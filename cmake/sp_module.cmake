@@ -46,20 +46,40 @@ endif()
 #     [TEST_NAME    <ctest name>]          # default: T_<UPPER(name)>
 #     [TEST_SOURCES <extra .c>]            # compiled into the test exe only
 #                                          #   (e.g. parity oracles, fixtures)
+#     [DEPENDS      <sp_other ...>]        # other sp_<m> libs this module links
 # )
 #
 # Produces:
 #   - static library  sp_<name>     (PUBLIC include dir = <repo>/include)
 #   - executable       test_<name>  linking sp_<name>
 #   - ctest entry      <TEST_NAME>   running test_<name>
+#
+# DEPENDS links the named sp_<m> libraries PUBLIC (so test_<name> inherits
+# them). For standalone single-module builds (cmake -S core/<name>), a depended
+# target that does not yet exist is pulled in via add_subdirectory of the
+# sibling core/<dep-without-sp_> dir; in the root build it already exists (the
+# root adds modules in dependency order) so it is just linked.
 function(sp_add_module name)
-    cmake_parse_arguments(M "" "TEST;TEST_NAME" "SOURCES;TEST_SOURCES" ${ARGN})
+    cmake_parse_arguments(M "" "TEST;TEST_NAME" "SOURCES;TEST_SOURCES;DEPENDS" ${ARGN})
+
+    foreach(dep IN LISTS M_DEPENDS)
+        if(NOT TARGET ${dep})
+            string(REGEX REPLACE "^sp_" "" _depdir "${dep}")
+            # CMAKE_CURRENT_SOURCE_DIR is the caller's module dir (core/<name>);
+            # its sibling core/<dep> holds the dependency.
+            add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../${_depdir}
+                             ${CMAKE_BINARY_DIR}/_deps_sp/${_depdir})
+        endif()
+    endforeach()
 
     add_library(sp_${name} STATIC ${M_SOURCES})
     target_include_directories(sp_${name} PUBLIC ${SP_INCLUDE_DIR})
     target_compile_options(sp_${name} PRIVATE ${SP_C_FLAGS} ${SP_UBSAN_C_OPT})
     if(SP_UBSAN_L_OPT)
         target_link_options(sp_${name} PUBLIC ${SP_UBSAN_L_OPT})
+    endif()
+    if(M_DEPENDS)
+        target_link_libraries(sp_${name} PUBLIC ${M_DEPENDS})
     endif()
     # libm is a separate library on Unix (floorf/ceilf/exp/log); MinGW and MSVC
     # fold it into the C runtime. PUBLIC so test exes inherit it.

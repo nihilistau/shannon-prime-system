@@ -1,0 +1,10 @@
+# Normalize text line endings (binary files left untouched). New/changed files
+# are normalized to LF in the repo; checkout EOL is per-platform.
+* text=auto
+
+# Reference fixtures / blobs: never apply EOL or other munging. The cross-
+# platform parity fixtures (e.g. the gcc-generated __int128 NTT oracle vectors)
+# must be byte-identical on every platform.
+*.bin   binary
+*.gguf  binary
+*.safetensors binary
