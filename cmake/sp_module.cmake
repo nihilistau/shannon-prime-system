@@ -61,6 +61,11 @@ function(sp_add_module name)
     if(SP_UBSAN_L_OPT)
         target_link_options(sp_${name} PUBLIC ${SP_UBSAN_L_OPT})
     endif()
+    # libm is a separate library on Unix (floorf/ceilf/exp/log); MinGW and MSVC
+    # fold it into the C runtime. PUBLIC so test exes inherit it.
+    if(UNIX)
+        target_link_libraries(sp_${name} PUBLIC m)
+    endif()
 
     if(M_TEST)
         if(NOT M_TEST_NAME)
