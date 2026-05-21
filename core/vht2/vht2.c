@@ -32,10 +32,14 @@ uint8_t sp_crc8(const uint8_t *data, int len) {
     for (int i = 0; i < len; i++) {
         crc ^= data[i];
         for (int b = 0; b < 8; b++) {
-            if (crc & 0x80u) {
-                crc = (uint8_t)((crc << 1) ^ 0x07u);  /* poly 0x07 */
+            /* shift in unsigned arithmetic so the uint8_t->int integer
+             * promotion never reintroduces a signed operand (clean under
+             * -Wsign-conversion even when UBSan instruments the shift). */
+            unsigned c = (unsigned)crc;
+            if (c & 0x80u) {
+                crc = (uint8_t)((c << 1) ^ 0x07u);  /* poly 0x07 */
             } else {
-                crc = (uint8_t)(crc << 1);
+                crc = (uint8_t)(c << 1);
             }
         }
     }
