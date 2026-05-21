@@ -18,17 +18,35 @@ The phasing in `../shannon-prime-lattice/papers/PPT-LAT-Roadmap.md` defines what
 
 ## Status
 
-**Phase 0 — empty.** Build environment set up, README + LICENSE + .gitignore in place. Phase 1 lands the KSTE encoder with tests T1.1–T1.5.
+**Phase 1 — math core, in progress.** Each primitive is a self-contained module under `core/<module>/` with its own tests; the EXISTS-guarded root build picks up whatever modules exist. See `CONVENTIONS.md` for the module template and `../shannon-prime-lattice/papers/PPT-LAT-Roadmap.md` §7 for the per-subphase contracts.
 
-## Build (placeholder)
+| Subphase | Module | Tests | Tier-1 (Win MinGW-gcc) |
+|----------|--------|-------|------------------------|
+| 1A | `core/ok_arith` — O_K arithmetic over Q(√-163) | T_OK_1..6 | ✅ green |
+| 1B | `core/ntt_crt` — dual-prime CRT-NTT (N ∈ {128,256,512}) | T_NTT_1..5 | in progress |
+| 1C | `core/poly_ring` — R_q polynomial-ring attention | T_PR_1..4 | pending (needs 1B) |
+| 1D | `core/vht2` — VHT2 + Möbius + 63-byte Spinor block | T_VHT_1..6 | ✅ green |
+| 1E | `core/frobenius` — Frobenius lift for Q8 weights | T_FRO_1..3 (T_FRO_4 → Phase 2) | in progress |
+| 1F | `core/kste` — KSTE encoder + Tier-0/Tier-1 dominance | T_KSTE_1..5 | ✅ green |
+
+Platform-gate policy is staged (roadmap §3.7): Tier-1 = Windows MinGW-gcc (closes in-session), Tier-2 = Linux gcc via CI (`.github/workflows/ci.yml`), Tier-3 = Windows MSVC (follow-up wave).
+
+## Build
+
+MinGW gcc 15.2 + Ninja:
 
 ```bash
-cmake -B build -G Ninja
+# whole repo
+cmake -B build -G Ninja -DCMAKE_C_COMPILER=gcc
 cmake --build build
-ctest --test-dir build
+ctest --test-dir build --output-on-failure
+
+# a single module (fast iteration)
+cmake -B core/<m>/build -S core/<m> -G Ninja -DCMAKE_C_COMPILER=gcc
+ctest --test-dir core/<m>/build --output-on-failure
 ```
 
-CMake stubs are in place; no source files yet.
+Run once with `-DSP_UBSAN=ON` before closing a module (auto-falls back to `-fsanitize-undefined-trap-on-error` where libubsan is unavailable, e.g. MinGW-Builds).
 
 ## License
 
