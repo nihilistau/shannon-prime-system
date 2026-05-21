@@ -1,0 +1,115 @@
+/* sp/frobenius_lift.h — Frobenius lift for Q8 weight storage.  (Phase 1E.)
+ *
+ * A weight tensor (rows x cols, fp32) is compressed to packed signed int8 plus
+ * a PER-ROW fp32 scale array, then decompressed inline at matmul time.
+ *
+ * Why per-row ("Frobenius") scaling.  A single per-tensor scale collapses the
+ * dynamic range of every row onto the same int8 grid; rows whose magnitudes
+ * are small relative to the tensor max lose almost all their bits and the
+ * quantised tensor degrades to noise.  Normalising each row by its own max
+ * absolute value (the "Frobenius scale" of that row) keeps every row using the
+ * full [-127,127] code range.  Per-row is the load-bearing choice.
+ *
+ * Storage layout (the lift):
+ *   - packed[r*cols + c] : the int8 code q for weight w[r][c]
+ *   - row_scale[r]       : fp32 scale s for row r  (s = max_c |w[r][c]|)
+ * Memory: 1 byte per coefficient + 1 fp32 (4 bytes) per row.  For an R x C
+ * tensor that is  R*C + 4*R  bytes, versus  4*R*C  for fp32 (~4x smaller) and
+ * 8*R*C for fp64 (~8x smaller).  See sp_frob_packed_bytes / sp_frob_ratio.
+ *
+ * Quantisation (encode):
+ *   x = v / s * 127                       (s = sp_frob_row_scale(row))
+ *   q = ceil-shift-round(x), clamped to [-127, 127], stored as int8_t
+ * Ceiling-shift rounding rule (round-half-AWAY-from-zero), deterministic and
+ * independent of the hardware FP rounding mode:
+ *   q = (x >= 0) ? floorf(x + 0.5f) : ceilf(x - 0.5f)
+ *      == copysignf(floorf(fabsf(x) + 0.5f), x)
+ * So +0.5 -> +1, -0.5 -> -1, +1.5 -> +2, -1.5 -> -2.  This is symmetric about
+ * zero, which removes the systematic +1/2-LSB bias that plain round-half-up
+ * (floorf(x + 0.5f) for all x) introduces on signed data.  We use floorf/ceilf
+ * (not lrintf) precisely so the result never depends on fesetround().
+ *
+ * The code range is the SYMMETRIC interval [-127, 127] (note: NOT -128).  A
+ * symmetric range is required for the dequant identity v_hat = q*(s/127) to be
+ * able to reproduce v = +s exactly (code +127); allowing -128 would break that
+ * symmetry without buying any extra precision for normalised data.
+ *
+ * Dequantisation (inline lift):
+ *   v_hat = q * (s / 127)
+ * In a real matmul this is: read packed byte -> sign-extend to int16 ->
+ * multiply by the broadcast row scale (fp32) -> accumulate.  sp_frob_dequantize
+ * mirrors that arithmetic exactly.
+ *
+ * A zero row (every element 0, hence s == 0) is encoded as all-zero codes with
+ * row_scale 0, and dequantises back to all zeros.
+ *
+ * Part of the shared public API root (include/).  Include as
+ *   #include "sp/frobenius_lift.h"
+ */
+#ifndef SP_FROBENIUS_LIFT_H
+#define SP_FROBENIUS_LIFT_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* The symmetric int8 code limit.  Codes live in [-SP_FROB_QMAX, +SP_FROB_QMAX]. */
+#define SP_FROB_QMAX 127
+
+/* A packed Q8 weight tensor: int8 codes plus one fp32 scale per row.
+ * `packed` points at rows*cols int8 codes in row-major order; `row_scale`
+ * points at `rows` fp32 scales.  The descriptor borrows the buffers (it does
+ * not own them); the caller manages their lifetime. */
+typedef struct {
+    int      rows;
+    int      cols;
+    int8_t  *packed;     /* rows*cols codes, row-major          */
+    float   *row_scale;  /* rows scales: row_scale[r] for row r */
+} sp_frob_tensor;
+
+/* Per-row Frobenius scale: the maximum absolute value over `cols` elements of
+ * `row`.  Returns 0.0f for an all-zero row (and is well-defined for cols <= 0,
+ * returning 0).  This is the s used by quantise/dequantise for that row. */
+float sp_frob_row_scale(const float *row, int cols);
+
+/* Quantise a single value v in a row of scale s to its int8 code, using the
+ * ceiling-shift (round-half-away-from-zero) rule documented above, clamped to
+ * [-SP_FROB_QMAX, +SP_FROB_QMAX].  If s == 0 the code is 0 (zero row). */
+int8_t sp_frob_quant1(float v, float scale);
+
+/* Dequantise a single int8 code q in a row of scale s: v_hat = q * (s / 127). */
+float sp_frob_dequant1(int8_t q, float scale);
+
+/* Quantise an fp32 weight tensor `w` (rows x cols, row-major) into `packed`
+ * (rows*cols int8 codes) and `row_scale` (rows fp32 scales).  For each row it
+ * picks the per-row scale via sp_frob_row_scale, then quantises every element
+ * with sp_frob_quant1.  `packed` and `row_scale` must be caller-allocated with
+ * room for rows*cols and rows entries respectively. */
+void sp_frob_quantize(const float *w, int rows, int cols,
+                      int8_t *packed, float *row_scale);
+
+/* Dequantise a packed Q8 tensor back to fp32 (rows x cols, row-major) into
+ * `out`, mirroring the inline matmul lift: out[r][c] = packed[r][c]*(s_r/127).
+ * `out` must be caller-allocated with room for rows*cols floats. */
+void sp_frob_dequantize(const int8_t *packed, const float *row_scale,
+                        int rows, int cols, float *out);
+
+/* Packed byte size of an `rows` x `cols` Q8 tensor:
+ *   rows*cols (one int8 code per coefficient) + rows*sizeof(float) (row scales).
+ */
+size_t sp_frob_packed_bytes(int rows, int cols);
+
+/* Compression ratio of the packed Q8 form versus an unquantised source tensor
+ * whose element width is `src_dtype_bytes` (e.g. 4 for fp32, 8 for fp64):
+ *   (src_dtype_bytes * rows * cols) / sp_frob_packed_bytes(rows, cols).
+ * Returns 0.0 if the packed size is 0 (degenerate rows/cols). */
+double sp_frob_ratio(int rows, int cols, int src_dtype_bytes);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* SP_FROBENIUS_LIFT_H */
