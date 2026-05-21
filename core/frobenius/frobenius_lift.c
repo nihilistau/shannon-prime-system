@@ -72,3 +72,52 @@ double sp_frob_ratio(int rows, int cols, int src_dtype_bytes) {
     double src = (double)src_dtype_bytes * (double)rows * (double)cols;
     return src / (double)packed;
 }
+
+/* ── Q4 (4-bit) variant ──────────────────────────────────────────────────── */
+
+int8_t sp_frob_quant1_q4(float v, float scale) {
+    if (scale == 0.0f) return 0;
+    float x = v / scale * 7.0f;
+    float r = (x >= 0.0f) ? floorf(x + 0.5f) : ceilf(x - 0.5f);   /* round half away */
+    if (r >  (float)SP_FROB_QMAX4) r =  (float)SP_FROB_QMAX4;
+    if (r < -(float)SP_FROB_QMAX4) r = -(float)SP_FROB_QMAX4;
+    return (int8_t)r;
+}
+
+float sp_frob_dequant1_q4(int8_t q, float scale) {
+    return (float)q * (scale / 7.0f);
+}
+
+void sp_frob_q4_pack(const int8_t *codes, int n, uint8_t *nib) {
+    for (int i = 0; i < n; i += 2) {
+        uint8_t lo = (uint8_t)(codes[i] & 0xF);
+        uint8_t hi = (i + 1 < n) ? (uint8_t)(codes[i + 1] & 0xF) : 0u;
+        nib[i >> 1] = (uint8_t)(lo | (hi << 4));
+    }
+}
+
+void sp_frob_q4_unpack(const uint8_t *nib, int n, int8_t *codes) {
+    for (int i = 0; i < n; i++) {
+        uint8_t v = (i & 1) ? (uint8_t)(nib[i >> 1] >> 4) : (uint8_t)(nib[i >> 1] & 0xF);
+        codes[i] = (int8_t)((v & 0x8) ? (int)v - 16 : (int)v);   /* sign-extend 4-bit */
+    }
+}
+
+float sp_frob_q4_row_relerr(const float *row, int cols) {
+    if (cols <= 0) return 0.0f;
+    float s = sp_frob_row_scale(row, cols);
+    if (s == 0.0f) return 0.0f;
+    double e2 = 0.0, n2 = 0.0;
+    for (size_t c = 0; c < (size_t)cols; c++) {
+        int8_t q = sp_frob_quant1_q4(row[c], s);
+        double d = (double)row[c] - (double)sp_frob_dequant1_q4(q, s);
+        e2 += d * d;
+        n2 += (double)row[c] * (double)row[c];
+    }
+    return (n2 > 0.0) ? (float)sqrt(e2 / n2) : 0.0f;
+}
+
+size_t sp_frob_q4_packed_bytes(int rows, int cols) {
+    if (rows <= 0 || cols <= 0) return 0;
+    return (size_t)rows * (size_t)((cols + 1) / 2) + (size_t)rows * sizeof(float);
+}
