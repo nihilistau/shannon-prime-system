@@ -22,8 +22,16 @@ if(_sp_ntt_crt_src MATCHES "__int128")
         "128-bit code into the test-only oracle ntt_ref_int128.c.")
 endif()
 
+# The __int128 parity oracle is gcc/clang-only (MSVC has no __int128). On MSVC
+# it is left out of the test exe; T_NTT_2 (live oracle) self-skips there and
+# T_NTT_3 gates MSVC against the gcc-pre-generated ntt_ref_vectors.h fixture.
+set(_ntt_test_extra "")
+if(NOT MSVC)
+    list(APPEND _ntt_test_extra ntt_ref_int128.c)
+endif()
+
 sp_add_module(ntt_crt
     SOURCES      ntt_crt.c
     TEST         ntt_crt_test.c
-    TEST_SOURCES ntt_ref_int128.c   # __int128 oracle; test-only, never in sp_ntt_crt
+    TEST_SOURCES ${_ntt_test_extra}
     TEST_NAME    T_NTT)

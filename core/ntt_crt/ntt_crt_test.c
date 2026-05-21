@@ -14,14 +14,20 @@
  */
 #include "sp/sp_test.h"
 #include "sp/ntt_crt.h"
+#include "ntt_ref_vectors.h"   /* gcc-pre-generated __int128-oracle fixture (T_NTT_3) */
 
 #include <stdint.h>
 #include <stdlib.h>
 
+#ifndef _MSC_VER
 /* Reference negacyclic multiply, mod M, signed-centered. Defined in the
- * test-only oracle ntt_ref_int128.c. out has N entries in (-M/2, M/2]. */
+ * test-only oracle ntt_ref_int128.c, which uses __int128 and is therefore
+ * compiled into this exe ONLY on non-MSVC (see CMakeLists). out has N entries
+ * in (-M/2, M/2]. On MSVC the live check (T_NTT_2) is skipped and the
+ * cross-compiler gate runs against the pre-generated fixture (T_NTT_3). */
 void ntt_ref_negacyclic_mul(uint32_t N, const int32_t *a, const int32_t *b,
                             int64_t *out);
+#endif
 
 /* ---- deterministic RNG (xorshift64*, house fixed seed) ------------------- */
 
@@ -91,6 +97,14 @@ static void T_NTT_1(void) {
 /* ---- T_NTT_2 : full pipeline == oracle negacyclic product ---------------- */
 
 static void T_NTT_2(void) {
+#ifdef _MSC_VER
+    /* The live oracle uses __int128 (unsupported by MSVC) and is not compiled
+     * into this exe on MSVC. The cross-compiler bit-exactness gate runs against
+     * the pre-generated oracle fixture in T_NTT_3 instead (roadmap §3.7). */
+    fprintf(stderr, "[T_NTT_2] skipped on MSVC (live __int128 oracle is gcc-only; "
+                    "MSVC parity gated by T_NTT_3 fixture)\n");
+    SP_CHECK(1, "T_NTT_2 live-oracle check is the gcc tier; MSVC uses T_NTT_3");
+#else
     rng_seed(0xD1B54A32D192ED03ull);
     for (int ni = 0; ni < 3; ni++) {
         uint32_t N = kNs[ni];
@@ -127,18 +141,49 @@ static void T_NTT_2(void) {
         free(c1); free(c2); free(got); free(ref);
         ntt_free(ctx);
     }
+#endif /* _MSC_VER */
 }
 
-/* ---- T_NTT_3 : MSVC gate — deferred -------------------------------------- */
+/* ---- T_NTT_3 : cross-compiler bit-exactness vs the __int128-oracle fixture - */
 
 static void T_NTT_3(void) {
-    /* The bit-exactness gate also has to hold under Windows MSVC. MSVC cannot
-     * compile the __int128 oracle, so this case is deferred to the MSVC
-     * follow-up wave (roadmap §3.7). Plan: the gcc tier already exercises the
-     * identical pipeline in T_NTT_2; the MSVC wave will compare against
-     * pre-emitted reference vectors instead of the live __int128 oracle. */
-    fprintf(stderr, "[T_NTT_3] DEFERRED (MSVC wave)\n");
-    SP_CHECK(1, "T_NTT_3 deferred to MSVC wave (no failure)");
+    /* The bit-exactness gate must also hold under MSVC, which cannot compile the
+     * __int128 oracle. The oracle's negacyclic products were pre-generated under
+     * gcc into ntt_ref_vectors.h (cases spanning coefficient magnitudes up to
+     * 2^28, exercising the full ~2^60 CRT recombination + centering). This case
+     * runs on EVERY compiler and asserts the production kernel reproduces those
+     * vectors bit-for-bit — so MSVC is gated against the same oracle gcc uses
+     * live in T_NTT_2 (roadmap §3.7). */
+    SP_CHECK(sp_ntt_ref_ncases > 0, "fixture is non-empty");
+    int bad = 0, ran = 0;
+    for (int ci = 0; ci < sp_ntt_ref_ncases; ci++) {
+        const sp_ntt_ref_case_t *c = &sp_ntt_ref_cases[ci];
+        ntt_ctx *ctx = ntt_init(c->N);
+        if (!ctx) { SP_CHECK(0, "ntt_init for T_NTT_3 fixture case"); continue; }
+        uint32_t N = c->N;
+
+        uint32_t *a1 = malloc(sizeof(uint32_t) * N);
+        uint32_t *a2 = malloc(sizeof(uint32_t) * N);
+        uint32_t *b1 = malloc(sizeof(uint32_t) * N);
+        uint32_t *b2 = malloc(sizeof(uint32_t) * N);
+        uint32_t *r1 = malloc(sizeof(uint32_t) * N);
+        uint32_t *r2 = malloc(sizeof(uint32_t) * N);
+        int64_t  *got = malloc(sizeof(int64_t) * N);
+
+        ntt_forward(ctx, c->a, a1, a2);
+        ntt_forward(ctx, c->b, b1, b2);
+        ntt_pointwise_mul(ctx, a1, a2, b1, b2, r1, r2);
+        ntt_inverse(ctx, r1, r2, got);
+        for (uint32_t i = 0; i < N; i++) {
+            if (got[i] != c->expected[i]) { bad = 1; break; }
+        }
+        ran++;
+
+        free(a1); free(a2); free(b1); free(b2); free(r1); free(r2); free(got);
+        ntt_free(ctx);
+    }
+    SP_CHECK(ran == sp_ntt_ref_ncases, "all fixture cases ran");
+    SP_CHECK(!bad, "production kernel bit-exact vs __int128-oracle fixture (cross-compiler)");
 }
 
 /* ---- T_NTT_4 : pointwise-mul + inverse == negacyclic convolution --------- */
