@@ -16,8 +16,11 @@ statements, re-derive the implementation from scratch. See
 A module agent for module `<m>` may create/edit ONLY:
 
 - `core/<m>/*.c` — implementation + test sources
+- `core/<m>/*.h` — module-PRIVATE headers (internal helpers shared between
+  the module's own `.c` files; not part of the public surface)
 - `core/<m>/CMakeLists.txt` — from the template below
-- `include/sp/<m>*.h` — that module's public header(s)
+- `include/sp/<header>.h` — that module's PUBLIC header(s) (basename matches
+  your API/source name, not necessarily the module dir)
 - `core/<m>/build*/` — its own build dir(s)
 
 **Forbidden — do not touch (shared scaffold):**
