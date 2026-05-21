@@ -108,6 +108,43 @@ size_t sp_frob_packed_bytes(int rows, int cols);
  * Returns 0.0 if the packed size is 0 (degenerate rows/cols). */
 double sp_frob_ratio(int rows, int cols, int src_dtype_bytes);
 
+/* ── Q4 (4-bit) variant ──────────────────────────────────────────────────────
+ * Same per-row "Frobenius" scale and round-half-away rule as Q8, but symmetric
+ * 4-bit codes in [-SP_FROB_QMAX4, +SP_FROB_QMAX4] = [-7,7], packed two per byte.
+ * 4x more aggressive than Q8 (~16x vs fp32) and correspondingly lossier, so it
+ * is used as a mixed-precision path: the caller calibrates per row (see
+ * sp_frob_q4_row_relerr) and promotes high-error rows back to Q8. The codec is
+ * shared by every engine backend (CPU/CUDA/Vulkan/Hexagon). */
+
+/* The symmetric int4 code limit. Q4 codes live in [-SP_FROB_QMAX4, +SP_FROB_QMAX4]. */
+#define SP_FROB_QMAX4 7
+
+/* Quantise v in a row of scale s to its 4-bit code (round-half-away, clamped to
+ * [-7,7]); s == 0 -> code 0. The code is returned in an int8_t but is always in
+ * [-7,7] (pack two per byte with sp_frob_q4_pack). */
+int8_t sp_frob_quant1_q4(float v, float scale);
+
+/* Dequantise a 4-bit code q in a row of scale s: v_hat = q * (s / 7). */
+float sp_frob_dequant1_q4(int8_t q, float scale);
+
+/* Pack/unpack symmetric 4-bit codes two-per-byte (low nibble = even index).
+ * Round-trips exactly for the [-8,7] two's-complement range, so it is lossless
+ * on valid Q4 codes — the only loss is the quantisation itself. `nib` must hold
+ * (n + 1) / 2 bytes; unpack sign-extends each nibble. */
+void sp_frob_q4_pack(const int8_t *codes, int n, uint8_t *nib);
+void sp_frob_q4_unpack(const uint8_t *nib, int n, int8_t *codes);
+
+/* Per-row Q4 round-trip relative error:
+ *   || row - dequant_q4(quant_q4(row)) ||_2 / || row ||_2     (0 for a zero row).
+ * The reusable calibration metric: the caller promotes a row from Q4 to Q8 when
+ * this exceeds its threshold. (The promotion policy stays with the caller; this
+ * is just the per-row sensitivity primitive.) */
+float sp_frob_q4_row_relerr(const float *row, int cols);
+
+/* Packed byte size of an `rows` x `cols` Q4 tensor:
+ *   rows*ceil(cols/2) (two 4-bit codes per byte) + rows*sizeof(float) scales. */
+size_t sp_frob_q4_packed_bytes(int rows, int cols);
+
 #ifdef __cplusplus
 }
 #endif

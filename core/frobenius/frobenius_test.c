@@ -232,6 +232,108 @@ static void T_FRO_3(void) {
              "T_FRO_3 fp64 ratio exact (= 134217728/16793600 = 2*fp32)");
 }
 
+/* ---- reference Q4 quantiser (independent oracle) ------------------------- */
+static int8_t ref_quant1_q4(float v, float scale) {
+    if (scale == 0.0f) return 0;
+    float x = v / scale * 7.0f;
+    float r = (x >= 0.0f) ? floorf(x + 0.5f) : ceilf(x - 0.5f);
+    if (r >  7.0f) r =  7.0f;
+    if (r < -7.0f) r = -7.0f;
+    return (int8_t)r;
+}
+
+/* ---- T_FRO_Q4: 4-bit codec — quant/dequant, pack/unpack, calibration ----- */
+/*
+ * Q4 mirrors the Q8 contract at 4 bits: symmetric codes [-7,7], per-row scale,
+ * round-half-away, dequant v_hat = q*(s/7). Shared by every engine backend
+ * (the engine matmul and the future CUDA/Vulkan/Hexagon paths call these).
+ */
+static void T_FRO_Q4(void) {
+    rng_seed(0xF404F404ull);
+
+    /* (a) quant1_q4 matches the reference bit-for-bit across many rows */
+    for (int trial = 0; trial < 4096; trial++) {
+        float scale = 0.01f + rng_float(10.0f);
+        if (scale <= 0.0f) scale = 0.5f;
+        for (int k = 0; k < 32; k++) {
+            float v = rng_float(scale * 1.5f);                 /* exercises the clamp */
+            SP_CHECK_EQ_I64(sp_frob_quant1_q4(v, scale), ref_quant1_q4(v, scale),
+                            "T_FRO_Q4 quant1_q4 matches reference bit-for-bit");
+        }
+    }
+
+    /* (b) every code is in [-7,7]; pack->unpack is the identity on valid codes */
+    {
+        int8_t codes[129], back[129];
+        uint8_t nib[65];
+        for (int n = 1; n <= 129; n++) {
+            for (int i = 0; i < n; i++) {
+                float s = 2.0f, v = rng_float(s * 1.5f);
+                codes[i] = sp_frob_quant1_q4(v, s);
+                SP_CHECK(codes[i] >= -7 && codes[i] <= 7, "T_FRO_Q4 code in [-7,7]");
+            }
+            sp_frob_q4_pack(codes, n, nib);
+            sp_frob_q4_unpack(nib, n, back);
+            int idok = 1;
+            for (int i = 0; i < n; i++) if (back[i] != codes[i]) idok = 0;
+            SP_CHECK(idok, "T_FRO_Q4 pack->unpack is the identity on Q4 codes");
+        }
+    }
+
+    /* (c) extremes: row max -> +/-7, dequant +/-7 -> +/-s exactly */
+    {
+        float row[5] = { -1.0f, 0.25f, 0.0f, 0.9f, 1.0f };
+        float s = sp_frob_row_scale(row, 5);
+        SP_CHECK_EQ_I64(sp_frob_quant1_q4( 1.0f, s),  7, "T_FRO_Q4 +max -> +7");
+        SP_CHECK_EQ_I64(sp_frob_quant1_q4(-1.0f, s), -7, "T_FRO_Q4 -max -> -7");
+        SP_CHECK(sp_frob_dequant1_q4( 7, s) ==  1.0f, "T_FRO_Q4 +7 -> +s exactly");
+        SP_CHECK(sp_frob_dequant1_q4(-7, s) == -1.0f, "T_FRO_Q4 -7 -> -s exactly");
+    }
+
+    /* (d) zero row: scale 0 -> code 0, rel-error 0 (no nan/divide-by-zero) */
+    {
+        float zrow[16] = {0};
+        SP_CHECK_EQ_I64(sp_frob_quant1_q4(0.0f, 0.0f), 0, "T_FRO_Q4 zero-row code 0");
+        SP_CHECK(sp_frob_q4_row_relerr(zrow, 16) == 0.0f, "T_FRO_Q4 zero-row relerr 0");
+    }
+
+    /* (e) per-element round-trip bound |v_hat - v| <= (s/7)*(0.5+eps) */
+    {
+        rng_seed(0xF4E5F4E5ull);
+        int bad = 0;
+        float row[64];
+        for (int trial = 0; trial < 512; trial++) {
+            int cols = 1 + (int)(rng_next() % 64);
+            for (int c = 0; c < cols; c++) row[c] = rng_float(3.0f);
+            float s = sp_frob_row_scale(row, cols);
+            float bound = (s == 0.0f) ? 0.0f : s / 7.0f * (0.5f + 1e-6f);
+            for (int c = 0; c < cols; c++) {
+                float vhat = sp_frob_dequant1_q4(sp_frob_quant1_q4(row[c], s), s);
+                if (fabsf(vhat - row[c]) > bound) bad = 1;
+            }
+        }
+        SP_CHECK(!bad, "T_FRO_Q4 |vhat-v| <= (s/7)*(0.5+eps) per element");
+    }
+
+    /* (f) calibration metric: a coarse row has larger Q4 rel-error than a row
+     * that lands near the grid; both are finite and in [0,1]-ish range. */
+    {
+        float coarse[8] = { 1.0f, 0.13f, 0.51f, 0.27f, 0.88f, 0.04f, 0.62f, 0.39f };
+        float e = sp_frob_q4_row_relerr(coarse, 8);
+        SP_CHECK(e > 0.0f && e < 1.0f, "T_FRO_Q4 row relerr finite and positive");
+    }
+
+    /* (g) packed byte size: rows*ceil(cols/2) + rows*4 (4-bit codes) */
+    {
+        size_t got = sp_frob_q4_packed_bytes(37, 53);
+        size_t want = (size_t)37 * ((53 + 1) / 2) + (size_t)37 * sizeof(float);
+        SP_CHECK_EQ_I64((int64_t)got, (int64_t)want, "T_FRO_Q4 packed bytes formula");
+        /* ~2x denser than Q8, ~8x vs fp32 on a wide matrix */
+        SP_CHECK(sp_frob_q4_packed_bytes(4096, 4096) < sp_frob_packed_bytes(4096, 4096),
+                 "T_FRO_Q4 denser than Q8");
+    }
+}
+
 /* ---- T_FRO_4: DEFERRED to Phase 2 ---------------------------------------- */
 
 static void T_FRO_4(void) {
@@ -245,6 +347,7 @@ int main(void) {
     SP_RUN(T_FRO_1);
     SP_RUN(T_FRO_2);
     SP_RUN(T_FRO_3);
+    SP_RUN(T_FRO_Q4);
     SP_RUN(T_FRO_4);
     return SP_DONE();
 }
