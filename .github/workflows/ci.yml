@@ -1,8 +1,10 @@
 name: ci
 
-# Tier-2 (Linux gcc) gate for the Phase-1 math core — see
+# Platform-gate CI for the math core — see
 # ../shannon-prime-lattice/papers/PPT-LAT-Roadmap.md §3.7.
-# The dev host has no local Linux; this workflow is the Linux verification.
+#   linux-gcc    : Tier-2 (the dev host has no local Linux)
+#   windows-msvc : Tier-3 (continuous MSVC parity; the __int128 oracle is
+#                  excluded on MSVC and T_NTT_3 gates against the gcc fixture)
 
 on:
   push:
@@ -26,3 +28,19 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+  windows-msvc:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # windows-latest ships full Visual Studio, so the VS generator finds the
+      # MSVC toolchain without vcvars / third-party setup actions.
+      - name: Configure
+        run: cmake -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
