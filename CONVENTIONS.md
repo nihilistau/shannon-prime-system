@@ -56,7 +56,9 @@ sp_add_module(<m>
 
 `sp_add_module` builds static lib `sp_<m>`, test exe `test_<m>`, and registers
 a ctest entry named `T_<TAG>`. The public header root `include/` is wired onto
-both targets automatically — include your header as `#include "sp/<m>.h"`.
+both targets automatically — include your header as `#include "sp/<header>.h"`.
+The header basename matches your API/source name, **not** necessarily the
+module dir: module `ok_arith` ships `include/sp/ok_int.h` and `ok_int.c`.
 
 For a parity oracle / fixture compiled only into the test (not the production
 lib), pass it via `TEST_SOURCES`:
@@ -90,6 +92,11 @@ int main(void) {
 
 The exe prints `[T_OK_1] PASS/FAIL` per case and exits nonzero if any check
 failed, so `ctest` names the failing contract item.
+
+`sp_test.h` ships only `SP_CHECK(cond, label)` and `SP_CHECK_EQ_I64(got, want,
+label)`. For domain types (struct equality, "equal up to a unit", float
+tolerance, byte-for-byte), write a small local predicate and wrap it:
+`SP_CHECK(sp_ok_eq(x, y), "round-trip")`. Do not edit `sp_test.h`.
 
 ## TDD (house style)
 

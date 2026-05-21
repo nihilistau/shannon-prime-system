@@ -12,6 +12,26 @@ get_filename_component(SP_INCLUDE_DIR "${CMAKE_CURRENT_LIST_DIR}/../include" ABS
 
 option(SP_UBSAN "Enable UndefinedBehaviorSanitizer on SP targets" OFF)
 
+# Resolve the UBSan flavour once. Linux gcc / clang ship libubsan and give
+# rich diagnostics; MinGW-Builds gcc ships the instrumentation but NO runtime
+# lib, so -fsanitize=undefined fails at link with "cannot find -lubsan".
+# Detect that and fall back to trap-on-error, which needs no runtime and still
+# aborts on any UB (sufficient for a "no UB" gate).
+set(SP_UBSAN_C_OPT "")
+set(SP_UBSAN_L_OPT "")
+if(SP_UBSAN AND (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"))
+    include(CheckLinkerFlag)
+    check_linker_flag(C "-fsanitize=undefined" SP_HAVE_UBSAN_RT)
+    if(SP_HAVE_UBSAN_RT)
+        set(SP_UBSAN_C_OPT -fsanitize=undefined -fno-sanitize-recover=all)
+        set(SP_UBSAN_L_OPT -fsanitize=undefined)
+    else()
+        message(STATUS "sp: libubsan not found; using -fsanitize-undefined-trap-on-error")
+        set(SP_UBSAN_C_OPT -fsanitize=undefined -fsanitize-undefined-trap-on-error -fno-sanitize-recover=all)
+        set(SP_UBSAN_L_OPT "")
+    endif()
+endif()
+
 # Warning flags applied to every SP target. C11, warnings-as-signal.
 set(SP_C_FLAGS "")
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
@@ -37,10 +57,9 @@ function(sp_add_module name)
 
     add_library(sp_${name} STATIC ${M_SOURCES})
     target_include_directories(sp_${name} PUBLIC ${SP_INCLUDE_DIR})
-    target_compile_options(sp_${name} PRIVATE ${SP_C_FLAGS})
-    if(SP_UBSAN AND (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"))
-        target_compile_options(sp_${name} PRIVATE -fsanitize=undefined -fno-sanitize-recover=all)
-        target_link_options(sp_${name} PUBLIC -fsanitize=undefined)
+    target_compile_options(sp_${name} PRIVATE ${SP_C_FLAGS} ${SP_UBSAN_C_OPT})
+    if(SP_UBSAN_L_OPT)
+        target_link_options(sp_${name} PUBLIC ${SP_UBSAN_L_OPT})
     endif()
 
     if(M_TEST)
@@ -51,7 +70,10 @@ function(sp_add_module name)
         add_executable(test_${name} ${M_TEST} ${M_TEST_SOURCES})
         target_link_libraries(test_${name} PRIVATE sp_${name})
         target_include_directories(test_${name} PRIVATE ${SP_INCLUDE_DIR})
-        target_compile_options(test_${name} PRIVATE ${SP_C_FLAGS})
+        target_compile_options(test_${name} PRIVATE ${SP_C_FLAGS} ${SP_UBSAN_C_OPT})
+        if(SP_UBSAN_L_OPT)
+            target_link_options(test_${name} PRIVATE ${SP_UBSAN_L_OPT})
+        endif()
         add_test(NAME ${M_TEST_NAME} COMMAND test_${name})
     endif()
 endfunction()
