@@ -1,0 +1,28 @@
+name: ci
+
+# Tier-2 (Linux gcc) gate for the Phase-1 math core — see
+# ../shannon-prime-lattice/papers/PPT-LAT-Roadmap.md §3.7.
+# The dev host has no local Linux; this workflow is the Linux verification.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  linux-gcc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Configure
+        run: cmake -B build -G Ninja -DCMAKE_C_COMPILER=gcc
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
