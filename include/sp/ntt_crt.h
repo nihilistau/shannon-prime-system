@@ -28,9 +28,16 @@
  * Barrett reduction, so a true 64-bit uint64_t is mandatory and a 128-bit type
  * is never needed in the production path. The enforcing T_NTT_5 gate lives in
  * core/ntt_crt/CMakeLists.txt (configure-time scan of ntt_crt.c). */
+/* C11/C++11 static assert, guarded for C++ backend consumers. */
+#ifdef __cplusplus
+static_assert(sizeof(uint64_t) == 8,
+              "ntt_crt needs a 64-bit uint64_t; production path is "
+              "128-bit-type-free (T_NTT_5 guards ntt_crt.c at configure time)");
+#else
 _Static_assert(sizeof(uint64_t) == 8,
                "ntt_crt needs a 64-bit uint64_t; production path is "
                "128-bit-type-free (T_NTT_5 guards ntt_crt.c at configure time)");
+#endif
 
 #ifdef __cplusplus
 extern "C" {
