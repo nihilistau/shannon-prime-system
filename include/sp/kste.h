@@ -92,8 +92,15 @@ typedef struct sp_kste_tree_s {
     uint8_t bytes[64];
 } sp_kste_tree_t;
 
+/* C11 _Static_assert / C++11 static_assert — guarded so the math core stays
+ * includable from the C++ backends (CUDA/Vulkan/Hexagon). */
+#ifdef __cplusplus
+static_assert(sizeof(sp_kste_tree_t) == 64,
+              "sp_kste_tree_t must be exactly 64 bytes (frozen wire form)");
+#else
 _Static_assert(sizeof(sp_kste_tree_t) == 64,
                "sp_kste_tree_t must be exactly 64 bytes (frozen wire form)");
+#endif
 
 /* Byte offsets of the tier regions (frozen v1). */
 #define SP_KSTE_OFF_VERSION   0

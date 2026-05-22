@@ -96,7 +96,11 @@ typedef struct {              /* 63 bytes total, packed; all uint8_t => no paddi
     uint8_t checksum;         /* CRC-8 of vht2_header || mobius_body */
 } sp_spinor_block_t;
 
+#ifdef __cplusplus
+static_assert(sizeof(sp_spinor_block_t) == 63, "frozen Spinor layout");
+#else
 _Static_assert(sizeof(sp_spinor_block_t) == 63, "frozen Spinor layout");
+#endif
 
 /* CRC-8/SMBus over `len` bytes: poly 0x07, init 0x00, no reflection, xorout 0. */
 uint8_t sp_crc8(const uint8_t *data, int len);
