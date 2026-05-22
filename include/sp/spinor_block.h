@@ -122,6 +122,27 @@ int sp_spinor_decode(const sp_spinor_block_t *in, float *vec, int k);
 void sp_spinor_pack(const sp_spinor_block_t *blk, uint8_t out[63]);
 int  sp_spinor_unpack(const uint8_t in[63], sp_spinor_block_t *blk);
 
+/* ── Multi-block KV head codec ───────────────────────────────────────────────
+ * A KV head vector is typically longer than the 55 anchors a single block holds
+ * (e.g. head_dim=128), so it is carried by ceil(k/55) blocks. The vector is split
+ * into that many BALANCED contiguous chunks (k=128 -> 3 blocks of 43/43/42), each
+ * encoded into one block. This split is the FROZEN cross-backend KV record format:
+ * every backend (CPU/CUDA/Vulkan/Hexagon) MUST split a head vector identically, or
+ * the on-disk / on-wire KV bytes diverge (roadmap §4.5/§4.9). Part of the same
+ * frozen contract as the block — a change requires bumping SP_SPINOR_LAYOUT_VERSION. */
+
+/* Number of Spinor blocks needed to carry a length-k vector: ceil(k/55), min 1. */
+int sp_spinor_blocks_for(int k);
+
+/* Encode a length-k vector into sp_spinor_blocks_for(k) blocks (balanced split).
+ * `blocks` must hold sp_spinor_blocks_for(k) entries. */
+void sp_spinor_encode_vec(const float *vec, int k, sp_spinor_block_t *blocks);
+
+/* Decode the sp_spinor_blocks_for(k) blocks back to k floats (lossy, the inverse
+ * of sp_spinor_encode_vec). Returns 0 on success, nonzero if any block's CRC-8
+ * fails (the partial result is still written for the verifying blocks). */
+int sp_spinor_decode_vec(const sp_spinor_block_t *blocks, int k, float *vec);
+
 #ifdef __cplusplus
 }
 #endif

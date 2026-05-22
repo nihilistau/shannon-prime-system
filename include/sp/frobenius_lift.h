@@ -145,6 +145,52 @@ float sp_frob_q4_row_relerr(const float *row, int cols);
  *   rows*ceil(cols/2) (two 4-bit codes per byte) + rows*sizeof(float) scales. */
 size_t sp_frob_q4_packed_bytes(int rows, int cols);
 
+/* ── Mixed-precision packed tensor (the load-bearing "arena" layout) ──────────
+ * The packed-WEIGHT memory layout of roadmap §4.8: one weight matrix stored
+ * per-row as EITHER Q8 or Q4 codes (Q4 mixed-precision promotes high-error rows
+ * to Q8), with a per-row scale and a per-row byte offset into one codes buffer.
+ * This is the byte format EVERY backend (CPU/CUDA/Vulkan/Hexagon) reads inline at
+ * matmul time, so it is versioned and frozen here. Per-ROW Frobenius — NOT ggml's
+ * per-32-block Q8_0; the two are not interchangeable. A change to the byte layout
+ * or dequant convention REQUIRES bumping SP_FROB_ARENA_LAYOUT_VERSION + migration. */
+#define SP_FROB_ARENA_LAYOUT_VERSION 1u
+
+typedef struct {
+    int      rows;          /* weight rows (= out features) */
+    int      cols;          /* elems per row (= in features) */
+    uint8_t *row_prec;      /* [rows] per-row precision: 8 or 4 */
+    float   *row_scale;     /* [rows] per-row Frobenius scale (max abs) */
+    size_t  *row_off;       /* [rows] byte offset of the row's codes in `codes` */
+    uint8_t *codes;         /* packed codes: Q8 row = cols int8; Q4 row = ceil(cols/2) bytes */
+    size_t   codes_bytes;   /* used bytes in `codes` */
+} sp_frob_packed_tensor;
+
+/* Source-row reader: writes row `j` of the weight matrix as `cols` f32 into `dst`.
+ * Returns 0 on success. The packer calls this once per row, so the caller (e.g. the
+ * engine reading a GGUF tensor) never has to materialize the whole matrix as f32. */
+typedef int (*sp_frob_row_fn)(void *ctx, int j, float *dst);
+
+/* Pack a rows x cols weight matrix (rows fetched via `get_row(ctx, j, dst)`) into
+ * `out` in the mixed-precision arena layout. `precision` 8 => every row Q8; 4 => Q4
+ * with rows whose Q4 round-trip rel-error (sp_frob_q4_row_relerr) exceeds `promote`
+ * stored Q8. Allocates and owns out->{row_prec,row_scale,row_off,codes} (release with
+ * sp_frob_packed_free). If `promoted` is non-NULL it is incremented per promoted row.
+ * Returns 0 on success; nonzero on a bad arg, alloc failure, or get_row failure (in
+ * which case `out` is freed and zeroed). */
+int sp_frob_pack_tensor(int rows, int cols, int precision, float promote,
+                        sp_frob_row_fn get_row, void *ctx,
+                        sp_frob_packed_tensor *out, long *promoted);
+
+/* Free the buffers owned by a packed tensor and zero the descriptor. */
+void sp_frob_packed_free(sp_frob_packed_tensor *t);
+
+/* Reconstruct row `r` to `cols` f32 (inline lift: code * scale / qmax, qmax 127 for
+ * a Q8 row or 7 for a Q4 row). `dst` holds `cols` floats. Returns 0 on success. */
+int sp_frob_packed_dequant_row(const sp_frob_packed_tensor *t, int r, float *dst);
+
+/* Total bytes the packed tensor occupies: codes + per-row (scale + offset + prec). */
+size_t sp_frob_packed_tensor_bytes(const sp_frob_packed_tensor *t);
+
 #ifdef __cplusplus
 }
 #endif

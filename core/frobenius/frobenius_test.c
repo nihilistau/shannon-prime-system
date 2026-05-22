@@ -334,6 +334,96 @@ static void T_FRO_Q4(void) {
     }
 }
 
+/* ---- T_FRO_5: mixed-precision packed tensor (arena layout) --------------- */
+
+/* Row reader over a flat rows*cols f32 matrix held in ctx (the test stand-in for
+ * the engine's GGUF-row dequant). */
+typedef struct { const float *w; int cols; } mat_ctx;
+static int mat_row(void *ctx, int j, float *dst) {
+    const mat_ctx *m = (const mat_ctx *)ctx;
+    const float *row = m->w + (size_t)j * (size_t)m->cols;
+    for (int i = 0; i < m->cols; i++) dst[i] = row[i];
+    return 0;
+}
+
+static void T_FRO_5(void) {
+    /* frozen arena layout guard — bumping forces a conscious migration. */
+    SP_CHECK_EQ_I64(SP_FROB_ARENA_LAYOUT_VERSION, 1, "T_FRO_5 frozen arena layout version == 1");
+
+    const int rows = 40, cols = 53;
+    float *w = (float *)malloc((size_t)rows * (size_t)cols * sizeof(float));
+    SP_CHECK(w != NULL, "T_FRO_5 alloc synthetic matrix");
+    if (!w) return;
+    rng_seed(0xABCDEF0123456789ull);
+    for (int j = 0; j < rows; j++) {
+        float mag = (j % 5 == 0) ? 4.0f : 1.0f;     /* a few rows with wider dynamic range */
+        float *row = w + (size_t)j * (size_t)cols;
+        for (int i = 0; i < cols; i++) row[i] = rng_float(mag);
+    }
+    mat_ctx ctx = { w, cols };
+    float dq[64];   /* cols=53 fits */
+
+    /* (a) Q8: every row Q8; dequant_row bit-matches per-element quant1->dequant1. */
+    {
+        sp_frob_packed_tensor t; long promoted = 0;
+        int rc = sp_frob_pack_tensor(rows, cols, 8, 0.0f, mat_row, &ctx, &t, &promoted);
+        SP_CHECK(rc == 0 && promoted == 0, "T_FRO_5 pack Q8 ok, nothing promoted");
+        int bad = 0;
+        for (int j = 0; j < rows && !bad; j++) {
+            if (t.row_prec[j] != 8) { bad = 1; break; }
+            sp_frob_packed_dequant_row(&t, j, dq);
+            const float *row = w + (size_t)j * (size_t)cols;
+            float s = sp_frob_row_scale(row, cols);
+            for (int i = 0; i < cols; i++)
+                if (dq[i] != sp_frob_dequant1(sp_frob_quant1(row[i], s), s)) { bad = 1; break; }
+        }
+        SP_CHECK(!bad, "T_FRO_5 Q8 dequant_row == quant1->dequant1 per element");
+        SP_CHECK_EQ_I64((int64_t)sp_frob_packed_tensor_bytes(&t),
+                        (int64_t)((size_t)rows * (size_t)cols + (size_t)rows * (sizeof(float) + sizeof(size_t) + 1)),
+                        "T_FRO_5 Q8 packed tensor bytes formula");
+        sp_frob_packed_free(&t);
+        SP_CHECK(t.codes == NULL && t.rows == 0, "T_FRO_5 packed_free zeroes the descriptor");
+    }
+
+    /* (b) Q4 mixed: promotion count equals the rows whose relerr exceeds the
+     *     threshold; dequant_row bit-matches the per-row codec (q4, or q8 if promoted). */
+    {
+        const float thr = 0.25f;
+        long want = 0;
+        for (int j = 0; j < rows; j++)
+            if (sp_frob_q4_row_relerr(w + (size_t)j * (size_t)cols, cols) > thr) want++;
+        sp_frob_packed_tensor t; long promoted = 0;
+        int rc = sp_frob_pack_tensor(rows, cols, 4, thr, mat_row, &ctx, &t, &promoted);
+        SP_CHECK(rc == 0, "T_FRO_5 pack Q4 ok");
+        SP_CHECK_EQ_I64(promoted, want, "T_FRO_5 Q4 promotion count matches relerr threshold");
+        int bad = 0;
+        for (int j = 0; j < rows && !bad; j++) {
+            sp_frob_packed_dequant_row(&t, j, dq);
+            const float *row = w + (size_t)j * (size_t)cols;
+            float s = sp_frob_row_scale(row, cols);
+            for (int i = 0; i < cols; i++) {
+                float want_v = (t.row_prec[j] == 8)
+                    ? sp_frob_dequant1(sp_frob_quant1(row[i], s), s)
+                    : sp_frob_dequant1_q4(sp_frob_quant1_q4(row[i], s), s);
+                if (dq[i] != want_v) { bad = 1; break; }
+            }
+        }
+        SP_CHECK(!bad, "T_FRO_5 Q4-mixed dequant_row == per-row codec per element");
+        sp_frob_packed_free(&t);
+    }
+
+    /* (c) bad args rejected, descriptor left zeroed. */
+    {
+        sp_frob_packed_tensor t;
+        SP_CHECK(sp_frob_pack_tensor(rows, cols, 5, 0.0f, mat_row, &ctx, &t, NULL) != 0 && t.codes == NULL,
+                 "T_FRO_5 pack rejects precision != 8/4");
+        SP_CHECK(sp_frob_pack_tensor(0, cols, 8, 0.0f, mat_row, &ctx, &t, NULL) != 0,
+                 "T_FRO_5 pack rejects rows <= 0");
+    }
+
+    free(w);
+}
+
 /* ---- T_FRO_4: DEFERRED to Phase 2 ---------------------------------------- */
 
 static void T_FRO_4(void) {
@@ -348,6 +438,7 @@ int main(void) {
     SP_RUN(T_FRO_2);
     SP_RUN(T_FRO_3);
     SP_RUN(T_FRO_Q4);
+    SP_RUN(T_FRO_5);
     SP_RUN(T_FRO_4);
     return SP_DONE();
 }

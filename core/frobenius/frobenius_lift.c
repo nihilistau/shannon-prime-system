@@ -6,6 +6,8 @@
 
 #include <math.h>
 #include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
 
 /* Per-row Frobenius scale: max_c |row[c]|.  0 for an all-zero or empty row. */
 float sp_frob_row_scale(const float *row, int cols) {
@@ -120,4 +122,89 @@ float sp_frob_q4_row_relerr(const float *row, int cols) {
 size_t sp_frob_q4_packed_bytes(int rows, int cols) {
     if (rows <= 0 || cols <= 0) return 0;
     return (size_t)rows * (size_t)((cols + 1) / 2) + (size_t)rows * sizeof(float);
+}
+
+/* ── Mixed-precision packed tensor (arena layout) ────────────────────────────
+ * Per-row: pick the Frobenius scale, optionally promote a Q4 row to Q8 by its
+ * round-trip rel-error, quantize, and append the codes at a per-row byte offset.
+ * Mirrors the inline dequant exactly (code * scale / qmax) so the lift is a true
+ * inverse up to the quantization step. */
+void sp_frob_packed_free(sp_frob_packed_tensor *t) {
+    if (!t) return;
+    free(t->row_prec); free(t->row_scale); free(t->row_off); free(t->codes);
+    memset(t, 0, sizeof *t);
+}
+
+int sp_frob_pack_tensor(int rows, int cols, int precision, float promote,
+                        sp_frob_row_fn get_row, void *ctx,
+                        sp_frob_packed_tensor *out, long *promoted) {
+    if (!out) return 1;
+    memset(out, 0, sizeof *out);
+    if (!get_row || rows <= 0 || cols <= 0 || (precision != 8 && precision != 4))
+        return 1;
+
+    float  *wrow = (float *)malloc((size_t)cols * sizeof(float));
+    int8_t *tmp  = (int8_t *)malloc((size_t)cols);                  /* Q4 pack scratch */
+    out->row_prec  = (uint8_t *)malloc((size_t)rows);
+    out->row_scale = (float *)malloc((size_t)rows * sizeof(float));
+    out->row_off   = (size_t *)malloc((size_t)rows * sizeof(size_t));
+    out->codes     = (uint8_t *)malloc((size_t)rows * (size_t)cols);   /* upper bound (all Q8) */
+    if (!wrow || !tmp || !out->row_prec || !out->row_scale || !out->row_off || !out->codes) {
+        free(wrow); free(tmp); sp_frob_packed_free(out); return 1;
+    }
+    out->rows = rows; out->cols = cols;
+
+    size_t off = 0;
+    int rc = 0;
+    for (int j = 0; j < rows; j++) {
+        if (get_row(ctx, j, wrow)) { rc = 1; break; }
+        float s = sp_frob_row_scale(wrow, cols);
+        int p = precision;
+        if (precision == 4 && sp_frob_q4_row_relerr(wrow, cols) > promote) {
+            p = 8; if (promoted) (*promoted)++;
+        }
+        out->row_prec[j]  = (uint8_t)p;
+        out->row_scale[j] = s;
+        out->row_off[j]   = off;
+        uint8_t *dst = out->codes + off;
+        if (p == 8) {
+            int8_t *q = (int8_t *)dst;
+            for (int i = 0; i < cols; i++) q[i] = sp_frob_quant1(wrow[i], s);
+            off += (size_t)cols;
+        } else {
+            for (int i = 0; i < cols; i++) tmp[i] = sp_frob_quant1_q4(wrow[i], s);
+            sp_frob_q4_pack(tmp, cols, dst);
+            off += (size_t)((cols + 1) / 2);
+        }
+    }
+    free(wrow); free(tmp);
+    if (rc) { sp_frob_packed_free(out); return 1; }
+
+    out->codes_bytes = off;
+    uint8_t *shr = (uint8_t *)realloc(out->codes, off ? off : 1);   /* shrink to actual */
+    if (shr) out->codes = shr;
+    return 0;
+}
+
+int sp_frob_packed_dequant_row(const sp_frob_packed_tensor *t, int r, float *dst) {
+    if (!t || !dst || r < 0 || r >= t->rows) return 1;
+    const uint8_t *rc = t->codes + t->row_off[r];
+    if (t->row_prec[r] == 8) {
+        const int8_t *cp = (const int8_t *)rc;
+        float inv = t->row_scale[r] / (float)SP_FROB_QMAX;
+        for (int i = 0; i < t->cols; i++) dst[i] = (float)cp[i] * inv;
+    } else {
+        float inv = t->row_scale[r] / (float)SP_FROB_QMAX4;
+        for (int i = 0; i < t->cols; i++) {
+            uint8_t b = (i & 1) ? (uint8_t)(rc[i >> 1] >> 4) : (uint8_t)(rc[i >> 1] & 0xF);
+            int8_t v = (int8_t)((b & 0x8) ? (int)b - 16 : (int)b);   /* sign-extend 4-bit */
+            dst[i] = (float)v * inv;
+        }
+    }
+    return 0;
+}
+
+size_t sp_frob_packed_tensor_bytes(const sp_frob_packed_tensor *t) {
+    if (!t) return 0;
+    return t->codes_bytes + (size_t)t->rows * (sizeof(float) + sizeof(size_t) + 1);
 }

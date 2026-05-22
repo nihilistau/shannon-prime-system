@@ -116,3 +116,34 @@ int sp_spinor_unpack(const uint8_t in[63], sp_spinor_block_t *blk) {
     blk->checksum = in[62];
     return 0;   /* pure inverse of pack; validation is sp_spinor_decode's job */
 }
+
+/* ── Multi-block KV head codec (frozen balanced split) ───────────────────────
+ * nblk = ceil(k/55); the k coordinates are split into nblk contiguous chunks
+ * sized base or base+1, with the first `extra` chunks taking the +1 (k=128,
+ * nblk=3 -> 43/43/42). Pure integer split, no data dependence, so it is identical
+ * on every backend. */
+int sp_spinor_blocks_for(int k) {
+    if (k <= SP_SPINOR_BODY_LEN) return 1;
+    return (k + SP_SPINOR_BODY_LEN - 1) / SP_SPINOR_BODY_LEN;
+}
+
+void sp_spinor_encode_vec(const float *vec, int k, sp_spinor_block_t *blocks) {
+    int nblk = sp_spinor_blocks_for(k);
+    int base = k / nblk, extra = k % nblk, off = 0;
+    for (int b = 0; b < nblk; b++) {
+        int len = base + (b < extra ? 1 : 0);
+        sp_spinor_encode(vec + off, len, &blocks[b]);
+        off += len;
+    }
+}
+
+int sp_spinor_decode_vec(const sp_spinor_block_t *blocks, int k, float *vec) {
+    int nblk = sp_spinor_blocks_for(k);
+    int base = k / nblk, extra = k % nblk, off = 0, rc = 0;
+    for (int b = 0; b < nblk; b++) {
+        int len = base + (b < extra ? 1 : 0);
+        if (sp_spinor_decode(&blocks[b], vec + off, len)) rc = 1;
+        off += len;
+    }
+    return rc;
+}

@@ -198,6 +198,59 @@ static void T_VHT_6(void) {
     SP_CHECK_EQ_I64(SP_SPINOR_LAYOUT_VERSION, 1, "frozen layout version == 1");
 }
 
+/* T_VHT_7 — multi-block KV head codec (the frozen balanced split).
+ *
+ * A head vector longer than 55 anchors is carried by ceil(k/55) blocks, split
+ * into balanced contiguous chunks. head_dim=128 => 3 blocks of 43/43/42. This is
+ * the cross-backend KV-record contract: encode_vec/decode_vec must equal an
+ * explicit per-chunk encode/decode of that split BIT-FOR-BIT, or backends that
+ * re-implement the split would write incompatible KV bytes. */
+static void T_VHT_7(void) {
+    /* (a) block count: ceil(k/55), min 1. */
+    SP_CHECK_EQ_I64(sp_spinor_blocks_for(1),   1, "blocks_for(1)=1");
+    SP_CHECK_EQ_I64(sp_spinor_blocks_for(55),  1, "blocks_for(55)=1");
+    SP_CHECK_EQ_I64(sp_spinor_blocks_for(56),  2, "blocks_for(56)=2");
+    SP_CHECK_EQ_I64(sp_spinor_blocks_for(110), 2, "blocks_for(110)=2");
+    SP_CHECK_EQ_I64(sp_spinor_blocks_for(111), 3, "blocks_for(111)=3");
+    SP_CHECK_EQ_I64(sp_spinor_blocks_for(128), 3, "blocks_for(128)=3 (head_dim)");
+    SP_CHECK_EQ_I64(sp_spinor_blocks_for(256), 5, "blocks_for(256)=5");
+
+    /* (b) a fixed random 128-vector. */
+    const int K = 128;
+    float vec[128];
+    rng_seed(0x7C0DEC0Du);
+    for (int i = 0; i < K; i++)
+        vec[i] = ((float)(rng_u32() & 0xFFFFFFu) / (float)(1u << 24) * 2.0f - 1.0f) * 3.0f;
+
+    /* (c) encode_vec == explicit 43/43/42 per-chunk encode, byte-for-byte. */
+    const int nblk = sp_spinor_blocks_for(K);   /* 3 */
+    const int lens[3] = { 43, 43, 42 };         /* the frozen split for K=128 */
+    sp_spinor_block_t blk[3], ref[3];
+    sp_spinor_encode_vec(vec, K, blk);
+    int off = 0;
+    for (int b = 0; b < nblk; b++) { sp_spinor_encode(vec + off, lens[b], &ref[b]); off += lens[b]; }
+    int blk_match = 1;
+    for (int b = 0; b < nblk; b++) {
+        uint8_t ia[63], ib[63];
+        sp_spinor_pack(&blk[b], ia); sp_spinor_pack(&ref[b], ib);
+        if (!bytes_eq(ia, ib, 63)) blk_match = 0;
+    }
+    SP_CHECK(blk_match, "encode_vec(128) == explicit 43/43/42 per-chunk encode (frozen split)");
+
+    /* (d) decode_vec == explicit per-chunk decode, bit-for-bit. */
+    float dvec[128], dref[128];
+    int rcd = sp_spinor_decode_vec(blk, K, dvec);
+    off = 0; int rcr = 0;
+    for (int b = 0; b < nblk; b++) { rcr |= sp_spinor_decode(&ref[b], dref + off, lens[b]); off += lens[b]; }
+    SP_CHECK(rcd == 0 && rcr == 0, "decode_vec + ref decode both verify CRC");
+    SP_CHECK(memcmp(dvec, dref, sizeof dvec) == 0, "decode_vec(128) == explicit per-chunk decode (bit-for-bit)");
+
+    /* (e) round-trip within int8 quantization tolerance (sanity). */
+    int approx_ok = 1;
+    for (int i = 0; i < K; i++) if (fabsf(dvec[i] - vec[i]) > 0.05f) { approx_ok = 0; break; }
+    SP_CHECK(approx_ok, "encode_vec->decode_vec within int8 quantization tolerance");
+}
+
 int main(void) {
     SP_RUN(T_VHT_1);
     SP_RUN(T_VHT_2);
@@ -205,5 +258,6 @@ int main(void) {
     SP_RUN(T_VHT_4);
     SP_RUN(T_VHT_5);
     SP_RUN(T_VHT_6);
+    SP_RUN(T_VHT_7);
     return SP_DONE();
 }
