@@ -44,6 +44,7 @@ set(SP_MODULES
     vht2            # 1D — VHT2 + Mobius reorder + 63-byte Spinor block
     frobenius       # 1E — Frobenius lift for Q8 weight storage
     kste            # 1F — KSTE encoder + Tier-0/Tier-1 dominance
+    arena           # L1 -- packed-weight arena (named sp_frob_packed_tensor set); listed after its 1E frobenius codec dependency
     dominance       # later — dominance order / signature dominance
     sieve           # later — Friedman sieve
     arm)            # later — Algebraic Resonance Memory
