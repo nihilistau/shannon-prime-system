@@ -13,10 +13,14 @@
 #include "sp/model.h"   /* qwen3_generate_kv and the forward prototypes */
 
 static void FORWARD_SMOKE(void) {
-    /* The only NULL-safe documented path: a NULL model is rejected with -1, not a crash. */
+    /* The NULL-safe documented paths: a NULL model is rejected with -1, not a crash. Calling
+     * both generation entry points pulls their objects (and transitively the prefill/forward
+     * they drive), link-exercising the whole forward module against the migrated closure. */
     int32_t dummy = 0;
     SP_CHECK_EQ_I64(qwen3_generate_kv(NULL, &dummy, 1, 0, -1), -1,
-                    "qwen3_generate_kv(NULL model) -> -1 (and links the whole forward module)");
+                    "qwen3_generate_kv(NULL model) -> -1 (persistent-KV decode guard)");
+    SP_CHECK_EQ_I64(qwen3_generate(NULL, &dummy, 1, 0, -1), -1,
+                    "qwen3_generate(NULL model) -> -1 (greedy O(n^2) generate guard)");
 }
 
 int main(void) { SP_RUN(FORWARD_SMOKE); return SP_DONE(); }
