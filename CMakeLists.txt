@@ -33,6 +33,7 @@ if(SP_SYSTEM_BUILD_TESTS)
 endif()
 
 set(SP_MODULES
+    forward_kernels # L1 -- portable scalar reference forward kernels (dot/rmsnorm/rope/attn)
     ok_arith        # 1A — O_K arithmetic over Q(sqrt-163)
     ntt_crt         # 1B — dual-prime CRT-NTT
     poly_ring       # 1C — R_q polynomial-ring attention
