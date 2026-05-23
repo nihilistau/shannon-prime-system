@@ -5,6 +5,7 @@
  * Win32 CreateFileMapping mirrors src/loader/gguf.c. */
 #include "sp/sp_model.h"
 #include "sp/sp_hash.h"
+#include "sp/sp_error.h"   /* sp_set_error — the backend-facing error setter (public header) */
 
 #include <stdlib.h>
 #include <string.h>
@@ -19,8 +20,6 @@
 #  include <sys/mman.h>
 #  include <sys/stat.h>
 #endif
-
-void sp_set_error(const char *msg);   /* internal (src/common/sp_error.c) */
 
 struct sp_model {
     const uint8_t  *base;       /* model mmap base */
