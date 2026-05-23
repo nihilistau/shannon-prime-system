@@ -35,6 +35,7 @@ endif()
 set(SP_MODULES
     forward_kernels # L1 -- portable scalar reference forward kernels (dot/rmsnorm/rope/attn)
     io_hash         # L1 -- .sp-model hash primitives (CRC-32 / SHA-256 / XXH64)
+    io_format       # L1 -- .sp-model mmap loader + accessors + L1 status-string impl
     ok_arith        # 1A — O_K arithmetic over Q(sqrt-163)
     ntt_crt         # 1B — dual-prime CRT-NTT
     poly_ring       # 1C — R_q polynomial-ring attention
