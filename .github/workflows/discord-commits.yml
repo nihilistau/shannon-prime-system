@@ -1,0 +1,53 @@
+name: discord-commits
+
+# Setup required:
+# 1) In this repository, go to Settings -> Secrets and variables -> Actions.
+# 2) Click "New repository secret".
+# 3) Name the secret exactly: DISCORD_WEBHOOK
+# 4) Paste your Discord webhook URL as the value and save.
+# The workflow will use that secret securely at runtime.
+
+on:
+  push:
+    branches: [ main ]
+
+permissions: {}
+
+jobs:
+  notify-discord:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate webhook secret is configured
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK" ]; then
+            echo "DISCORD_WEBHOOK is not configured. Add it under Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
+      - name: Send commit notification to Discord
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          COMMIT_AUTHOR: ${{ github.event.head_commit.author.name }}
+          COMMIT_URL: ${{ github.event.head_commit.url }}
+          BRANCH_NAME: ${{ github.ref_name }}
+        run: |
+          PAYLOAD="$(python - <<'PY'
+          import json
+          import os
+          content = (
+              f"New commit on `{os.environ['BRANCH_NAME']}`\n"
+              f"**Message:** {os.environ['COMMIT_MESSAGE']}\n"
+              f"**Author:** {os.environ['COMMIT_AUTHOR']}\n"
+              f"**Commit:** {os.environ['COMMIT_URL']}"
+          )
+          print(json.dumps({"content": content}))
+          PY
+          )"
+
+          curl --fail-with-body --silent --show-error -X POST \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "$DISCORD_WEBHOOK"
