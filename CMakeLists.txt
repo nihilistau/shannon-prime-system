@@ -47,6 +47,7 @@ set(SP_MODULES
     arena           # L1 -- packed-weight arena (named sp_frob_packed_tensor set); listed after its 1E frobenius codec dependency
     model           # L1 -- Qwen3/Gemma3 model representation + GGUF load/free/release lifecycle (on arena + gguf)
     forward_dispatch # L1 -- model-coupled weight-access kernels (matmul/embed/norm-accessor) on forward_kernels + arena
+    forward         # L1 -- Qwen3 forward orchestration: prefill + persistent-KV decode (on forward_dispatch + the overlay codecs poly_ring/kste/vht2)
     dominance       # later — dominance order / signature dominance
     sieve           # later — Friedman sieve
     arm)            # later — Algebraic Resonance Memory
