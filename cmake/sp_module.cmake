@@ -87,7 +87,14 @@ function(sp_add_module name)
         target_link_libraries(sp_${name} PUBLIC m)
     endif()
 
-    if(M_TEST)
+    # Gate the test-EXECUTABLE creation on SP_SYSTEM_BUILD_TESTS — the same lever the root
+    # CMakeLists already uses for enable_testing(). A consumer that add_subdirectory()'s the
+    # math core with tests off (the engine sets SP_SYSTEM_BUILD_TESTS OFF CACHE ... FORCE so the
+    # submodule's libs build but not its unit tests) must not have the module test exes created
+    # at all — otherwise their names (test_forward / test_arena / ...) collide with the consumer's
+    # own test targets (a hard CMake duplicate-target error). Undefined — standalone single-module
+    # builds (cmake -S core/<m>) — defaults on, preserving their built-in test target.
+    if(M_TEST AND (NOT DEFINED SP_SYSTEM_BUILD_TESTS OR SP_SYSTEM_BUILD_TESTS))
         if(NOT M_TEST_NAME)
             string(TOUPPER ${name} _u)
             set(M_TEST_NAME T_${_u})
