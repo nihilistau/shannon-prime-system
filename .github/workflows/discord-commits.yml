@@ -47,7 +47,7 @@ jobs:
           PY
           )"
 
-          curl --fail --show-error -X POST \
+          curl --fail-with-body --silent --show-error -X POST \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD" \
             "$DISCORD_WEBHOOK"
