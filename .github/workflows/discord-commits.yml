@@ -1,0 +1,25 @@
+name: discord-commits
+
+# Setup required:
+# 1) In this repository, go to Settings -> Secrets and variables -> Actions.
+# 2) Click "New repository secret".
+# 3) Name the secret exactly: DISCORD_WEBHOOK
+# 4) Paste your Discord webhook URL as the value and save.
+# The workflow will use that secret securely at runtime.
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  notify-discord:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send commit notification to Discord
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          curl -X POST \
+            -H "Content-Type: application/json" \
+            -d "{\"content\":${{ toJson(format('New commit on `{0}`\n**Message:** {1}\n**Author:** {2}\n**Commit:** {3}', github.ref_name, github.event.head_commit.message, github.event.head_commit.author.name, github.event.head_commit.url)) }}}" \
+            "$DISCORD_WEBHOOK"
