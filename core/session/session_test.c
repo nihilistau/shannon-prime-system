@@ -109,9 +109,120 @@ static void T_SESSION_GUARDS(void) {
     sp_model_unload(m); cleanup_files();
 }
 
+#define NPROMPT 5u    /* == sizeof(TOKS) */
+#define NGEN    100u
+
+static int argmax_f(const float *v, uint32_t n) {
+    int a = 0;
+    for (uint32_t j = 1; j < n; j++) if (v[j] > v[(uint32_t)a]) a = (int)j;
+    return a;
+}
+
+static void T_SESSION_DECODE_TRAJECTORY(void) {
+    sp_qwen3_fixture_info info; sp_model *m = NULL;
+    SP_CHECK(load_fixture(&info, &m) == 0, "fixture load");
+    if (!m) { cleanup_files(); return; }
+    const uint32_t V = info.n_vocab;
+
+    /* reference: greedy qwen3_generate_kv (persistent-KV) over NGEN tokens */
+    qwen3_model *ref = sp_model_to_qwen3(m);
+    int32_t *seq = (int32_t *)malloc((size_t)(NPROMPT + NGEN) * sizeof(int32_t));
+    for (uint32_t i = 0; i < NPROMPT; i++) seq[i] = TOKS[i];
+    int total = ref ? qwen3_generate_kv(ref, seq, (int)NPROMPT, (int)NGEN, -1) : -1;
+    SP_CHECK_EQ_I64(total, (int)(NPROMPT + NGEN), "qwen3_generate_kv produced NGEN tokens");
+
+    /* session: prefill the prompt, then greedily decode, taking our own argmax */
+    sp_session *s = NULL; sp_session_config cfg; memset(&cfg, 0, sizeof cfg); cfg.deterministic = 1;
+    SP_CHECK_EQ_I64(sp_session_create(m, &cfg, NULL, &s), SP_OK, "create");
+    float *lg = (float *)malloc((size_t)V * sizeof(float));
+    SP_CHECK_EQ_I64(sp_prefill_chunk(s, TOKS, NPROMPT, lg, V), SP_OK, "prefill");
+
+    int t = argmax_f(lg, V), matched = 1; uint32_t first_div = NGEN;
+    for (uint32_t k = 0; k < NGEN; k++) {
+        if (t != seq[NPROMPT + k]) { matched = 0; first_div = k; break; }
+        if (k + 1 < NGEN) {
+            if (sp_decode_step(s, t, lg, V) != SP_OK) { matched = 0; first_div = k; break; }
+            t = argmax_f(lg, V);
+        }
+    }
+    SP_CHECK(matched, "session greedy argmax trajectory == qwen3_generate_kv over 100 steps");
+    if (!matched) fprintf(stderr, "    [traj] first divergence at step %u\n", first_div);
+    size_t pos = 0; sp_session_position(s, &pos);
+    SP_CHECK_EQ_I64(pos, NPROMPT + (NGEN - 1u), "position == prompt + 99 decode steps");
+
+    free(lg); free(seq); if (ref) qwen3_free(ref);
+    sp_session_destroy(s); sp_model_unload(m); cleanup_files();
+}
+
+static void T_SESSION_CLONE_REWIND(void) {
+    sp_qwen3_fixture_info info; sp_model *m = NULL;
+    SP_CHECK(load_fixture(&info, &m) == 0, "fixture load");
+    if (!m) { cleanup_files(); return; }
+    const uint32_t V = info.n_vocab;
+
+    sp_session *s = NULL;
+    SP_CHECK_EQ_I64(sp_session_create(m, NULL, NULL, &s), SP_OK, "create");
+    float *lg = (float *)malloc((size_t)V * sizeof(float));
+    sp_prefill_chunk(s, TOKS, NPROMPT, lg, V);
+    int t = argmax_f(lg, V);
+    for (int k = 0; k < 3; k++) { sp_decode_step(s, t, lg, V); t = argmax_f(lg, V); }   /* pos = 5+3 = 8 */
+
+    /* clone: independent session with identical state */
+    sp_session *cl = NULL;
+    SP_CHECK_EQ_I64(sp_session_clone(s, NULL, &cl), SP_OK, "clone -> SP_OK");
+    size_t ps = 0, pc = 0; sp_session_position(s, &ps); sp_session_position(cl, &pc);
+    SP_CHECK_EQ_I64(ps, 8, "original position");
+    SP_CHECK_EQ_I64(pc, ps, "clone position matches original");
+
+    /* decoding the same token on both yields bit-identical logits (independent state) */
+    float *a = (float *)malloc((size_t)V * sizeof(float));
+    float *b = (float *)malloc((size_t)V * sizeof(float));
+    SP_CHECK_EQ_I64(sp_decode_step(s,  t, a, V), SP_OK, "orig decode");
+    SP_CHECK_EQ_I64(sp_decode_step(cl, t, b, V), SP_OK, "clone decode");
+    SP_CHECK(memcmp(a, b, (size_t)V * sizeof(float)) == 0, "clone decode logits BIT-EXACT vs original");
+
+    /* rewind */
+    SP_CHECK_EQ_I64(sp_session_rewind(s, 2), SP_OK, "rewind 2 -> SP_OK");
+    sp_session_position(s, &ps);
+    SP_CHECK_EQ_I64(ps, 7, "position after rewind (9 -> 7)");
+    SP_CHECK_EQ_I64(sp_session_rewind(s, 9999), SP_EBADARG, "rewind > position -> EBADARG");
+
+    free(lg); free(a); free(b);
+    sp_session_destroy(cl); sp_session_destroy(s); sp_model_unload(m); cleanup_files();
+}
+
+static void T_SESSION_CANCEL(void) {
+    sp_qwen3_fixture_info info; sp_model *m = NULL;
+    SP_CHECK(load_fixture(&info, &m) == 0, "fixture load");
+    if (!m) { cleanup_files(); return; }
+    const uint32_t V = info.n_vocab;
+
+    volatile int flag = 0;
+    sp_session *s = NULL;
+    SP_CHECK_EQ_I64(sp_session_create(m, NULL, &flag, &s), SP_OK, "create with cancel flag");
+    float *lg = (float *)malloc((size_t)V * sizeof(float));
+    SP_CHECK_EQ_I64(sp_prefill_chunk(s, TOKS, NPROMPT, lg, V), SP_OK, "prefill (flag clear)");
+    int t = argmax_f(lg, V);
+
+    flag = 1;
+    SP_CHECK_EQ_I64(sp_decode_step(s, t, lg, V), SP_ECANCEL, "decode with cancel -> SP_ECANCEL");
+    size_t pos = 0; sp_session_position(s, &pos);
+    SP_CHECK_EQ_I64(pos, NPROMPT, "position unchanged after cancel");
+    SP_CHECK_EQ_I64(sp_prefill_chunk(s, TOKS, 1, lg, V), SP_ECANCEL, "prefill with cancel -> SP_ECANCEL");
+
+    flag = 0;
+    SP_CHECK_EQ_I64(sp_decode_step(s, t, lg, V), SP_OK, "decode resumes after clearing cancel");
+
+    free(lg);
+    sp_session_destroy(s); sp_model_unload(m); cleanup_files();
+}
+
 int main(void) {
     SP_RUN(T_SESSION_BRIDGE);
     SP_RUN(T_SESSION_PREFILL_PARITY);
     SP_RUN(T_SESSION_GUARDS);
+    SP_RUN(T_SESSION_DECODE_TRAJECTORY);
+    SP_RUN(T_SESSION_CLONE_REWIND);
+    SP_RUN(T_SESSION_CANCEL);
     return SP_DONE();
 }
