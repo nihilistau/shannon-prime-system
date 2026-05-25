@@ -52,10 +52,29 @@
 extern "C" {
 #endif
 
+/* Working-precision enum (2-L1.FP16). Stored as a fixed-width uint32_t in
+ * sp_arch_info.preferred_precision and sp_session_config.precision_override (NOT as a
+ * raw `enum` field — enum width is implementation-defined and these cross the
+ * .sp-model wire / FFI boundary). */
+enum sp_precision {
+    SP_PRECISION_UNSPECIFIED = 0,
+    SP_PRECISION_F32         = 1,
+    SP_PRECISION_FP16        = 2,
+    SP_PRECISION_QF32        = 3,
+    /* SP_PRECISION_FP8     = 4   reserved for a future sub-phase (no kernel yet) */
+};
+
 /* ── §2 arch info -- caller-stack-allocated, L1 fills it in place ──
  * A public projection of the math core's model config. L2 reads this once at load to
  * size the logits buffer (vocab_size * sizeof(float)) and never re-queries. Rust
- * bindings should treat the out-parameter as &mut MaybeUninit<sp_arch_info>. */
+ * bindings should treat the out-parameter as &mut MaybeUninit<sp_arch_info>.
+ *
+ * Growth discipline: new fields are APPENDED in the reserved arch_struct tail
+ * (PPT-LAT-SP-MODEL-v0 §3, arch_struct_capacity = 256). The loader (sp_model_load.c)
+ * memcpy's min(arch_struct_size, sizeof(sp_arch_info)) bytes (sp_model_arch.c), so an
+ * old .sp-model (smaller arch_struct_size) leaves the appended fields ZERO — that is
+ * the "unspecified" sentinel for each. NOT an ABI version bump. sizeof MUST stay
+ * <= 256 (compile-asserted in sp_model_arch.c). */
 typedef struct {
     uint32_t arch_id;          /* sp_arch_id wire value (QWEN3=2, GEMMA3=3, ...)        */
     uint32_t vocab_size;       /* logits width; sizes the caller's logits buffer       */
@@ -71,6 +90,11 @@ typedef struct {
     uint8_t  norm_variant;     /* 0 = pre-norm only, 1 = sandwich (gemma3 post-norms)  */
     uint8_t  tied_embeddings;  /* LM head reuses the token-embedding matrix            */
     uint8_t  has_qk_norm;      /* per-head Q/K RMSNorm present                         */
+
+    /* ── appended 2-L1.FP16 (reserved arch_struct tail; 0 = unspecified) ── */
+    uint32_t n_ff;                /* feed-forward width; 0 -> bridge derives from ffn_gate shape */
+    float    rms_eps;             /* RMSNorm epsilon; 0.0 -> bridge defaults 1e-6 + load warning  */
+    uint32_t preferred_precision; /* sp_precision; 0 -> SP_PRECISION_UNSPECIFIED (session falls back) */
 } sp_arch_info;
 
 /* Populate *out from the loaded model's header arch_struct. Caller-stack-allocated.
@@ -84,6 +108,9 @@ typedef struct {
     uint32_t arm_bank_kb;     /* ARM HRR bank size; 0 = arch default (Phase 9+)         */
     uint32_t sieve_capacity;  /* Friedman-sieve frontier cap; 0 = arch default (Phase 5+) */
     uint32_t flags;           /* reserved bitfield (e.g. SP_VERIFY_TENSORS)            */
+    uint32_t precision_override; /* sp_precision (2-L1.FP16). Working-precision precedence:
+                                  *   override (non-zero) > arch_info.preferred_precision
+                                  *   (non-zero) > SP_PRECISION_F32. 0 = defer to the model. */
 } sp_session_config;
 
 /* ── §1 opaque session handle -- per-thread KV (+ later ARM/sieve) + arch scratch ── */
@@ -96,6 +123,13 @@ typedef struct sp_session sp_session;
 sp_status sp_session_create(const sp_model *m, const sp_session_config *cfg,
                             volatile int *cancel_flag, sp_session **out_session);
 void      sp_session_destroy(sp_session *s);
+
+/* Resolved working precision for this session (2-L1.FP16): the precedence result of
+ * cfg->precision_override > arch_info.preferred_precision > SP_PRECISION_F32, fixed at
+ * create. Backend dispatch reads this to select the fp16 vs f32 vs qf32 kernel path;
+ * the math-core reference forward ignores it (it stays f32, the bit-exact anchor).
+ * Returns an sp_precision value; SP_PRECISION_UNSPECIFIED on a NULL handle. */
+uint32_t  sp_session_precision(const sp_session *s);
 
 /* ── §3 two-function forward -- logits buffers are caller-allocated ──
  * prefill consumes n_tokens, advances position by n_tokens, writes ONLY the last

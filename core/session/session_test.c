@@ -226,6 +226,118 @@ static void T_SESSION_CANCEL(void) {
     sp_session_destroy(s); sp_model_unload(m); cleanup_files();
 }
 
+/* ── 2-L1.FP16 ABI extension: arch_struct growth + precision precedence ── */
+#include <stddef.h>   /* offsetof */
+
+static int load_fixture_opts(const sp_qwen3_fixture_opts *opts,
+                             sp_qwen3_fixture_info *info, sp_model **out) {
+    uint8_t *mb = NULL, *tb = NULL;
+    if (sp_qwen3_fixture_build_ex(&mb, &tb, info, opts)) return 1;
+    int rc = sp_qwen3_fixture_write("fx_q3.spm", mb, info->model_len)
+           | sp_qwen3_fixture_write("fx_q3.spt", tb, info->tok_len);
+    free(mb); free(tb);
+    if (rc) return 1;
+    return (sp_model_load("fx_q3.spm", "fx_q3.spt", out) == SP_OK) ? 0 : 1;
+}
+
+static void T_ARCH_GROWTH_OLD(void) {
+    /* arch_struct_size written = the pre-FP16 size (offsetof n_ff): the appended fields
+     * are TRUNCATED by the size-limited memcpy, so they read 0 and the bridge defaults. */
+    sp_qwen3_fixture_info info; sp_model *m = NULL;
+    sp_qwen3_fixture_opts opts; memset(&opts, 0, sizeof opts);
+    opts.arch_struct_size    = (uint32_t)offsetof(sp_arch_info, n_ff);
+    opts.preferred_precision = SP_PRECISION_FP16;   /* present in payload but truncated away */
+    opts.rms_eps_field       = 2.5e-5f;
+    opts.n_ff_field          = 999u;                /* bogus; must be ignored (truncated) */
+    SP_CHECK(load_fixture_opts(&opts, &info, &m) == 0, "old-size .sp-model loads (no SP_EBADFORMAT)");
+    if (!m) { cleanup_files(); return; }
+
+    sp_arch_info ai; memset(&ai, 0, sizeof ai);
+    SP_CHECK_EQ_I64(sp_model_arch(m, &ai), SP_OK, "arch query");
+    SP_CHECK_EQ_I64(ai.n_ff, 0, "old file: appended n_ff reads 0");
+    SP_CHECK(ai.rms_eps == 0.0f, "old file: appended rms_eps reads 0");
+    SP_CHECK_EQ_I64(ai.preferred_precision, SP_PRECISION_UNSPECIFIED, "old file: preferred_precision 0");
+
+    qwen3_model *qm = sp_model_to_qwen3(m);
+    SP_CHECK(qm != NULL, "bridge reconstructs");
+    if (qm) {
+        SP_CHECK_EQ_I64(qm->cfg.n_ff, info.n_ff, "n_ff derived from ffn_gate (not the bogus 999)");
+        SP_CHECK(qm->cfg.rms_eps == 1e-6f, "rms_eps defaulted to 1e-6");
+        qwen3_free(qm);
+    }
+    sp_session *s = NULL;
+    SP_CHECK_EQ_I64(sp_session_create(m, NULL, NULL, &s), SP_OK, "create");
+    SP_CHECK_EQ_I64(sp_session_precision(s), SP_PRECISION_F32, "old file -> resolved precision F32");
+    sp_session_destroy(s);
+    sp_model_unload(m); cleanup_files();
+}
+
+static void T_ARCH_GROWTH_NEW(void) {
+    /* full arch_struct_size: the appended fields are populated and read back. */
+    sp_qwen3_fixture_info info; sp_model *m = NULL;
+    sp_qwen3_fixture_opts opts; memset(&opts, 0, sizeof opts);
+    opts.arch_struct_size    = (uint32_t)sizeof(sp_arch_info);
+    opts.preferred_precision = SP_PRECISION_FP16;
+    opts.rms_eps_field       = 2.5e-5f;
+    opts.n_ff_field          = 12345u;   /* arbitrary; proves the field is read (not derived) */
+    SP_CHECK(load_fixture_opts(&opts, &info, &m) == 0, "new-size .sp-model loads");
+    if (!m) { cleanup_files(); return; }
+
+    sp_arch_info ai; memset(&ai, 0, sizeof ai);
+    SP_CHECK_EQ_I64(sp_model_arch(m, &ai), SP_OK, "arch query");
+    SP_CHECK_EQ_I64(ai.n_ff, 12345, "new file: n_ff read from arch_struct");
+    SP_CHECK(ai.rms_eps == 2.5e-5f, "new file: rms_eps read from arch_struct");
+    SP_CHECK_EQ_I64(ai.preferred_precision, SP_PRECISION_FP16, "new file: preferred_precision read");
+
+    qwen3_model *qm = sp_model_to_qwen3(m);   /* note: do NOT forward (n_ff=12345 != real ffn_gate) */
+    SP_CHECK(qm != NULL, "bridge reconstructs");
+    if (qm) {
+        SP_CHECK_EQ_I64(qm->cfg.n_ff, 12345, "bridge uses arch_struct.n_ff");
+        SP_CHECK(qm->cfg.rms_eps == 2.5e-5f, "bridge uses arch_struct.rms_eps");
+        qwen3_free(qm);
+    }
+    sp_model_unload(m); cleanup_files();
+}
+
+static void T_SESSION_PRECISION_PRECEDENCE(void) {
+    sp_qwen3_fixture_info info; sp_model *m = NULL;
+
+    /* model prefers FP16 */
+    sp_qwen3_fixture_opts opts; memset(&opts, 0, sizeof opts);
+    opts.arch_struct_size = (uint32_t)sizeof(sp_arch_info);
+    opts.preferred_precision = SP_PRECISION_FP16;
+    SP_CHECK(load_fixture_opts(&opts, &info, &m) == 0, "load (model prefers FP16)");
+    if (m) {
+        sp_session *s = NULL;
+        sp_session_config cfg; memset(&cfg, 0, sizeof cfg);
+        cfg.precision_override = SP_PRECISION_QF32;
+        SP_CHECK_EQ_I64(sp_session_create(m, &cfg, NULL, &s), SP_OK, "create (override QF32)");
+        SP_CHECK_EQ_I64(sp_session_precision(s), SP_PRECISION_QF32, "override > arch preference");
+        sp_session_destroy(s);
+
+        s = NULL;
+        SP_CHECK_EQ_I64(sp_session_create(m, NULL, NULL, &s), SP_OK, "create (no override)");
+        SP_CHECK_EQ_I64(sp_session_precision(s), SP_PRECISION_FP16, "arch preference > default");
+        sp_session_destroy(s);
+        sp_model_unload(m);
+    }
+    cleanup_files();
+
+    /* model unspecified -> f32 default */
+    m = NULL;
+    sp_qwen3_fixture_opts opts2; memset(&opts2, 0, sizeof opts2);
+    opts2.arch_struct_size = (uint32_t)sizeof(sp_arch_info);   /* preferred_precision left 0 */
+    SP_CHECK(load_fixture_opts(&opts2, &info, &m) == 0, "load (model unspecified)");
+    if (m) {
+        sp_session *s = NULL;
+        SP_CHECK_EQ_I64(sp_session_create(m, NULL, NULL, &s), SP_OK, "create (no override, no preference)");
+        SP_CHECK_EQ_I64(sp_session_precision(s), SP_PRECISION_F32, "default -> F32");
+        sp_session_destroy(s);
+        sp_model_unload(m);
+    }
+    cleanup_files();
+}
+
 int main(void) {
     SP_RUN(T_SESSION_BRIDGE);
     SP_RUN(T_SESSION_PREFILL_PARITY);
@@ -233,5 +345,8 @@ int main(void) {
     SP_RUN(T_SESSION_DECODE_TRAJECTORY);
     SP_RUN(T_SESSION_CLONE_REWIND);
     SP_RUN(T_SESSION_CANCEL);
+    SP_RUN(T_ARCH_GROWTH_OLD);
+    SP_RUN(T_ARCH_GROWTH_NEW);
+    SP_RUN(T_SESSION_PRECISION_PRECEDENCE);
     return SP_DONE();
 }

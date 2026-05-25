@@ -39,6 +39,7 @@ struct sp_session {
     size_t             hist_cap;    /* == effective max_context (== kv_cap) */
     size_t             pos;         /* current sequence position */
     uint32_t           n_vocab;
+    uint32_t           resolved_precision; /* sp_precision (2-L1.FP16); fixed at create */
     /* persistent decode KV (lazily allocated on first sp_decode_step) */
     float             *kc, *vc;     /* [n_layers * hist_cap * KVD] each */
     size_t             kv_filled;   /* positions [0, kv_filled) hold valid KV */
@@ -61,6 +62,16 @@ sp_status sp_session_create(const sp_model *m, const sp_session_config *cfg,
     if (!s) { qwen3_free(qm); sp_set_error("sp_session_create: OOM"); return SP_ENOMEM; }
     s->model = m; s->qm = qm; s->cancel = cancel_flag; s->n_vocab = qm->cfg.n_vocab;
     if (cfg) s->cfg = *cfg;
+
+    /* 2-L1.FP16 working-precision resolution: override > arch preference > f32. Fixed at
+     * create; backend dispatch reads it via sp_session_precision. (math-core stays f32.) */
+    {
+        sp_arch_info ai; memset(&ai, 0, sizeof ai);
+        (void)sp_model_arch(m, &ai);   /* m is valid: qm was just built from it */
+        uint32_t ovr  = cfg ? cfg->precision_override : 0u;
+        uint32_t pref = ai.preferred_precision;
+        s->resolved_precision = ovr ? ovr : (pref ? pref : (uint32_t)SP_PRECISION_F32);
+    }
 
     size_t cap = s->cfg.max_context;
     if (cap == 0) cap = qm->cfg.context_length;
@@ -87,6 +98,10 @@ sp_status sp_session_position(const sp_session *s, size_t *pos_out) {
     if (!s || !pos_out) { sp_set_error("sp_session_position: null arg"); return SP_EBADARG; }
     *pos_out = s->pos;
     return SP_OK;
+}
+
+uint32_t sp_session_precision(const sp_session *s) {
+    return s ? s->resolved_precision : (uint32_t)SP_PRECISION_UNSPECIFIED;
 }
 
 /* ── prefill (bit-exact reference forward over the accumulated history) ── */

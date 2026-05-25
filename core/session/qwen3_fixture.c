@@ -88,7 +88,8 @@ static int cmp_hash(const void *a, const void *b) {
     return (ha < hb) ? -1 : (ha > hb) ? 1 : 0;
 }
 
-int sp_qwen3_fixture_build(uint8_t **model_buf, uint8_t **tok_buf, sp_qwen3_fixture_info *info) {
+int sp_qwen3_fixture_build_ex(uint8_t **model_buf, uint8_t **tok_buf,
+                              sp_qwen3_fixture_info *info, const sp_qwen3_fixture_opts *opts) {
     if (!model_buf || !tok_buf || !info) return 1;
     memset(info, 0, sizeof *info);
     info->n_layers = FX_NL; info->n_embd = FX_E; info->n_ff = FX_FF;
@@ -100,6 +101,15 @@ int sp_qwen3_fixture_build(uint8_t **model_buf, uint8_t **tok_buf, sp_qwen3_fixt
     a->n_layers = FX_NL; a->n_heads = FX_NH; a->n_kv_heads = FX_NKV; a->head_dim = FX_HD;
     a->max_context = 256u; a->swa_window = 0u; a->rope_freq_base = 1e6f;
     a->ffn_variant = 0u; a->norm_variant = 0u; a->tied_embeddings = 1u; a->has_qk_norm = 1u;
+    /* appended (2-L1.FP16) fields: a realistic new-format model specifies n_ff + rms_eps
+     * (so the default build does not trip the bridge's rms_eps-absent warning);
+     * preferred_precision left 0 = unspecified. opts override all three below. */
+    a->n_ff = FX_FF; a->rms_eps = 1e-6f; a->preferred_precision = SP_PRECISION_UNSPECIFIED;
+    if (opts) {
+        a->preferred_precision = opts->preferred_precision;          /* 0 is meaningful (unspecified) */
+        if (opts->rms_eps_field != 0.0f) a->rms_eps = opts->rms_eps_field;
+        if (opts->n_ff_field)            a->n_ff    = opts->n_ff_field;
+    }
 
     /* ── tokenizer ── */
     const size_t tok_len = (size_t)SP_TOK_HEADER_SIZE + FX_TOKBLOB;
@@ -180,9 +190,11 @@ int sp_qwen3_fixture_build(uint8_t **model_buf, uint8_t **tok_buf, sp_qwen3_fixt
         sp_model_header h; memset(&h, 0, sizeof h);
         h.magic = SP_MODEL_MAGIC; h.version_major = SP_MODEL_VER_MAJOR;
         h.version_minor = SP_MODEL_VER_MINOR; h.header_size = SP_HEADER_SIZE;
-        h.arch_id = a->arch_id; h.arch_struct_size = (uint32_t)sizeof(sp_arch_info);
+        h.arch_id = a->arch_id;
+        h.arch_struct_size = (opts && opts->arch_struct_size) ? opts->arch_struct_size
+                                                              : (uint32_t)sizeof(sp_arch_info);
         h.arch_struct_capacity = 256u;
-        memcpy(h.arch_struct, a, sizeof *a);
+        memcpy(h.arch_struct, a, sizeof *a);   /* full payload written; arch_struct_size caps the read */
         sp_sha256(tk, tok_len, h.tokenizer_hash);
         h.vocab_size = FX_V; h.tensor_count = (uint32_t)n;
         h.tensor_table_offset = table_off; h.tensor_data_offset = data_off;
@@ -198,6 +210,10 @@ int sp_qwen3_fixture_build(uint8_t **model_buf, uint8_t **tok_buf, sp_qwen3_fixt
     *model_buf = mb;
     *tok_buf = tk;
     return 0;
+}
+
+int sp_qwen3_fixture_build(uint8_t **model_buf, uint8_t **tok_buf, sp_qwen3_fixture_info *info) {
+    return sp_qwen3_fixture_build_ex(model_buf, tok_buf, info, NULL);
 }
 
 int sp_qwen3_fixture_write(const char *path, const uint8_t *buf, size_t len) {
