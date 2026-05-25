@@ -8,6 +8,7 @@
 #include "sp/sp_l1.h"
 #include "sp/sp_model.h"
 #include "sp/model.h"
+#include "sp/sp_hash.h"
 #include "qwen3_fixture.h"
 
 #include <stdlib.h>
@@ -22,6 +23,14 @@ static int load_fixture(sp_qwen3_fixture_info *info, sp_model **out) {
     if (sp_qwen3_fixture_build(&mb, &tb, info)) return 1;
     int rc = sp_qwen3_fixture_write("fx_q3.spm", mb, info->model_len)
            | sp_qwen3_fixture_write("fx_q3.spt", tb, info->tok_len);
+    static int sha_printed = 0;
+    if (!sha_printed) {
+        uint8_t dg[32]; sp_sha256(mb, info->model_len, dg);
+        fprintf(stderr, "    [fixture] qwen3 .sp-model SHA-256 (%zu bytes): ", info->model_len);
+        for (unsigned i = 0; i < 32u; i++) fprintf(stderr, "%02x", (unsigned)dg[i]);
+        fprintf(stderr, "\n");
+        sha_printed = 1;
+    }
     free(mb); free(tb);
     if (rc) return 1;
     return (sp_model_load("fx_q3.spm", "fx_q3.spt", out) == SP_OK) ? 0 : 1;
