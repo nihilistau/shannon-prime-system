@@ -10,6 +10,7 @@
 #include "sp/model.h"
 #include "sp/sp_hash.h"
 #include "sp/spinor_block.h"
+#include "sp/arena.h"
 #include "qwen3_fixture.h"
 
 #include <stdlib.h>
@@ -383,8 +384,133 @@ static void T_PARITY_KV_SPINOR(void) {
     sp_model_unload(m); cleanup_files();
 }
 
+static void T_PARITY_CROSS_LOAD(void) {
+    /* E_PARITY_3 integration gate: engine-transcoded Qwen3-0.6B .sp-model (arch_struct
+     * now written as sp_arch_info) loads via math-core sp_model_load; arch fields
+     * round-trip correctly through sp_model_arch; prefill produces finite logits.
+     * Skips gracefully if the artifact is absent (standalone math-core suite run). */
+    const char *mpath = "D:/F/shannon-prime-repos/shannon-prime-system-engine/"
+                        "build-cpu/tests/qwen3_rt.sp-model";
+    const char *tpath = "D:/F/shannon-prime-repos/shannon-prime-system-engine/"
+                        "build-cpu/tests/qwen3_rt.sp-tokenizer";
+    FILE *probe = fopen(mpath, "rb");
+    if (!probe) {
+        fprintf(stderr, "    [E_PARITY_3] cross-load: artifact absent — SKIP\n");
+        return;
+    }
+    fclose(probe);
+
+    sp_model *m = NULL;
+    SP_CHECK_EQ_I64(sp_model_load(mpath, tpath, &m), SP_OK,
+                    "sp_model_load (engine-transcoded Qwen3-0.6B)");
+    if (!m) return;
+
+    /* arch_struct round-trip: transcoder wrote sp_arch_info; verify key fields */
+    sp_arch_info ai; memset(&ai, 0, sizeof ai);
+    SP_CHECK_EQ_I64(sp_model_arch(m, &ai), SP_OK, "sp_model_arch");
+    SP_CHECK_EQ_I64(ai.arch_id,    SP_ARCH_ID_QWEN3, "arch_id == QWEN3 (E_PARITY_3)");
+    SP_CHECK_EQ_I64(ai.vocab_size,        151936,     "vocab_size == 151936");
+    SP_CHECK_EQ_I64(ai.n_layers,              28,     "n_layers == 28");
+    SP_CHECK_EQ_I64(ai.hidden_dim,          1024,     "hidden_dim == 1024");
+    SP_CHECK_EQ_I64(ai.n_heads,               16,     "n_heads == 16");
+    SP_CHECK_EQ_I64(ai.n_kv_heads,             8,     "n_kv_heads == 8");
+    SP_CHECK_EQ_I64(ai.head_dim,             128,     "head_dim == 128");
+    SP_CHECK_EQ_I64(ai.preferred_precision, SP_PRECISION_FP16,
+                    "preferred_precision == FP16 (transcoder contract)");
+    SP_CHECK(ai.n_ff > 0, "n_ff populated (not zero) in arch_struct");
+    fprintf(stderr, "    [E_PARITY_3] arch: n_ff=%u  rms_eps=%.2e  prec=%u\n",
+            ai.n_ff, (double)ai.rms_eps, ai.preferred_precision);
+
+    /* session + short prefill: proves cross-load end-to-end wiring */
+    static const int32_t cross_toks[4] = { 1, 7, 3, 42 };
+    const uint32_t V = ai.vocab_size;
+    sp_session *s = NULL;
+    sp_session_config cfg; memset(&cfg, 0, sizeof cfg);
+    cfg.deterministic = 1;
+    cfg.max_context   = 32;   /* small cap: avoid full-context KV alloc on a real model */
+    SP_CHECK_EQ_I64(sp_session_create(m, &cfg, NULL, &s), SP_OK,
+                    "sp_session_create (cross-load)");
+    float *lg = (float *)malloc((size_t)V * sizeof(float));
+    SP_CHECK(lg != NULL, "alloc logits");
+    if (s && lg) {
+        SP_CHECK_EQ_I64(sp_prefill_chunk(s, cross_toks, 4u, lg, V), SP_OK,
+                        "sp_prefill_chunk (cross-load)");
+        int finite = 1;
+        for (uint32_t i = 0; i < V; i++) if (!isfinite(lg[i])) { finite = 0; break; }
+        SP_CHECK(finite, "cross-load prefill all logits finite (E_PARITY_3)");
+        if (finite)
+            fprintf(stderr, "    [E_PARITY_3] cross-load argmax: tok %d\n",
+                    argmax_f(lg, V));
+    }
+    free(lg);
+    if (s) sp_session_destroy(s);
+    sp_model_unload(m);
+}
+
+static void T_PARITY_Q4_BRIDGE(void) {
+    /* E_PARITY_2: bridge reads SP_DT_OK_Q4 (nibble-packed) tensors and builds a
+     * sp_frob_packed_tensor with row_prec=4. Gate: (1) forward logits finite (Q4
+     * decode path wired end-to-end); (2) Q4 arena bytes < Q8 arena bytes (compression
+     * mechanism works — ratio ~2x by construction for even-column dimensions). */
+    sp_qwen3_fixture_info q8info, q4info;
+    sp_model *mq8 = NULL, *mq4 = NULL;
+    SP_CHECK(load_fixture(&q8info, &mq8) == 0, "Q8 fixture load");
+    if (!mq8) { cleanup_files(); return; }
+
+    sp_qwen3_fixture_opts q4opts; memset(&q4opts, 0, sizeof q4opts);
+    q4opts.use_q4 = 1u;
+    uint8_t *mb = NULL, *tb = NULL;
+    SP_CHECK(sp_qwen3_fixture_build_ex(&mb, &tb, &q4info, &q4opts) == 0, "Q4 fixture build");
+    if (!mb) { sp_model_unload(mq8); cleanup_files(); return; }
+    int wrc = sp_qwen3_fixture_write("fx_q4.spm", mb, q4info.model_len)
+            | sp_qwen3_fixture_write("fx_q4.spt", tb, q4info.tok_len);
+    free(mb); free(tb);
+    SP_CHECK(!wrc, "Q4 fixture write");
+    if (wrc) { sp_model_unload(mq8); cleanup_files(); remove("fx_q4.spm"); remove("fx_q4.spt"); return; }
+    SP_CHECK(sp_model_load("fx_q4.spm", "fx_q4.spt", &mq4) == SP_OK, "Q4 sp_model_load");
+    remove("fx_q4.spm"); remove("fx_q4.spt");
+    if (!mq4) { sp_model_unload(mq8); cleanup_files(); return; }
+
+    /* verify tensor dtype is Q4 */
+    const sp_tensor_entry *te = sp_model_find_tensor(mq4, "token_embd.weight");
+    SP_CHECK(te && te->dtype_id == SP_DT_OK_Q4, "token_embd.weight is OK_Q4 in Q4 fixture");
+
+    /* bridge Q4 fixture */
+    qwen3_model *qm8 = sp_model_to_qwen3(mq8);
+    qwen3_model *qm4 = sp_model_to_qwen3(mq4);
+    SP_CHECK(qm8 != NULL, "Q8 bridge -> non-NULL");
+    SP_CHECK(qm4 != NULL, "Q4 bridge -> non-NULL");
+
+    if (qm4) {
+        /* forward must be finite (Q4 decode path wired through the arena) */
+        size_t N = (size_t)NTOK * q4info.n_vocab;
+        float *lg = (float *)malloc(N * sizeof(float));
+        SP_CHECK(lg != NULL, "alloc logits");
+        if (lg) {
+            SP_CHECK(qwen3_forward(qm4, TOKS, (int)NTOK, lg) == 0, "Q4 qwen3_forward ok");
+            int finite = 1;
+            for (size_t i = 0; i < N; i++) if (!isfinite(lg[i])) { finite = 0; break; }
+            SP_CHECK(finite, "Q4 bridge forward: all logits finite (E_PARITY_2)");
+            free(lg);
+        }
+
+        /* arena footprint: Q4 must be smaller than Q8 */
+        size_t bytes_q8 = qm8 ? sp_arena_bytes(qm8->arena) : 0;
+        size_t bytes_q4 = sp_arena_bytes(qm4->arena);
+        fprintf(stderr, "    [E_PARITY_2] arena: Q8=%zuB  Q4=%zuB  ratio=%.3f\n",
+                bytes_q8, bytes_q4, bytes_q8 > 0 ? (double)bytes_q4 / (double)bytes_q8 : 0.0);
+        SP_CHECK(bytes_q4 < bytes_q8, "Q4 arena bytes < Q8 arena bytes (compression green)");
+    }
+
+    if (qm8) qwen3_free(qm8);
+    if (qm4) qwen3_free(qm4);
+    sp_model_unload(mq8); sp_model_unload(mq4); cleanup_files();
+}
+
 int main(void) {
     SP_RUN(T_PARITY_KV_SPINOR);
+    SP_RUN(T_PARITY_Q4_BRIDGE);
+    SP_RUN(T_PARITY_CROSS_LOAD);
     SP_RUN(T_SESSION_BRIDGE);
     SP_RUN(T_SESSION_PREFILL_PARITY);
     SP_RUN(T_SESSION_GUARDS);
