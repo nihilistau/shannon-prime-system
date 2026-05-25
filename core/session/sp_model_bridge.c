@@ -111,10 +111,17 @@ struct qwen3_model *sp_model_to_qwen3(const sp_model *sm) {
         return NULL;
     }
 
-    /* n_ff from the ffn_gate out-dimension (not carried in sp_arch_info). */
-    const sp_tensor_entry *fg = sp_model_find_tensor(sm, "blk.0.ffn_gate.weight");
-    if (!fg || fg->n_dims < 2) { sp_set_error("sp_model_to_qwen3: missing blk.0.ffn_gate.weight"); return NULL; }
-    const uint32_t n_ff = (uint32_t)fg->dims[1];
+    /* n_ff (2-L1.FP16): prefer arch_struct.n_ff; fall back to the ffn_gate out-dim for
+     * old .sp-model files that predate the field (n_ff == 0). */
+    uint32_t n_ff = ai.n_ff;
+    if (n_ff == 0) {
+        const sp_tensor_entry *fg = sp_model_find_tensor(sm, "blk.0.ffn_gate.weight");
+        if (!fg || fg->n_dims < 2) {
+            sp_set_error("sp_model_to_qwen3: arch_struct.n_ff==0 and blk.0.ffn_gate.weight missing");
+            return NULL;
+        }
+        n_ff = (uint32_t)fg->dims[1];
+    }
 
     const int NSYN   = 2 + 11 * (int)NL;
     const int NARENA = 1 + 7 * (int)NL;
@@ -197,7 +204,13 @@ struct qwen3_model *sp_model_to_qwen3(const sp_model *sm) {
     c->context_length = ai.max_context;
     c->sliding_window = ai.swa_window;
     c->rope_freq_base = ai.rope_freq_base;
-    c->rms_eps        = 1e-6f;                 /* not in sp_arch_info — format-v1 gap */
+    if (ai.rms_eps != 0.0f) {                  /* 2-L1.FP16: prefer arch_struct.rms_eps */
+        c->rms_eps = ai.rms_eps;
+    } else {                                   /* old .sp-model (field absent) -> default + warn */
+        c->rms_eps = 1e-6f;
+        fprintf(stderr, "[sp_model_to_qwen3] warning: arch_struct.rms_eps == 0; defaulting to 1e-6 "
+                        "(model predates the rms_eps field)\n");
+    }
     c->has_qk_norm    = ai.has_qk_norm ? 1 : 0;
     c->tied_embedding = ai.tied_embeddings ? 1 : 0;
 
