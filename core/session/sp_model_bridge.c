@@ -102,6 +102,15 @@ struct qwen3_model *sp_model_to_qwen3(const sp_model *sm) {
     const uint32_t NL = ai.n_layers;
     if (NL == 0) { sp_set_error("sp_model_to_qwen3: zero layers"); return NULL; }
 
+    /* v0 limit (fail loud, not silent): only tied embeddings + the qwen3 weight set
+     * are reconstructed. An untied model needs output.weight packed into the arena as a
+     * separate entry; gemma3 needs its sandwich post-norms in the NORM list + an
+     * arch-conditional forward. Both are follow-ups (no fixture/gate exercises them). */
+    if (!ai.tied_embeddings) {
+        sp_set_error("sp_model_to_qwen3: untied embeddings not yet supported (output.weight bridge is a follow-up)");
+        return NULL;
+    }
+
     /* n_ff from the ffn_gate out-dimension (not carried in sp_arch_info). */
     const sp_tensor_entry *fg = sp_model_find_tensor(sm, "blk.0.ffn_gate.weight");
     if (!fg || fg->n_dims < 2) { sp_set_error("sp_model_to_qwen3: missing blk.0.ffn_gate.weight"); return NULL; }
@@ -202,7 +211,7 @@ struct qwen3_model *sp_model_to_qwen3(const sp_model *sm) {
     qm->n_norm        = ni;
     qm->token_embd    = &synth[embd_syn];
     qm->output_norm   = &synth[onorm_syn];
-    qm->output        = qm->token_embd;        /* fixture/v0 is tied */
+    qm->output        = qm->token_embd;        /* tied: LM head reuses the embedding (untied rejected above) */
     return qm;
 
 fail:
