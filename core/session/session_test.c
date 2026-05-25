@@ -9,6 +9,7 @@
 #include "sp/sp_model.h"
 #include "sp/model.h"
 #include "sp/sp_hash.h"
+#include "sp/spinor_block.h"
 #include "qwen3_fixture.h"
 
 #include <stdlib.h>
@@ -338,7 +339,52 @@ static void T_SESSION_PRECISION_PRECEDENCE(void) {
     cleanup_files();
 }
 
+static void T_PARITY_KV_SPINOR(void) {
+    /* E_PARITY_1: the session's Spinor-block KV cache (SP_KV_SPINOR) must produce
+     * decode logits BIT-IDENTICAL to the f32 + in-place-Spinor-roundtrip reference
+     * (SP_KV_SPINOR_REF) — decode-from-block === in-place-roundtrip by codec identity
+     * (the E_CPU_8 / GEN_KV_SPINOR gate, verifiable without a real model). */
+    sp_qwen3_fixture_info info; sp_model *m = NULL;
+    SP_CHECK(load_fixture(&info, &m) == 0, "fixture load");
+    if (!m) { cleanup_files(); return; }
+    const uint32_t V = info.n_vocab;
+
+    sp_session *sb = NULL, *sr = NULL;
+    sp_session_config cb; memset(&cb, 0, sizeof cb); cb.deterministic = 1; cb.flags = SP_KV_SPINOR;
+    sp_session_config cr; memset(&cr, 0, sizeof cr); cr.deterministic = 1; cr.flags = SP_KV_SPINOR_REF;
+    SP_CHECK_EQ_I64(sp_session_create(m, &cb, NULL, &sb), SP_OK, "create (SP_KV_SPINOR block cache)");
+    SP_CHECK_EQ_I64(sp_session_create(m, &cr, NULL, &sr), SP_OK, "create (SP_KV_SPINOR_REF f32 roundtrip)");
+
+    float *lb = (float *)malloc((size_t)V * sizeof(float));
+    float *lr = (float *)malloc((size_t)V * sizeof(float));
+    SP_CHECK_EQ_I64(sp_prefill_chunk(sb, TOKS, NPROMPT, lb, V), SP_OK, "prefill block");
+    SP_CHECK_EQ_I64(sp_prefill_chunk(sr, TOKS, NPROMPT, lr, V), SP_OK, "prefill ref");
+    int tb = argmax_f(lb, V), tr = argmax_f(lr, V);
+    int identical = 1;
+    for (int k = 0; k < 8; k++) {
+        if (sp_decode_step(sb, tb, lb, V) != SP_OK || sp_decode_step(sr, tr, lr, V) != SP_OK) { identical = 0; break; }
+        if (memcmp(lb, lr, (size_t)V * sizeof(float)) != 0) { identical = 0; break; }
+        tb = argmax_f(lb, V); tr = argmax_f(lr, V);
+    }
+    SP_CHECK(identical, "Spinor block-KV decode logits BIT-IDENTICAL to f32-roundtrip ref (E_PARITY_1)");
+
+    /* structural footprint: per (layer,position,kv-head) the compressed cache stores
+     * sp_spinor_blocks_for(head_dim) 63-byte blocks vs head_dim*4 f32 bytes. */
+    int nblk = sp_spinor_blocks_for((int)info.head_dim);
+    size_t blk_bytes = (size_t)nblk * sizeof(sp_spinor_block_t);
+    size_t f32_bytes = (size_t)info.head_dim * sizeof(float);
+    fprintf(stderr, "    [E_PARITY_1] per-head KV: spinor %zuB (%d blk) vs f32 %zuB  (head_dim=%u; "
+                    "real head_dim=128 -> 3*63=189B vs 512B = 2.71x)\n",
+            blk_bytes, nblk, f32_bytes, info.head_dim);
+    SP_CHECK(nblk == sp_spinor_blocks_for((int)info.head_dim), "blocks-per-head deterministic");
+
+    free(lb); free(lr);
+    sp_session_destroy(sb); sp_session_destroy(sr);
+    sp_model_unload(m); cleanup_files();
+}
+
 int main(void) {
+    SP_RUN(T_PARITY_KV_SPINOR);
     SP_RUN(T_SESSION_BRIDGE);
     SP_RUN(T_SESSION_PREFILL_PARITY);
     SP_RUN(T_SESSION_GUARDS);

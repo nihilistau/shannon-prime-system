@@ -22,6 +22,7 @@
 #include "sp/model.h"
 #include "sp/forward_dispatch.h"   /* sp_matmul / sp_embed_row / sp_as_f32 */
 #include "sp/forward_kernels.h"    /* sp_rmsnorm / sp_rmsnorm_head / sp_rope_neox */
+#include "sp/spinor_block.h"       /* 2-L1.PARITY: VHT2+Mobius Spinor KV codec */
 #include "sp/sp_error.h"
 
 #include <stdlib.h>
@@ -40,10 +41,16 @@ struct sp_session {
     size_t             pos;         /* current sequence position */
     uint32_t           n_vocab;
     uint32_t           resolved_precision; /* sp_precision (2-L1.FP16); fixed at create */
-    /* persistent decode KV (lazily allocated on first sp_decode_step) */
-    float             *kc, *vc;     /* [n_layers * hist_cap * KVD] each */
+    /* persistent decode KV (lazily allocated on first sp_decode_step).
+     * kv_mode (2-L1.PARITY): 0 = f32 cache (default); 1 = Spinor block cache (SP_KV_SPINOR);
+     * 2 = f32 cache + in-place Spinor roundtrip (SP_KV_SPINOR_REF parity reference). */
+    int                kv_mode;
+    int                nblk;        /* sp_spinor_blocks_for(head_dim); blocks per head (mode 1) */
+    float             *kc, *vc;     /* [n_layers * hist_cap * KVD] (modes 0/2) */
+    sp_spinor_block_t *kcb, *vcb;   /* [n_layers * hist_cap * NKV * nblk] (mode 1, compressed) */
+    float             *kdec, *vdec; /* [hist_cap * KVD] per-layer window decode scratch (mode 1) */
     size_t             kv_filled;   /* positions [0, kv_filled) hold valid KV */
-    /* per-step scratch (allocated with kc/vc) */
+    /* per-step scratch */
     float *sx, *snx, *sq, *sknew, *svnew, *sao, *sap, *sgg, *sup, *sdn, *ssc;
 };
 
@@ -73,6 +80,12 @@ sp_status sp_session_create(const sp_model *m, const sp_session_config *cfg,
         s->resolved_precision = ovr ? ovr : (pref ? pref : (uint32_t)SP_PRECISION_F32);
     }
 
+    /* 2-L1.PARITY: KV codec mode from cfg->flags (default 0 = persistent f32). */
+    {
+        uint32_t kvf = cfg ? cfg->flags : 0u;
+        s->kv_mode = (kvf & SP_KV_SPINOR) ? 1 : (kvf & SP_KV_SPINOR_REF) ? 2 : 0;
+    }
+
     size_t cap = s->cfg.max_context;
     if (cap == 0) cap = qm->cfg.context_length;
     if (cap == 0) cap = SP_SESSION_CTX_FALLBACK;
@@ -89,6 +102,7 @@ void sp_session_destroy(sp_session *s) {
     qwen3_free(s->qm);
     free(s->hist);
     free(s->kc); free(s->vc);
+    free(s->kcb); free(s->vcb); free(s->kdec); free(s->vdec);
     free(s->sx); free(s->snx); free(s->sq); free(s->sknew); free(s->svnew);
     free(s->sao); free(s->sap); free(s->sgg); free(s->sup); free(s->sdn); free(s->ssc);
     free(s);
@@ -129,14 +143,37 @@ sp_status sp_prefill_chunk(sp_session *s, const int32_t *tokens, size_t n_tokens
 }
 
 /* ── decode (persistent-KV, one token) ── */
+#define SP_KV_MAX_BLOCKS 16   /* head_dim up to 16*55 = 880 */
+/* In-place Spinor encode->decode roundtrip of a length-d head vector (mode-2 parity
+ * reference): produces exactly what the block cache decodes back, so mode 1 == mode 2. */
+static void spinor_roundtrip(float *vec, int d) {
+    sp_spinor_block_t blks[SP_KV_MAX_BLOCKS];
+    if (sp_spinor_blocks_for(d) > SP_KV_MAX_BLOCKS) return;
+    sp_spinor_encode_vec(vec, d, blks);
+    (void)sp_spinor_decode_vec(blks, d, vec);
+}
+
 static int ensure_decode_bufs(sp_session *s) {
-    if (s->kc) return 0;
+    if (s->kc || s->kcb) return 0;
     const qwen3_config *c = &s->qm->cfg;
-    const size_t KVD = (size_t)c->n_head_kv * c->head_dim;
-    const size_t QD  = (size_t)c->n_head * c->head_dim;
-    const size_t kvsz = (size_t)c->n_layers * s->hist_cap * KVD;
-    s->kc = (float *)malloc(kvsz * sizeof(float));
-    s->vc = (float *)malloc(kvsz * sizeof(float));
+    const int HD = (int)c->head_dim, NKV = (int)c->n_head_kv;
+    const size_t KVD = (size_t)NKV * HD;
+    const size_t QD  = (size_t)c->n_head * HD;
+    const size_t P = s->hist_cap;
+    s->nblk = sp_spinor_blocks_for(HD);
+    if (s->kv_mode == 1) {   /* compressed Spinor block cache + per-layer window decode scratch */
+        const size_t nb = (size_t)c->n_layers * P * (size_t)NKV * (size_t)s->nblk;
+        s->kcb  = (sp_spinor_block_t *)malloc(nb * sizeof(sp_spinor_block_t));
+        s->vcb  = (sp_spinor_block_t *)malloc(nb * sizeof(sp_spinor_block_t));
+        s->kdec = (float *)malloc(P * KVD * sizeof(float));
+        s->vdec = (float *)malloc(P * KVD * sizeof(float));
+        if (!s->kcb || !s->vcb || !s->kdec || !s->vdec) return 1;
+    } else {                 /* f32 cache (mode 0 pristine, mode 2 in-place roundtrip ref) */
+        const size_t kvsz = (size_t)c->n_layers * P * KVD;
+        s->kc = (float *)malloc(kvsz * sizeof(float));
+        s->vc = (float *)malloc(kvsz * sizeof(float));
+        if (!s->kc || !s->vc) return 1;
+    }
     s->sx  = (float *)malloc((size_t)c->n_embd * sizeof(float));
     s->snx = (float *)malloc((size_t)c->n_embd * sizeof(float));
     s->sq  = (float *)malloc(QD * sizeof(float));
@@ -148,7 +185,7 @@ static int ensure_decode_bufs(sp_session *s) {
     s->sup = (float *)malloc((size_t)c->n_ff * sizeof(float));
     s->sdn = (float *)malloc((size_t)c->n_embd * sizeof(float));
     s->ssc = (float *)malloc(s->hist_cap * sizeof(float));
-    if (!s->kc || !s->vc || !s->sx || !s->snx || !s->sq || !s->sknew || !s->svnew ||
+    if (!s->sx || !s->snx || !s->sq || !s->sknew || !s->svnew ||
         !s->sao || !s->sap || !s->sgg || !s->sup || !s->sdn || !s->ssc) return 1;
     return 0;
 }
@@ -178,10 +215,36 @@ static int kv_step(sp_session *s, int32_t tok, int pos, float *out_logits) {
         for (int h = 0; h < NH;  h++) { float *qh = q    + (size_t)h * HD; sp_rmsnorm_head(qh, qn, HD, eps); sp_rope_neox(qh, HD, pos, base); }
         for (int h = 0; h < NKV; h++) { float *kh = knew + (size_t)h * HD; sp_rmsnorm_head(kh, kn, HD, eps); sp_rope_neox(kh, HD, pos, base); }
 
-        float *KC = s->kc + (size_t)L * P * KVD;
-        float *VC = s->vc + (size_t)L * P * KVD;
-        memcpy(KC + (size_t)pos * KVD, knew, (size_t)KVD * sizeof(float));
-        memcpy(VC + (size_t)pos * KVD, vnew, (size_t)KVD * sizeof(float));
+        /* 2-L1.PARITY KV codec: store K/V[pos] and expose KC/VC over the window [0,pos]. */
+        const float *KC, *VC;
+        if (s->kv_mode == 1) {            /* compressed Spinor block cache (the §4.9 layout) */
+            const int NB = s->nblk;
+            sp_spinor_block_t *kb = s->kcb + ((size_t)L * P + pos) * NKV * NB;
+            sp_spinor_block_t *vb = s->vcb + ((size_t)L * P + pos) * NKV * NB;
+            for (int h = 0; h < NKV; h++) {
+                sp_spinor_encode_vec(knew + (size_t)h * HD, HD, kb + (size_t)h * NB);
+                sp_spinor_encode_vec(vnew + (size_t)h * HD, HD, vb + (size_t)h * NB);
+            }
+            for (int sp_ = 0; sp_ <= pos; sp_++) {   /* decode the live window into f32 scratch */
+                const sp_spinor_block_t *ks = s->kcb + ((size_t)L * P + sp_) * NKV * NB;
+                const sp_spinor_block_t *vs = s->vcb + ((size_t)L * P + sp_) * NKV * NB;
+                for (int h = 0; h < NKV; h++) {
+                    (void)sp_spinor_decode_vec(ks + (size_t)h * NB, HD, s->kdec + (size_t)sp_ * KVD + (size_t)h * HD);
+                    (void)sp_spinor_decode_vec(vs + (size_t)h * NB, HD, s->vdec + (size_t)sp_ * KVD + (size_t)h * HD);
+                }
+            }
+            KC = s->kdec; VC = s->vdec;
+        } else {
+            if (s->kv_mode == 2)          /* parity reference: in-place lossy Spinor roundtrip */
+                for (int h = 0; h < NKV; h++) {
+                    spinor_roundtrip(knew + (size_t)h * HD, HD);
+                    spinor_roundtrip(vnew + (size_t)h * HD, HD);
+                }
+            float *kcl = s->kc + (size_t)L * P * KVD, *vcl = s->vc + (size_t)L * P * KVD;
+            memcpy(kcl + (size_t)pos * KVD, knew, (size_t)KVD * sizeof(float));
+            memcpy(vcl + (size_t)pos * KVD, vnew, (size_t)KVD * sizeof(float));
+            KC = kcl; VC = vcl;
+        }
 
         for (int h = 0; h < NH; h++) {
             int kvh = h / group;
@@ -250,12 +313,19 @@ sp_status sp_session_clone(const sp_session *s, volatile int *cancel_flag, sp_se
     sp_session *c = *out;
     memcpy(c->hist, s->hist, s->pos * sizeof(int32_t));
     c->pos = s->pos;
-    if (s->kc) {   /* deep-copy the live KV so the fork doesn't re-prefill */
+    if (s->kc || s->kcb) {   /* deep-copy the live KV so the fork doesn't re-prefill */
         if (ensure_decode_bufs(c)) { sp_session_destroy(c); *out = NULL; sp_set_error("sp_session_clone: OOM (KV)"); return SP_ENOMEM; }
         const qwen3_config *cf = &c->qm->cfg;
-        size_t kvsz = (size_t)cf->n_layers * c->hist_cap * (size_t)cf->n_head_kv * cf->head_dim;
-        memcpy(c->kc, s->kc, kvsz * sizeof(float));
-        memcpy(c->vc, s->vc, kvsz * sizeof(float));
+        const size_t P = c->hist_cap;
+        if (s->kv_mode == 1) {
+            const size_t nb = (size_t)cf->n_layers * P * (size_t)cf->n_head_kv * (size_t)c->nblk;
+            memcpy(c->kcb, s->kcb, nb * sizeof(sp_spinor_block_t));
+            memcpy(c->vcb, s->vcb, nb * sizeof(sp_spinor_block_t));
+        } else {
+            const size_t kvsz = (size_t)cf->n_layers * P * (size_t)cf->n_head_kv * cf->head_dim;
+            memcpy(c->kc, s->kc, kvsz * sizeof(float));
+            memcpy(c->vc, s->vc, kvsz * sizeof(float));
+        }
         c->kv_filled = s->kv_filled;
     }
     return SP_OK;
