@@ -33,10 +33,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Build a per-row-Q8 packed tensor from the .sp-model OK_Q8 weight `name` + its
- * `<name>.scale` companion. Allocates out->{row_prec,row_scale,row_off,codes}
- * (the arena adopts + frees them). Returns 0 on success. */
-static int build_packed(const sp_model *sm, const char *name, sp_frob_packed_tensor *out) {
+/* Build a per-row-Q8 packed tensor from OK_Q8 codes + paired .scale tensor. */
+static int build_packed_q8(const sp_model *sm, const char *name, sp_frob_packed_tensor *out) {
     memset(out, 0, sizeof *out);
     const sp_tensor_entry *e = sp_model_find_tensor(sm, name);
     if (!e || e->dtype_id != (uint32_t)SP_DT_OK_Q8 || e->n_dims < 2) return 1;
@@ -68,6 +66,53 @@ static int build_packed(const sp_model *sm, const char *name, sp_frob_packed_ten
     }
     memcpy(out->codes, codes, (size_t)out->codes_bytes);
     return 0;
+}
+
+/* Build a per-row-Q4 packed tensor from OK_Q4 nibble-packed codes + paired .scale.
+ * On-disk layout: rows * ceil(cols/2) nibble bytes (low nibble = even col index,
+ * sign-extended 4-bit). Mirrors sp_frob_packed_tensor row_prec=4 convention. */
+static int build_packed_q4(const sp_model *sm, const char *name, sp_frob_packed_tensor *out) {
+    memset(out, 0, sizeof *out);
+    const sp_tensor_entry *e = sp_model_find_tensor(sm, name);
+    if (!e || e->dtype_id != (uint32_t)SP_DT_OK_Q4 || e->n_dims < 2) return 1;
+    uint64_t cols = e->dims[0], rows = e->dims[1];
+    if (rows == 0 || cols == 0) return 1;
+    uint64_t nib_cols = (cols + 1u) / 2u;
+    if (e->size_bytes != rows * nib_cols) return 1;
+    const uint8_t *codes = (const uint8_t *)sp_model_tensor_data(sm, e);
+    if (!codes) return 1;
+
+    char sn[96];
+    snprintf(sn, sizeof sn, "%s.scale", name);
+    const sp_tensor_entry *se = sp_model_find_tensor(sm, sn);
+    if (!se || se->dtype_id != (uint32_t)SP_DT_FROBENIUS_SCALE_FP32 ||
+        se->dims[0] != rows || se->size_bytes != rows * 4u) return 1;
+    const float *scale = (const float *)sp_model_tensor_data(sm, se);
+    if (!scale) return 1;
+
+    out->rows = (int)rows; out->cols = (int)cols; out->codes_bytes = (size_t)(rows * nib_cols);
+    out->row_prec  = (uint8_t *)malloc((size_t)rows);
+    out->row_scale = (float   *)malloc((size_t)rows * sizeof(float));
+    out->row_off   = (size_t  *)malloc((size_t)rows * sizeof(size_t));
+    out->codes     = (uint8_t *)malloc(out->codes_bytes);
+    if (!out->row_prec || !out->row_scale || !out->row_off || !out->codes) {
+        sp_frob_packed_free(out); return 1;
+    }
+    for (uint64_t r = 0; r < rows; r++) {
+        out->row_prec[r]  = 4u;
+        out->row_scale[r] = scale[r];
+        out->row_off[r]   = (size_t)(r * nib_cols);
+    }
+    memcpy(out->codes, codes, out->codes_bytes);
+    return 0;
+}
+
+/* Dispatch to Q8 or Q4 builder depending on the tensor's on-disk dtype. */
+static int build_packed(const sp_model *sm, const char *name, sp_frob_packed_tensor *out) {
+    const sp_tensor_entry *e = sp_model_find_tensor(sm, name);
+    if (!e || e->n_dims < 2) { memset(out, 0, sizeof *out); return 1; }
+    if (e->dtype_id == (uint32_t)SP_DT_OK_Q4) return build_packed_q4(sm, name, out);
+    return build_packed_q8(sm, name, out);
 }
 
 /* Copy an F32 norm tensor `name` into a fresh owned buffer. Returns 0 on success. */
@@ -102,15 +147,6 @@ struct qwen3_model *sp_model_to_qwen3(const sp_model *sm) {
     const uint32_t NL = ai.n_layers;
     if (NL == 0) { sp_set_error("sp_model_to_qwen3: zero layers"); return NULL; }
 
-    /* v0 limit (fail loud, not silent): only tied embeddings + the qwen3 weight set
-     * are reconstructed. An untied model needs output.weight packed into the arena as a
-     * separate entry; gemma3 needs its sandwich post-norms in the NORM list + an
-     * arch-conditional forward. Both are follow-ups (no fixture/gate exercises them). */
-    if (!ai.tied_embeddings) {
-        sp_set_error("sp_model_to_qwen3: untied embeddings not yet supported (output.weight bridge is a follow-up)");
-        return NULL;
-    }
-
     /* n_ff (2-L1.FP16): prefer arch_struct.n_ff; fall back to the ffn_gate out-dim for
      * old .sp-model files that predate the field (n_ff == 0). */
     uint32_t n_ff = ai.n_ff;
@@ -123,8 +159,12 @@ struct qwen3_model *sp_model_to_qwen3(const sp_model *sm) {
         n_ff = (uint32_t)fg->dims[1];
     }
 
-    const int NSYN   = 2 + 11 * (int)NL;
-    const int NARENA = 1 + 7 * (int)NL;
+    /* Untied LM head: present in the .sp-model as "output.weight". Detect by tensor
+     * presence rather than arch_struct.tied_embeddings for robustness. */
+    const int has_output_w = (sp_model_find_tensor(sm, "output.weight") != NULL) ? 1 : 0;
+
+    const int NSYN   = 2 + has_output_w + 11 * (int)NL;
+    const int NARENA = 1 + has_output_w + 7  * (int)NL;
     const int NNORM  = 1 + 4 * (int)NL;
 
     synth  = (gguf_tensor *)calloc((size_t)NSYN, sizeof(gguf_tensor));
@@ -142,10 +182,18 @@ struct qwen3_model *sp_model_to_qwen3(const sp_model *sm) {
         snprintf(ats[ari].name, sizeof ats[ari].name, "%s", (wname)); ari++; \
     } while (0)
 
-    /* token_embd (tied LM head + embedding) */
+    /* token_embd (embedding; LM head tied or separate below) */
     embd_syn = si;
     SYNTH_NAME(si, "token_embd.weight"); si++;
     ARENA("token_embd.weight");
+
+    /* untied LM head: pack output.weight as a separate arena entry */
+    int out_syn = embd_syn;
+    if (has_output_w) {
+        out_syn = si;
+        SYNTH_NAME(si, "output.weight"); si++;
+        ARENA("output.weight");
+    }
 
     for (uint32_t L = 0; L < NL; L++) {
         qwen3_layer *ly = &layers[L];
@@ -184,8 +232,10 @@ struct qwen3_model *sp_model_to_qwen3(const sp_model *sm) {
     #undef SYNTH_NAME
     #undef ARENA
 
-    /* adopt the packed matmul weights (arena takes ownership of the pt buffers) */
-    arena = sp_arena_from_packed(ats, NARENA, 8);
+    /* adopt the packed matmul weights (arena takes ownership of the pt buffers).
+     * Precision is derived from the first arena tensor's row_prec (4 for Q4, 8 for Q8). */
+    int arena_prec = (ari > 0 && ats[0].pt.rows > 0 && ats[0].pt.row_prec[0] == 4u) ? 4 : 8;
+    arena = sp_arena_from_packed(ats, NARENA, arena_prec);
     if (!arena) { sp_set_error("sp_model_to_qwen3: arena adoption failed"); goto fail; }
     free(ats); ats = NULL; ari = 0;   /* pt buffers now owned by the arena */
 
@@ -212,7 +262,7 @@ struct qwen3_model *sp_model_to_qwen3(const sp_model *sm) {
                         "(model predates the rms_eps field)\n");
     }
     c->has_qk_norm    = ai.has_qk_norm ? 1 : 0;
-    c->tied_embedding = ai.tied_embeddings ? 1 : 0;
+    c->tied_embedding = has_output_w ? 0 : 1;
 
     qm->gguf          = NULL;
     qm->layers        = layers;
@@ -224,7 +274,7 @@ struct qwen3_model *sp_model_to_qwen3(const sp_model *sm) {
     qm->n_norm        = ni;
     qm->token_embd    = &synth[embd_syn];
     qm->output_norm   = &synth[onorm_syn];
-    qm->output        = qm->token_embd;        /* tied: LM head reuses the embedding (untied rejected above) */
+    qm->output        = has_output_w ? &synth[out_syn] : qm->token_embd;
     return qm;
 
 fail:

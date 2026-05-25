@@ -41,6 +41,7 @@ typedef struct {
     uint32_t preferred_precision;  /* sp_arch_info.preferred_precision payload value              */
     uint32_t n_ff_field;           /* sp_arch_info.n_ff payload value (0 -> leave unspecified)    */
     float    rms_eps_field;        /* sp_arch_info.rms_eps payload value (0 -> leave unspecified) */
+    uint32_t use_q4;               /* nonzero: store matmul weights as SP_DT_OK_Q4 (E_PARITY_2)   */
 } sp_qwen3_fixture_opts;
 
 /* Build a tiny qwen3-shaped .sp-model + .sp-tokenizer into fresh malloc'd buffers

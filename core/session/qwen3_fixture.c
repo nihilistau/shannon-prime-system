@@ -68,6 +68,44 @@ static int add_q8(tspec *T, int *n, const char *name, uint32_t rows, uint32_t co
     return 0;
 }
 
+/* Add a Q4-nibble-packed weight + paired .scale sibling. Each row is ceil(cols/2)
+ * nibble bytes (low-nibble = even index, sign-extended 4-bit two's-complement). */
+static int add_q4(tspec *T, int *n, const char *name, uint32_t rows, uint32_t cols, uint32_t salt) {
+    if (*n >= FX_MAXT) return 1;
+    uint64_t nib_cols = ((uint64_t)cols + 1u) / 2u;
+    tspec *s = &T[*n];
+    memset(s, 0, sizeof *s);
+    snprintf(s->name, sizeof s->name, "%s", name);
+    s->dtype = (uint32_t)SP_DT_OK_Q4; s->n_dims = 2; s->dims[0] = cols; s->dims[1] = rows;
+    s->block_size = 1u; s->size_bytes = (uint64_t)rows * nib_cols;
+    s->data = (uint8_t *)malloc((size_t)s->size_bytes ? (size_t)s->size_bytes : 1u);
+    if (!s->data) return 1;
+    for (uint32_t r = 0; r < rows; r++) {
+        uint8_t *row_nib = s->data + (size_t)r * (size_t)nib_cols;
+        for (uint32_t p = 0; p < nib_cols; p++) {
+            uint32_t ci = p * 2u;
+            int lo = (int)((r * 5u + ci * 11u + salt) % 15u) - 7;          /* [-7,7] */
+            int hi = (ci + 1u < cols) ? (int)((r * 5u + (ci+1u) * 11u + salt) % 15u) - 7 : 0;
+            row_nib[p] = (uint8_t)(((uint8_t)(lo & 0xF)) | (uint8_t)((hi & 0xF) << 4));
+        }
+    }
+    (*n)++;
+
+    /* paired per-row Frobenius scale (same layout as Q8) */
+    if (*n >= FX_MAXT) return 1;
+    tspec *sc = &T[*n];
+    memset(sc, 0, sizeof *sc);
+    snprintf(sc->name, sizeof sc->name, "%s.scale", name);
+    sc->dtype = (uint32_t)SP_DT_FROBENIUS_SCALE_FP32; sc->n_dims = 1; sc->dims[0] = rows;
+    sc->block_size = 4u; sc->size_bytes = (uint64_t)rows * 4u;
+    sc->data = (uint8_t *)malloc((size_t)sc->size_bytes);
+    if (!sc->data) return 1;
+    float *sf = (float *)sc->data;
+    for (uint32_t r = 0; r < rows; r++) sf[r] = 0.5f + (float)(r % 7u) * 0.05f;   /* positive */
+    (*n)++;
+    return 0;
+}
+
 static int add_f32(tspec *T, int *n, const char *name, uint32_t len) {
     if (*n >= FX_MAXT) return 1;
     tspec *s = &T[*n];
@@ -132,21 +170,26 @@ int sp_qwen3_fixture_build_ex(uint8_t **model_buf, uint8_t **tok_buf,
     tspec T[FX_MAXT];
     int n = 0, rc = 0;
     char nm[80];
-    rc |= add_q8 (T, &n, "token_embd.weight", FX_V, FX_E, 1u);        /* tied LM head + embed */
+    int q4 = (opts && opts->use_q4) ? 1 : 0;
+    #define ADD_MM(name, rows, cols, salt) \
+        (q4 ? add_q4(T, &n, (name), (rows), (cols), (salt)) \
+             : add_q8(T, &n, (name), (rows), (cols), (salt)))
+    rc |= ADD_MM("token_embd.weight", FX_V, FX_E, 1u);        /* tied LM head + embed */
     for (uint32_t L = 0; L < FX_NL && !rc; L++) {
         uint32_t s = (L + 1u) * 17u;
         snprintf(nm, sizeof nm, "blk.%u.attn_norm.weight", L);   rc |= add_f32(T, &n, nm, FX_E);
-        snprintf(nm, sizeof nm, "blk.%u.attn_q.weight", L);      rc |= add_q8 (T, &n, nm, FX_NH*FX_HD, FX_E, s+1u);
-        snprintf(nm, sizeof nm, "blk.%u.attn_k.weight", L);      rc |= add_q8 (T, &n, nm, FX_NKV*FX_HD, FX_E, s+2u);
-        snprintf(nm, sizeof nm, "blk.%u.attn_v.weight", L);      rc |= add_q8 (T, &n, nm, FX_NKV*FX_HD, FX_E, s+3u);
-        snprintf(nm, sizeof nm, "blk.%u.attn_output.weight", L); rc |= add_q8 (T, &n, nm, FX_E, FX_NH*FX_HD, s+4u);
+        snprintf(nm, sizeof nm, "blk.%u.attn_q.weight", L);      rc |= ADD_MM(nm, FX_NH*FX_HD, FX_E, s+1u);
+        snprintf(nm, sizeof nm, "blk.%u.attn_k.weight", L);      rc |= ADD_MM(nm, FX_NKV*FX_HD, FX_E, s+2u);
+        snprintf(nm, sizeof nm, "blk.%u.attn_v.weight", L);      rc |= ADD_MM(nm, FX_NKV*FX_HD, FX_E, s+3u);
+        snprintf(nm, sizeof nm, "blk.%u.attn_output.weight", L); rc |= ADD_MM(nm, FX_E, FX_NH*FX_HD, s+4u);
         snprintf(nm, sizeof nm, "blk.%u.attn_q_norm.weight", L); rc |= add_f32(T, &n, nm, FX_HD);
         snprintf(nm, sizeof nm, "blk.%u.attn_k_norm.weight", L); rc |= add_f32(T, &n, nm, FX_HD);
         snprintf(nm, sizeof nm, "blk.%u.ffn_norm.weight", L);    rc |= add_f32(T, &n, nm, FX_E);
-        snprintf(nm, sizeof nm, "blk.%u.ffn_gate.weight", L);    rc |= add_q8 (T, &n, nm, FX_FF, FX_E, s+5u);
-        snprintf(nm, sizeof nm, "blk.%u.ffn_up.weight", L);      rc |= add_q8 (T, &n, nm, FX_FF, FX_E, s+6u);
-        snprintf(nm, sizeof nm, "blk.%u.ffn_down.weight", L);    rc |= add_q8 (T, &n, nm, FX_E, FX_FF, s+7u);
+        snprintf(nm, sizeof nm, "blk.%u.ffn_gate.weight", L);    rc |= ADD_MM(nm, FX_FF, FX_E, s+5u);
+        snprintf(nm, sizeof nm, "blk.%u.ffn_up.weight", L);      rc |= ADD_MM(nm, FX_FF, FX_E, s+6u);
+        snprintf(nm, sizeof nm, "blk.%u.ffn_down.weight", L);    rc |= ADD_MM(nm, FX_E, FX_FF, s+7u);
     }
+    #undef ADD_MM
     rc |= add_f32(T, &n, "output_norm.weight", FX_E);
     if (rc) { for (int i = 0; i < n; i++) free(T[i].data); free(tk); return 1; }
 
