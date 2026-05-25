@@ -101,6 +101,11 @@ typedef struct {
  * SP_OK on success; SP_EBADARG on a NULL handle/out. */
 sp_status sp_model_arch(const sp_model *m, sp_arch_info *out);
 
+/* sp_session_config.flags bits. Default 0 = persistent f32 KV (no compression).
+ * 2-L1.PARITY inline KV-cache codec (the §4.9 frozen Spinor layout, sp/spinor_block.h): */
+#define SP_KV_SPINOR     (1u << 0)   /* persistent COMPRESSED KV: VHT2+Mobius 63-byte Spinor blocks, decoded inline on read */
+#define SP_KV_SPINOR_REF (1u << 1)   /* parity reference: f32 cache + in-place Spinor roundtrip (decode-from-block == this, by codec identity) */
+
 /* ── §6 session config -- immutable for the session's lifetime ── */
 typedef struct {
     size_t   max_context;     /* hard cap on sequence position; 0 = arch default       */
