@@ -72,6 +72,46 @@ static sp_status fail(sp_model *m, sp_status code, const char *msg) {
     return code;
 }
 
+/* §6 Spinor sentinel: byte (block_size-1) of every 64-byte on-disk Spinor block
+ * holds 0xA5 (the 63->64 pad). Default load samples the first and last block of
+ * each SP_DT_SPINOR63 tensor — cheap integrity that catches a page tear or
+ * partial write without an O(N) sweep. A mismatch maps to the frozen
+ * SP_ESPINOR_BADBLOCK; geometry that can't be bounds-checked is SP_EBADFORMAT.
+ * Sets the thread-local error detail; does NOT unload (the caller decides). */
+static sp_status check_spinor_sentinels(const sp_model *m, int full_sweep) {
+    char buf[176];
+    for (uint32_t i = 0; i < m->header.tensor_count; i++) {
+        const sp_tensor_entry *e = &m->table[i];
+        if (e->dtype_id != (uint32_t)SP_DT_SPINOR63) continue;
+        const uint8_t *t = (const uint8_t *)sp_model_tensor_data(m, e);
+        uint64_t bs = e->block_size, bc = e->block_count;
+        if (!t || bs == 0 || bc == 0 || bc * bs > e->size_bytes) {
+            snprintf(buf, sizeof buf,
+                     "sp_model_load: Spinor tensor '%.40s' has invalid block geometry", e->name);
+            sp_set_error(buf);
+            return SP_EBADFORMAT;
+        }
+        uint64_t s = bs - 1, bad = 0;
+        int found = 0;
+        if (full_sweep) {
+            for (uint64_t b = 0; b < bc; b++)
+                if (t[b * bs + s] != SP_SPINOR_SENTINEL) { bad = b; found = 1; break; }
+        } else {
+            uint64_t last = bc - 1;                 /* sample first + last only */
+            if      (t[s]             != SP_SPINOR_SENTINEL) { bad = 0;    found = 1; }
+            else if (t[last * bs + s] != SP_SPINOR_SENTINEL) { bad = last; found = 1; }
+        }
+        if (found) {
+            snprintf(buf, sizeof buf,
+                     "sp_model_load: Spinor tensor '%.40s' block %llu sentinel != 0xA5 "
+                     "(page tear / partial write?)", e->name, (unsigned long long)bad);
+            sp_set_error(buf);
+            return SP_ESPINOR_BADBLOCK;
+        }
+    }
+    return SP_OK;
+}
+
 sp_status sp_model_load(const char *model_path, const char *tok_path, sp_model **out) {
     if (!model_path || !tok_path || !out) { sp_set_error("sp_model_load: null arg"); return SP_EBADARG; }
     *out = NULL;
@@ -133,6 +173,10 @@ sp_status sp_model_load(const char *model_path, const char *tok_path, sp_model *
     if (m->tok_hdr->vocab_size != h->vocab_size)
         return fail(m, SP_EVOCAB, "sp_model_load: tokenizer vocab != model vocab");
 
+    /* §6 Spinor sentinel sweep — first+last block of each Spinor tensor. */
+    sp_status sst = check_spinor_sentinels(m, 0);
+    if (sst != SP_OK) { sp_model_unload(m); return sst; }   /* error detail already set */
+
     *out = m;
     return SP_OK;
 }
@@ -188,4 +232,9 @@ const void *sp_model_tokenizer_blob(const sp_model *m, uint64_t *size_out) {
     if (m->tok_hdr->blob_offset + m->tok_hdr->blob_size > m->tok_size) return NULL;
     if (size_out) *size_out = m->tok_hdr->blob_size;
     return m->tok_base + m->tok_hdr->blob_offset;
+}
+
+sp_status sp_model_verify_spinors(const sp_model *m, int full_sweep) {
+    if (!m) { sp_set_error("sp_model_verify_spinors: null handle"); return SP_EBADARG; }
+    return check_spinor_sentinels(m, full_sweep);
 }
