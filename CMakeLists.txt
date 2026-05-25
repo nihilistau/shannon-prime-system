@@ -48,6 +48,7 @@ set(SP_MODULES
     model           # L1 -- Qwen3/Gemma3 model representation + GGUF load/free/release lifecycle (on arena + gguf)
     forward_dispatch # L1 -- model-coupled weight-access kernels (matmul/embed/norm-accessor) on forward_kernels + arena
     forward         # L1 -- Qwen3 forward orchestration: prefill + persistent-KV decode (on forward_dispatch + the overlay codecs poly_ring/kste/vht2)
+    session         # L1 -- sp_session ABI (create/prefill/decode) + sp_model_to_qwen3 bridge (on io_format + forward + model + arena + frobenius)
     dominance       # later — dominance order / signature dominance
     sieve           # later — Friedman sieve
     arm)            # later — Algebraic Resonance Memory
