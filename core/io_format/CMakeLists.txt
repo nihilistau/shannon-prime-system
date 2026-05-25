@@ -14,7 +14,8 @@ include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/sp_module.cmake)
 # sp_model_to_qwen3 (the runtime-model adapter) is NOT here -- it stays engine-side
 # until the model representation migrates; its declaration in sp/sp_model.h is inert.
 sp_add_module(io_format
-    SOURCES   sp_model_load.c sp_error.c
-    TEST      io_format_test.c
-    TEST_NAME T_IO_FORMAT
-    DEPENDS   sp_io_hash)
+    SOURCES      sp_model_load.c sp_model_arch.c sp_error.c
+    TEST         io_format_test.c
+    TEST_SOURCES sp_model_fixture.c
+    TEST_NAME    T_IO_FORMAT
+    DEPENDS      sp_io_hash)

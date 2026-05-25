@@ -147,6 +147,12 @@ const sp_tensor_entry *sp_model_find_tensor(const sp_model *m, const char *name)
 const void            *sp_model_tensor_data(const sp_model *m, const sp_tensor_entry *e);
 /* Tokenizer blob pointer + size inside the tokenizer mmap. */
 const void            *sp_model_tokenizer_blob(const sp_model *m, uint64_t *size_out);
+/* Spinor 0xA5 sentinel check (§6). full_sweep==0 samples the first+last block of
+ * each Spinor tensor (the cheap check sp_model_load runs by default); nonzero
+ * scans every block (the SP_VERIFY_TENSORS-style sweep). SP_OK / SP_ESPINOR_BADBLOCK
+ * / SP_EBADFORMAT (bad geometry) / SP_EBADARG. Not part of the frozen L1 ABI —
+ * an internal helper available to the SESSION sub-phase's verify path. */
+sp_status              sp_model_verify_spinors(const sp_model *m, int full_sweep);
 
 /* ── adapter (src/io/sp_model_adapter.c) ──
  * Reconstruct a qwen3_model the existing gemma3_forward / qwen3_forward consume
