@@ -71,6 +71,8 @@ sp_status sp_session_create(const sp_model *m, const sp_session_config *cfg,
     if (!qm) {
         if (ai.arch_id == (uint32_t)SP_ARCH_ID_GEMMA3)
             qm = sp_model_to_gemma3(m);
+        else if (ai.arch_id == (uint32_t)SP_ARCH_ID_QWEN25)
+            qm = sp_model_to_qwen25(m);
         else
             qm = sp_model_to_qwen3(m);
         if (!qm) return SP_EBADFORMAT;
@@ -142,9 +144,10 @@ sp_status sp_prefill_chunk(sp_session *s, const int32_t *tokens, size_t n_tokens
 
     float *tmp = (float *)malloc(new_len * (size_t)s->n_vocab * sizeof(float));
     if (!tmp) { sp_set_error("sp_prefill_chunk: OOM (logits scratch)"); return SP_ENOMEM; }
-    int frc = (s->qm->cfg.arch == SP_ARCH_GEMMA3)
-        ? gemma3_forward(s->qm, s->hist, (int)new_len, tmp)
-        : qwen3_forward(s->qm, s->hist, (int)new_len, tmp);
+    sp_arch_t _arch = s->qm->cfg.arch;
+    int frc = (_arch == SP_ARCH_GEMMA3) ? gemma3_forward(s->qm, s->hist, (int)new_len, tmp)
+            : (_arch == SP_ARCH_QWEN25)  ? qwen25_forward(s->qm, s->hist, (int)new_len, tmp)
+            :                              qwen3_forward(s->qm, s->hist, (int)new_len, tmp);
     if (frc != 0) {
         free(tmp); sp_set_error("sp_prefill_chunk: forward failed"); return SP_EBADSTATE;
     }
@@ -389,6 +392,106 @@ static int kv_step_gemma3(sp_session *s, int32_t tok, int pos, float *out_logits
     return 0;
 }
 
+/* Qwen2.5 persistent-KV step: no QK norms, QKV biases, SwiGLU, simple residual. */
+static int kv_step_qwen25(sp_session *s, int32_t tok, int pos, float *out_logits) {
+    const qwen3_model *m = s->qm;
+    const qwen3_config *c = &m->cfg;
+    const int E = (int)c->n_embd, FF = (int)c->n_ff, HD = (int)c->head_dim;
+    const int NH = (int)c->n_head, NKV = (int)c->n_head_kv;
+    const int QD = NH * HD, KVD = NKV * HD, group = NH / NKV, V = (int)c->n_vocab;
+    const float eps = c->rms_eps, base = c->rope_freq_base, ascale = 1.0f / sqrtf((float)HD);
+    const int P = (int)s->hist_cap;
+    float *x = s->sx, *nx = s->snx, *q = s->sq, *knew = s->sknew, *vnew = s->svnew;
+    float *ao = s->sao, *ap = s->sap, *gg = s->sgg, *up = s->sup, *dn = s->sdn, *sc = s->ssc;
+
+    if (sp_embed_row(m, tok, E, x)) return 1;
+    for (uint32_t L = 0; L < c->n_layers; L++) {
+        const qwen3_layer *ly = &m->layers[L];
+        sp_rmsnorm(x, sp_as_f32(m, ly->attn_norm), E, eps, nx);
+        if (sp_matmul(m, ly->attn_q, nx, 1, E, QD, q))     return 1;
+        if (sp_matmul(m, ly->attn_k, nx, 1, E, KVD, knew))  return 1;
+        if (sp_matmul(m, ly->attn_v, nx, 1, E, KVD, vnew))  return 1;
+
+        /* add QKV biases */
+        const float *qb = sp_as_f32(m, ly->attn_q_bias);
+        const float *kb = sp_as_f32(m, ly->attn_k_bias);
+        const float *vb = sp_as_f32(m, ly->attn_v_bias);
+        for (int i = 0; i < QD;  i++) q[i]    += qb[i];
+        for (int i = 0; i < KVD; i++) knew[i]  += kb[i];
+        for (int i = 0; i < KVD; i++) vnew[i]  += vb[i];
+
+        /* NEOX RoPE (no QK norm) */
+        for (int h = 0; h < NH;  h++) { float *qh = q    + (size_t)h * HD; sp_rope_neox(qh, HD, pos, base); }
+        for (int h = 0; h < NKV; h++) { float *kh = knew + (size_t)h * HD; sp_rope_neox(kh, HD, pos, base); }
+
+        const float *KC, *VC;
+        if (s->kv_mode == 1) {
+            const int NB = s->nblk;
+            sp_spinor_block_t *kb2 = s->kcb + ((size_t)L * P + pos) * NKV * NB;
+            sp_spinor_block_t *vb2 = s->vcb + ((size_t)L * P + pos) * NKV * NB;
+            for (int h = 0; h < NKV; h++) {
+                sp_spinor_encode_vec(knew + (size_t)h * HD, HD, kb2 + (size_t)h * NB);
+                sp_spinor_encode_vec(vnew + (size_t)h * HD, HD, vb2 + (size_t)h * NB);
+            }
+            for (int sp_ = 0; sp_ <= pos; sp_++) {
+                const sp_spinor_block_t *ks = s->kcb + ((size_t)L * P + sp_) * NKV * NB;
+                const sp_spinor_block_t *vs = s->vcb + ((size_t)L * P + sp_) * NKV * NB;
+                for (int h = 0; h < NKV; h++) {
+                    (void)sp_spinor_decode_vec(ks + (size_t)h * NB, HD, s->kdec + (size_t)sp_ * KVD + (size_t)h * HD);
+                    (void)sp_spinor_decode_vec(vs + (size_t)h * NB, HD, s->vdec + (size_t)sp_ * KVD + (size_t)h * HD);
+                }
+            }
+            KC = s->kdec; VC = s->vdec;
+        } else {
+            if (s->kv_mode == 2)
+                for (int h = 0; h < NKV; h++) {
+                    spinor_roundtrip(knew + (size_t)h * HD, HD);
+                    spinor_roundtrip(vnew + (size_t)h * HD, HD);
+                }
+            float *kcl = s->kc + (size_t)L * P * KVD, *vcl = s->vc + (size_t)L * P * KVD;
+            memcpy(kcl + (size_t)pos * KVD, knew, (size_t)KVD * sizeof(float));
+            memcpy(vcl + (size_t)pos * KVD, vnew, (size_t)KVD * sizeof(float));
+            KC = kcl; VC = vcl;
+        }
+
+        for (int h = 0; h < NH; h++) {
+            int kvh = h / group;
+            const float *qh = q + (size_t)h * HD;
+            float maxs = -INFINITY;
+            for (int sp_ = 0; sp_ <= pos; sp_++) {
+                const float *kh = KC + (size_t)sp_ * KVD + (size_t)kvh * HD;
+                float acc = 0.0f;
+                for (int i = 0; i < HD; i++) acc += qh[i] * kh[i];
+                float d = acc * ascale; sc[sp_] = d; if (d > maxs) maxs = d;
+            }
+            float sum = 0.0f;
+            for (int sp_ = 0; sp_ <= pos; sp_++) { sc[sp_] = expf(sc[sp_] - maxs); sum += sc[sp_]; }
+            float inv = 1.0f / sum;
+            float *out = ao + (size_t)h * HD;
+            for (int i = 0; i < HD; i++) out[i] = 0.0f;
+            for (int sp_ = 0; sp_ <= pos; sp_++) {
+                float w = sc[sp_] * inv;
+                const float *vh = VC + (size_t)sp_ * KVD + (size_t)kvh * HD;
+                for (int i = 0; i < HD; i++) out[i] += w * vh[i];
+            }
+        }
+        if (sp_matmul(m, ly->attn_output, ao, 1, QD, E, ap)) return 1;
+        for (int i = 0; i < E; i++) x[i] += ap[i];
+
+        sp_rmsnorm(x, sp_as_f32(m, ly->ffn_norm), E, eps, nx);
+        if (sp_matmul(m, ly->ffn_gate, nx, 1, E, FF, gg)) return 1;
+        if (sp_matmul(m, ly->ffn_up,   nx, 1, E, FF, up)) return 1;
+        for (int i = 0; i < FF; i++) { float gv = gg[i]; gg[i] = gv / (1.0f + expf(-gv)) * up[i]; }
+        if (sp_matmul(m, ly->ffn_down, gg, 1, FF, E, dn)) return 1;
+        for (int i = 0; i < E; i++) x[i] += dn[i];
+    }
+    if (out_logits) {
+        sp_rmsnorm(x, sp_as_f32(m, m->output_norm), E, eps, nx);
+        if (sp_matmul(m, m->output, nx, 1, E, V, out_logits)) return 1;
+    }
+    return 0;
+}
+
 sp_status sp_decode_step(sp_session *s, int32_t token, float *logits, size_t logits_capacity) {
     if (!s || !logits) { sp_set_error("sp_decode_step: null arg"); return SP_EBADARG; }
     if (logits_capacity < s->n_vocab) { sp_set_error("sp_decode_step: logits_capacity < vocab_size"); return SP_EBADARG; }
@@ -397,16 +500,19 @@ sp_status sp_decode_step(sp_session *s, int32_t token, float *logits, size_t log
     if (ensure_decode_bufs(s)) { sp_set_error("sp_decode_step: OOM (KV)"); return SP_ENOMEM; }
 
     const int p = (int)s->pos;
-    const int gemma = (s->qm->cfg.arch == SP_ARCH_GEMMA3);
+    const sp_arch_t _arch = s->qm->cfg.arch;
+    #define STEP(tok, pos, lo) \
+        (_arch == SP_ARCH_GEMMA3 ? kv_step_gemma3(s, tok, pos, lo) : \
+         _arch == SP_ARCH_QWEN25 ? kv_step_qwen25(s, tok, pos, lo) : \
+                                   kv_step(s, tok, pos, lo))
     /* lazily fill KV for any prior positions not yet cached (e.g. a re-forward prefill) */
     for (size_t f = s->kv_filled; f < s->pos; f++) {
-        int brc = gemma ? kv_step_gemma3(s, s->hist[f], (int)f, NULL)
-                        : kv_step(s, s->hist[f], (int)f, NULL);
-        if (brc) { sp_set_error("sp_decode_step: KV backfill failed"); return SP_EBADSTATE; }
+        if (STEP(s->hist[f], (int)f, NULL)) { sp_set_error("sp_decode_step: KV backfill failed"); return SP_EBADSTATE; }
     }
 
     s->hist[p] = token;
-    int drc = gemma ? kv_step_gemma3(s, token, p, logits) : kv_step(s, token, p, logits);
+    int drc = STEP(token, p, logits);
+    #undef STEP
     if (drc) { sp_set_error("sp_decode_step: forward failed"); return SP_EBADSTATE; }
 
     s->kv_filled = (size_t)p + 1;

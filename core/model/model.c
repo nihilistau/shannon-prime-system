@@ -30,7 +30,8 @@ qwen3_model *qwen3_load(const char *path) {
     if (!g) return NULL;
 
     const char *arch = gguf_get_str(g, "general.architecture");
-    if (!arch || (strcmp(arch, "qwen3") != 0 && strcmp(arch, "gemma3") != 0)) {
+    if (!arch || (strcmp(arch, "qwen3") != 0 && strcmp(arch, "gemma3") != 0 &&
+                  strcmp(arch, "qwen2") != 0)) {
         gguf_close(g); return NULL;
     }
 
@@ -38,7 +39,8 @@ qwen3_model *qwen3_load(const char *path) {
     if (!m) { gguf_close(g); return NULL; }
     m->gguf = g;
     qwen3_config *c = &m->cfg;
-    c->arch = (strcmp(arch, "gemma3") == 0) ? SP_ARCH_GEMMA3 : SP_ARCH_QWEN3;
+    c->arch = (strcmp(arch, "gemma3") == 0) ? SP_ARCH_GEMMA3 :
+              (strcmp(arch, "qwen2")  == 0) ? SP_ARCH_QWEN25 : SP_ARCH_QWEN3;
 
     /* metadata keys are namespaced by architecture (e.g. "qwen3.block_count" /
      * "gemma3.block_count"); build the prefix once. */
@@ -94,6 +96,11 @@ qwen3_model *qwen3_load(const char *path) {
             BIND(post_attn_norm, "post_attention_norm.weight");  /* sandwich norms */
             BIND(post_ffw_norm,  "post_ffw_norm.weight");
         }
+        if (c->arch == SP_ARCH_QWEN25) {
+            BIND(attn_q_bias, "attn_q.bias");
+            BIND(attn_k_bias, "attn_k.bias");
+            BIND(attn_v_bias, "attn_v.bias");
+        }
         #undef BIND
         if (!L->attn_norm || !L->attn_q || !L->attn_k || !L->attn_v || !L->attn_output ||
             !L->ffn_norm  || !L->ffn_gate || !L->ffn_up || !L->ffn_down) {
@@ -102,6 +109,10 @@ qwen3_model *qwen3_load(const char *path) {
         if (c->arch == SP_ARCH_GEMMA3 &&
             (!L->attn_q_norm || !L->attn_k_norm || !L->post_attn_norm || !L->post_ffw_norm)) {
             qwen3_free(m); return NULL;   /* gemma3 requires sandwich + QK norms */
+        }
+        if (c->arch == SP_ARCH_QWEN25 &&
+            (!L->attn_q_bias || !L->attn_k_bias || !L->attn_v_bias)) {
+            qwen3_free(m); return NULL;   /* qwen2.5 requires QKV biases */
         }
     }
     /* QK-norm is present iff layer 0 carries it (uniform across layers). */
@@ -137,7 +148,7 @@ int qwen3_release_source(qwen3_model *m) {
     /* the embedding must be packed (else the forward still needs the mapping) */
     if (!sp_arena_find(m->arena, m->token_embd->name)) return 1;
 
-    int cap = (int)m->cfg.n_layers * 4 + 1;
+    int cap = (int)m->cfg.n_layers * 7 + 1;
     m->norm_src = (const gguf_tensor **)malloc((size_t)cap * sizeof(*m->norm_src));
     m->norm_buf = (float **)malloc((size_t)cap * sizeof(*m->norm_buf));
     if (!m->norm_src || !m->norm_buf) return 1;
@@ -154,6 +165,7 @@ int qwen3_release_source(qwen3_model *m) {
         const qwen3_layer *L = &m->layers[i];
         COPY_NORM(L->attn_norm); COPY_NORM(L->ffn_norm);
         COPY_NORM(L->attn_q_norm); COPY_NORM(L->attn_k_norm);
+        COPY_NORM(L->attn_q_bias); COPY_NORM(L->attn_k_bias); COPY_NORM(L->attn_v_bias);
     }
     COPY_NORM(m->output_norm);
     #undef COPY_NORM

@@ -285,6 +285,7 @@ struct qwen3_model *sp_model_to_qwen3(const sp_model *sm) {
     if (!sm) { sp_set_error("sp_model_to_qwen3: null handle"); return NULL; }
     sp_arch_info ai;
     if (sp_model_arch(sm, &ai) != SP_OK) { sp_set_error("sp_model_to_qwen3: arch query failed"); return NULL; }
+    if (ai.arch_id != (uint32_t)SP_ARCH_ID_QWEN3) { sp_set_error("sp_model_to_qwen3: model is not Qwen3"); return NULL; }
     const uint32_t NL = ai.n_layers;
     if (NL == 0) { sp_set_error("sp_model_to_qwen3: zero layers"); return NULL; }
 
@@ -384,7 +385,7 @@ struct qwen3_model *sp_model_to_qwen3(const sp_model *sm) {
     if (!qm) { sp_set_error("sp_model_to_qwen3: out of memory (model)"); sp_arena_free(arena); arena = NULL; goto fail; }
 
     qwen3_config *c = &qm->cfg;
-    c->arch           = (ai.arch_id == (uint32_t)SP_ARCH_ID_GEMMA3) ? SP_ARCH_GEMMA3 : SP_ARCH_QWEN3;
+    c->arch           = SP_ARCH_QWEN3;
     c->n_layers       = NL;
     c->n_embd         = ai.hidden_dim;
     c->n_ff           = n_ff;
@@ -419,6 +420,147 @@ struct qwen3_model *sp_model_to_qwen3(const sp_model *sm) {
     return qm;
 
 fail:
+    if (ats) { for (int i = 0; i < ari; i++) sp_frob_packed_free(&ats[i].pt); }
+    for (int i = 0; i < ni; i++) free(nbuf[i]);
+    free(ats); free(nsrc); free(nbuf); free(layers); free(synth);
+    return NULL;
+}
+
+struct qwen3_model *sp_model_to_qwen25(const sp_model *sm) {
+    gguf_tensor       *synth  = NULL;
+    qwen3_layer       *layers = NULL;
+    sp_arena_tensor   *ats    = NULL;
+    const gguf_tensor **nsrc  = NULL;
+    float            **nbuf   = NULL;
+    sp_arena          *arena  = NULL;
+    qwen3_model       *qm     = NULL;
+    int si = 0, ari = 0, ni = 0, embd_syn = 0, onorm_syn = 0;
+    char nm[96];
+
+    if (!sm) { sp_set_error("sp_model_to_qwen25: null handle"); return NULL; }
+    sp_arch_info ai;
+    if (sp_model_arch(sm, &ai) != SP_OK) { sp_set_error("sp_model_to_qwen25: arch query failed"); return NULL; }
+    if (ai.arch_id != (uint32_t)SP_ARCH_ID_QWEN25) { sp_set_error("sp_model_to_qwen25: model is not Qwen2.5"); return NULL; }
+    const uint32_t NL = ai.n_layers;
+    if (NL == 0) { sp_set_error("sp_model_to_qwen25: zero layers"); return NULL; }
+
+    uint32_t n_ff = ai.n_ff;
+    if (n_ff == 0) {
+        const sp_tensor_entry *fg = sp_model_find_tensor(sm, "blk.0.ffn_gate.weight");
+        if (!fg || fg->n_dims < 2) { sp_set_error("sp_model_to_qwen25: n_ff unknown"); return NULL; }
+        n_ff = (uint32_t)fg->dims[1];
+    }
+
+    const int has_output_w = (sp_model_find_tensor(sm, "output.weight") != NULL) ? 1 : 0;
+
+    /* 12 synth tensors per layer: 7 matmul (attn_q/k/v/output, ffn_gate/up/down)
+     * + 5 F32 (attn_norm, attn_q.bias, attn_k.bias, attn_v.bias, ffn_norm).
+     * NARENA = 7/layer + embd + optional output.
+     * NNORM = 5/layer + output_norm. */
+    const int NSYN   = 2 + has_output_w + 12 * (int)NL;
+    const int NARENA = 1 + has_output_w + 7  * (int)NL;
+    const int NNORM  = 1 + 5 * (int)NL;
+
+    synth  = (gguf_tensor *)calloc((size_t)NSYN, sizeof(gguf_tensor));
+    layers = (qwen3_layer *)calloc((size_t)NL, sizeof(qwen3_layer));
+    ats    = (sp_arena_tensor *)calloc((size_t)NARENA, sizeof(sp_arena_tensor));
+    nsrc   = (const gguf_tensor **)calloc((size_t)NNORM, sizeof(*nsrc));
+    nbuf   = (float **)calloc((size_t)NNORM, sizeof(*nbuf));
+    if (!synth || !layers || !ats || !nsrc || !nbuf) { sp_set_error("sp_model_to_qwen25: out of memory"); goto fail25; }
+
+    #define SYNTH_NAME(idx, str) snprintf(synth[(idx)].name, sizeof synth[(idx)].name, "%s", (str))
+    #define ARENA(wname) do { \
+        if (build_packed(sm, (wname), &ats[ari].pt)) { \
+            char eb_[128]; snprintf(eb_, sizeof eb_, "sp_model_to_qwen25: bad weight %s", (wname)); \
+            sp_set_error(eb_); goto fail25; } \
+        snprintf(ats[ari].name, sizeof ats[ari].name, "%s", (wname)); ari++; \
+    } while (0)
+    #define NORMF(field, str_nm) do { \
+        SYNTH_NAME(si, (str_nm)); ly->field = &synth[si]; \
+        if (copy_norm(sm, (str_nm), &nbuf[ni])) { sp_set_error("sp_model_to_qwen25: bad norm " #field); goto fail25; } \
+        nsrc[ni] = &synth[si]; si++; ni++; \
+    } while (0)
+
+    embd_syn = si;
+    SYNTH_NAME(si, "token_embd.weight"); si++;
+    ARENA("token_embd.weight");
+
+    int out_syn = embd_syn;
+    if (has_output_w) {
+        out_syn = si;
+        SYNTH_NAME(si, "output.weight"); si++;
+        ARENA("output.weight");
+    }
+
+    for (uint32_t L = 0; L < NL; L++) {
+        qwen3_layer *ly = &layers[L];
+        #define MM(field, suffix) do { \
+            snprintf(nm, sizeof nm, "blk.%u." suffix, L); \
+            SYNTH_NAME(si, nm); ly->field = &synth[si]; si++; \
+            ARENA(nm); \
+        } while (0)
+
+        snprintf(nm, sizeof nm, "blk.%u.attn_norm.weight", L);    NORMF(attn_norm,   nm);
+        MM  (attn_q,      "attn_q.weight");
+        MM  (attn_k,      "attn_k.weight");
+        MM  (attn_v,      "attn_v.weight");
+        MM  (attn_output, "attn_output.weight");
+        snprintf(nm, sizeof nm, "blk.%u.attn_q.bias", L);         NORMF(attn_q_bias, nm);
+        snprintf(nm, sizeof nm, "blk.%u.attn_k.bias", L);         NORMF(attn_k_bias, nm);
+        snprintf(nm, sizeof nm, "blk.%u.attn_v.bias", L);         NORMF(attn_v_bias, nm);
+        snprintf(nm, sizeof nm, "blk.%u.ffn_norm.weight", L);     NORMF(ffn_norm,    nm);
+        MM  (ffn_gate,    "ffn_gate.weight");
+        MM  (ffn_up,      "ffn_up.weight");
+        MM  (ffn_down,    "ffn_down.weight");
+        #undef MM
+    }
+
+    onorm_syn = si;
+    SYNTH_NAME(si, "output_norm.weight"); si++;
+    if (copy_norm(sm, "output_norm.weight", &nbuf[ni])) { sp_set_error("sp_model_to_qwen25: bad output_norm"); goto fail25; }
+    nsrc[ni] = &synth[onorm_syn]; ni++;
+    #undef SYNTH_NAME
+    #undef ARENA
+    #undef NORMF
+
+    int arena_prec = (ari > 0 && ats[0].pt.rows > 0 && ats[0].pt.row_prec[0] == 4u) ? 4 : 8;
+    arena = sp_arena_from_packed(ats, NARENA, arena_prec);
+    if (!arena) { sp_set_error("sp_model_to_qwen25: arena adoption failed"); goto fail25; }
+    free(ats); ats = NULL; ari = 0;
+
+    qm = (qwen3_model *)calloc(1, sizeof(*qm));
+    if (!qm) { sp_set_error("sp_model_to_qwen25: out of memory (model)"); sp_arena_free(arena); arena = NULL; goto fail25; }
+
+    qwen3_config *c = &qm->cfg;
+    c->arch           = SP_ARCH_QWEN25;
+    c->n_layers       = NL;
+    c->n_embd         = ai.hidden_dim;
+    c->n_ff           = n_ff;
+    c->n_head         = ai.n_heads;
+    c->n_head_kv      = ai.n_kv_heads;
+    c->head_dim       = ai.head_dim;
+    c->n_vocab        = ai.vocab_size;
+    c->context_length = ai.max_context;
+    c->sliding_window = 0;
+    c->rope_freq_base = (ai.rope_freq_base != 0.0f) ? ai.rope_freq_base : 1e6f;
+    c->rms_eps        = (ai.rms_eps != 0.0f) ? ai.rms_eps : 1e-6f;
+    c->has_qk_norm    = 0;
+    c->tied_embedding = has_output_w ? 0 : 1;
+
+    qm->gguf          = NULL;
+    qm->layers        = layers;
+    qm->synth_tensors = synth;
+    qm->arena         = arena;
+    qm->released      = 1;
+    qm->norm_src      = nsrc;
+    qm->norm_buf      = nbuf;
+    qm->n_norm        = ni;
+    qm->token_embd    = &synth[embd_syn];
+    qm->output_norm   = &synth[onorm_syn];
+    qm->output        = has_output_w ? &synth[out_syn] : qm->token_embd;
+    return qm;
+
+fail25:
     if (ats) { for (int i = 0; i < ari; i++) sp_frob_packed_free(&ats[i].pt); }
     for (int i = 0; i < ni; i++) free(nbuf[i]);
     free(ats); free(nsrc); free(nbuf); free(layers); free(synth);
