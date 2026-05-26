@@ -49,6 +49,7 @@ set(SP_MODULES
     forward_dispatch # L1 -- model-coupled weight-access kernels (matmul/embed/norm-accessor) on forward_kernels + arena
     forward         # L1 -- Qwen3 forward orchestration: prefill + persistent-KV decode (on forward_dispatch + the overlay codecs poly_ring/kste/vht2)
     session         # L1 -- sp_session ABI (create/prefill/decode) + sp_model_to_qwen3 bridge (on io_format + forward + model + arena + frobenius)
+    sp_channel      # TS.MAP -- GF(2) memory-channel oracle (hedge-read timing; perf overlay only, never a correctness dependency)
     dominance       # later — dominance order / signature dominance
     sieve           # later — Friedman sieve
     arm)            # later — Algebraic Resonance Memory
