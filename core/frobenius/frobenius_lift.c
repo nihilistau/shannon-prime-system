@@ -131,7 +131,10 @@ size_t sp_frob_q4_packed_bytes(int rows, int cols) {
  * inverse up to the quantization step. */
 void sp_frob_packed_free(sp_frob_packed_tensor *t) {
     if (!t) return;
-    free(t->row_prec); free(t->row_scale); free(t->row_off); free(t->codes);
+    free(t->row_prec);
+    if (!(t->alias_mask & 0x2)) free(t->row_scale);
+    free(t->row_off);
+    if (!(t->alias_mask & 0x1)) free(t->codes);
     memset(t, 0, sizeof *t);
 }
 

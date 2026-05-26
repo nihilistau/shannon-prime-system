@@ -30,6 +30,10 @@ struct sp_model {
     const sp_tensor_entry *table;   /* into base */
     const uint8_t  *data;           /* base + tensor_data_offset */
     const sp_tok_header   *tok_hdr; /* into tok_base */
+    /* Arena hoist: hoisted qwen3_model shared across all sessions on this handle.
+     * Freed via qm_free_fn BEFORE the mmap is unmapped (arena tensors alias mmap). */
+    struct qwen3_model        *qm;
+    void (*qm_free_fn)(struct qwen3_model *);
 #ifdef _WIN32
     HANDLE hF, hM, hTF, hTM;
 #else
@@ -183,6 +187,8 @@ sp_status sp_model_load(const char *model_path, const char *tok_path, sp_model *
 
 void sp_model_unload(sp_model *m) {
     if (!m) return;
+    /* Free the hoisted arena BEFORE unmapping — arena tensors alias mmap pages. */
+    if (m->qm && m->qm_free_fn) m->qm_free_fn(m->qm);
 #ifdef _WIN32
     if (m->base)     UnmapViewOfFile((LPCVOID)m->base);
     if (m->tok_base) UnmapViewOfFile((LPCVOID)m->tok_base);
@@ -238,3 +244,11 @@ sp_status sp_model_verify_spinors(const sp_model *m, int full_sweep) {
     if (!m) { sp_set_error("sp_model_verify_spinors: null handle"); return SP_EBADARG; }
     return check_spinor_sentinels(m, full_sweep);
 }
+
+void sp_model_store_qm(sp_model *m, struct qwen3_model *qm,
+                       void (*free_fn)(struct qwen3_model *)) {
+    if (!m) return;
+    m->qm = qm; m->qm_free_fn = free_fn;
+}
+
+struct qwen3_model *sp_model_borrow_qm(const sp_model *m) { return m ? m->qm : NULL; }

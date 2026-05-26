@@ -156,15 +156,24 @@ sp_status              sp_model_verify_spinors(const sp_model *m, int full_sweep
 
 /* ── adapter (src/io/sp_model_adapter.c) ──
  * Reconstruct a qwen3_model the existing gemma3_forward / qwen3_forward consume
- * unchanged: matmul weights + embedding from the .sp-model OK_Q8 codes/scales
- * (rebuilt into a packed arena; row codes/scales memcpy'd out of the mmap so the
- * arena owns its buffers), norms as owned f32. The returned model has gguf==NULL
- * and released==1; free it with qwen3_free. NOT part of the L1 ABI handle.
- * Returns NULL on error (sp_last_error has detail). The sp_model handle must
- * outlive the returned qwen3_model (norms/embedding are copied; nothing else
- * borrows the mmap, so in practice it is self-contained). */
+ * unchanged: matmul weights + embedding aliased directly from the .sp-model mmap
+ * (codes + row_scale point into the mmap via alias_mask; row_off + row_prec
+ * heap-allocated). Norms/embedding copied to owned f32. The returned model has
+ * gguf==NULL and released==1. The sp_model handle MUST outlive the qwen3_model
+ * because codes/row_scale remain mmap-backed. Caller transfers ownership to the
+ * model handle via sp_model_store_qm; sp_model_unload calls the destructor before
+ * unmapping. Returns NULL on error (sp_last_error has detail). */
 struct qwen3_model;
 struct qwen3_model *sp_model_to_qwen3(const sp_model *m);
+
+/* Hoist the runnable qwen3_model into the sp_model handle (built once, shared
+ * across sessions). store_qm takes ownership: sp_model_unload calls free_fn(qm)
+ * before unmapping. borrow_qm returns NULL until store_qm has been called.
+ * NOT thread-safe on the first call per model — the L2 layer must serialize the
+ * first sp_session_create per model handle. */
+void               sp_model_store_qm(sp_model *m, struct qwen3_model *qm,
+                                     void (*free_fn)(struct qwen3_model *));
+struct qwen3_model *sp_model_borrow_qm(const sp_model *m);
 
 #ifdef __cplusplus
 }

@@ -507,6 +507,50 @@ static void T_PARITY_Q4_BRIDGE(void) {
     sp_model_unload(mq8); sp_model_unload(mq4); cleanup_files();
 }
 
+static void T_ZERO_COPY_ALIAS(void) {
+    /* E_ZERO_COPY: arena codes + row_scale alias the mmap directly (Fix B); the
+     * hoisted qwen3_model is shared across sessions on the same model handle. */
+    sp_qwen3_fixture_info info; sp_model *m = NULL;
+    SP_CHECK(load_fixture(&info, &m) == 0, "fixture load");
+    if (!m) { cleanup_files(); return; }
+
+    SP_CHECK(sp_model_borrow_qm(m) == NULL, "borrow before any session -> NULL");
+
+    sp_session *s1 = NULL;
+    SP_CHECK_EQ_I64(sp_session_create(m, NULL, NULL, &s1), SP_OK, "first session create -> SP_OK");
+    qwen3_model *hoisted = sp_model_borrow_qm(m);
+    SP_CHECK(hoisted != NULL, "borrow after first session -> non-NULL");
+
+    sp_session *s2 = NULL;
+    SP_CHECK_EQ_I64(sp_session_create(m, NULL, NULL, &s2), SP_OK, "second session create -> SP_OK");
+    SP_CHECK(sp_model_borrow_qm(m) == hoisted, "second borrow -> same hoisted pointer");
+
+    /* alias check on token_embd.weight: codes and row_scale must point into the mmap */
+    const sp_arena_tensor *at = sp_arena_find(hoisted->arena, "token_embd.weight");
+    SP_CHECK(at != NULL, "arena find token_embd.weight");
+    if (at) {
+        SP_CHECK(at->pt.alias_mask == 0x3, "token_embd alias_mask == 0x3 (both pointers mmap-aliased)");
+        const sp_tensor_entry *e = sp_model_find_tensor(m, "token_embd.weight");
+        SP_CHECK(e != NULL, "tensor_entry token_embd.weight found");
+        if (e) {
+            const void *mmap_codes = sp_model_tensor_data(m, e);
+            SP_CHECK(at->pt.codes == (const uint8_t *)mmap_codes,
+                     "token_embd codes == mmap data pointer (zero-copy)");
+        }
+        const sp_tensor_entry *se = sp_model_find_tensor(m, "token_embd.weight.scale");
+        SP_CHECK(se != NULL, "tensor_entry token_embd.weight.scale found");
+        if (se) {
+            const void *mmap_scale = sp_model_tensor_data(m, se);
+            SP_CHECK((const void *)at->pt.row_scale == mmap_scale,
+                     "token_embd row_scale == mmap data pointer (zero-copy)");
+        }
+    }
+
+    sp_session_destroy(s1); sp_session_destroy(s2);
+    SP_CHECK(sp_model_borrow_qm(m) == hoisted, "qm still live after both sessions destroyed");
+    sp_model_unload(m); cleanup_files();
+}
+
 int main(void) {
     SP_RUN(T_PARITY_KV_SPINOR);
     SP_RUN(T_PARITY_Q4_BRIDGE);
@@ -520,5 +564,6 @@ int main(void) {
     SP_RUN(T_ARCH_GROWTH_OLD);
     SP_RUN(T_ARCH_GROWTH_NEW);
     SP_RUN(T_SESSION_PRECISION_PRECEDENCE);
+    SP_RUN(T_ZERO_COPY_ALIAS);
     return SP_DONE();
 }
