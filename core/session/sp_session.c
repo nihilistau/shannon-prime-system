@@ -62,11 +62,17 @@ sp_status sp_session_create(const sp_model *m, const sp_session_config *cfg,
     if (!m || !out_session) { sp_set_error("sp_session_create: null arg"); return SP_EBADARG; }
     *out_session = NULL;
 
-    qwen3_model *qm = sp_model_to_qwen3(m);
-    if (!qm) return SP_EBADFORMAT;   /* sp_model_to_qwen3 set the detail */
+    /* Borrow the model-level hoisted qwen3_model; build + hoist on first create.
+     * NOT thread-safe on the first call per model handle — L2 must serialize. */
+    qwen3_model *qm = sp_model_borrow_qm(m);
+    if (!qm) {
+        qm = sp_model_to_qwen3(m);
+        if (!qm) return SP_EBADFORMAT;
+        sp_model_store_qm((sp_model *)m, qm, qwen3_free);  /* one-shot hoist; model owns it */
+    }
 
     sp_session *s = (sp_session *)calloc(1, sizeof *s);
-    if (!s) { qwen3_free(qm); sp_set_error("sp_session_create: OOM"); return SP_ENOMEM; }
+    if (!s) { sp_set_error("sp_session_create: OOM"); return SP_ENOMEM; }
     s->model = m; s->qm = qm; s->cancel = cancel_flag; s->n_vocab = qm->cfg.n_vocab;
     if (cfg) s->cfg = *cfg;
 
@@ -99,7 +105,7 @@ sp_status sp_session_create(const sp_model *m, const sp_session_config *cfg,
 
 void sp_session_destroy(sp_session *s) {
     if (!s) return;
-    qwen3_free(s->qm);
+    /* s->qm is borrowed from the model handle — freed by sp_model_unload, not here */
     free(s->hist);
     free(s->kc); free(s->vc);
     free(s->kcb); free(s->vcb); free(s->kdec); free(s->vdec);

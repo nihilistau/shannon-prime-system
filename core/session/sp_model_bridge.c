@@ -33,7 +33,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Build a per-row-Q8 packed tensor from OK_Q8 codes + paired .scale tensor. */
+/* Build a per-row-Q8 packed tensor aliasing codes + row_scale directly from the
+ * mmap (zero copy). alias_mask=0x3 prevents sp_frob_packed_free from freeing them.
+ * Only row_prec and row_off are heap-allocated (tiny: rows * 5 bytes). */
 static int build_packed_q8(const sp_model *sm, const char *name, sp_frob_packed_tensor *out) {
     memset(out, 0, sizeof *out);
     const sp_tensor_entry *e = sp_model_find_tensor(sm, name);
@@ -52,25 +54,23 @@ static int build_packed_q8(const sp_model *sm, const char *name, sp_frob_packed_
     if (!scale) return 1;
 
     out->rows = (int)rows; out->cols = (int)cols; out->codes_bytes = rows * cols;
-    out->row_prec  = (uint8_t *)malloc((size_t)rows);
-    out->row_scale = (float   *)malloc((size_t)rows * sizeof(float));
-    out->row_off   = (size_t  *)malloc((size_t)rows * sizeof(size_t));
-    out->codes     = (uint8_t *)malloc((size_t)out->codes_bytes);
-    if (!out->row_prec || !out->row_scale || !out->row_off || !out->codes) {
-        sp_frob_packed_free(out); return 1;
+    out->row_prec = (uint8_t *)malloc((size_t)rows);
+    out->row_off  = (size_t  *)malloc((size_t)rows * sizeof(size_t));
+    if (!out->row_prec || !out->row_off) {
+        sp_frob_packed_free(out); return 1;  /* alias_mask=0, codes/scale=NULL -> safe */
     }
+    out->alias_mask = 0x3;
+    out->codes     = (uint8_t *)(uintptr_t)codes;   /* mmap PAGE_READONLY/PROT_READ */
+    out->row_scale = (float   *)(uintptr_t)scale;
     for (uint64_t r = 0; r < rows; r++) {
-        out->row_prec[r]  = 8u;
-        out->row_scale[r] = scale[r];
-        out->row_off[r]   = (size_t)(r * cols);
+        out->row_prec[r] = 8u;
+        out->row_off[r]  = (size_t)(r * cols);
     }
-    memcpy(out->codes, codes, (size_t)out->codes_bytes);
     return 0;
 }
 
-/* Build a per-row-Q4 packed tensor from OK_Q4 nibble-packed codes + paired .scale.
- * On-disk layout: rows * ceil(cols/2) nibble bytes (low nibble = even col index,
- * sign-extended 4-bit). Mirrors sp_frob_packed_tensor row_prec=4 convention. */
+/* Build a per-row-Q4 packed tensor aliasing codes + row_scale from the mmap.
+ * On-disk layout: rows * ceil(cols/2) nibble bytes (low nibble = even col index). */
 static int build_packed_q4(const sp_model *sm, const char *name, sp_frob_packed_tensor *out) {
     memset(out, 0, sizeof *out);
     const sp_tensor_entry *e = sp_model_find_tensor(sm, name);
@@ -91,19 +91,18 @@ static int build_packed_q4(const sp_model *sm, const char *name, sp_frob_packed_
     if (!scale) return 1;
 
     out->rows = (int)rows; out->cols = (int)cols; out->codes_bytes = (size_t)(rows * nib_cols);
-    out->row_prec  = (uint8_t *)malloc((size_t)rows);
-    out->row_scale = (float   *)malloc((size_t)rows * sizeof(float));
-    out->row_off   = (size_t  *)malloc((size_t)rows * sizeof(size_t));
-    out->codes     = (uint8_t *)malloc(out->codes_bytes);
-    if (!out->row_prec || !out->row_scale || !out->row_off || !out->codes) {
+    out->row_prec = (uint8_t *)malloc((size_t)rows);
+    out->row_off  = (size_t  *)malloc((size_t)rows * sizeof(size_t));
+    if (!out->row_prec || !out->row_off) {
         sp_frob_packed_free(out); return 1;
     }
+    out->alias_mask = 0x3;
+    out->codes     = (uint8_t *)(uintptr_t)codes;
+    out->row_scale = (float   *)(uintptr_t)scale;
     for (uint64_t r = 0; r < rows; r++) {
-        out->row_prec[r]  = 4u;
-        out->row_scale[r] = scale[r];
-        out->row_off[r]   = (size_t)(r * nib_cols);
+        out->row_prec[r] = 4u;
+        out->row_off[r]  = (size_t)(r * nib_cols);
     }
-    memcpy(out->codes, codes, out->codes_bytes);
     return 0;
 }
 

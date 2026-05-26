@@ -163,6 +163,7 @@ typedef struct {
     size_t  *row_off;       /* [rows] byte offset of the row's codes in `codes` */
     uint8_t *codes;         /* packed codes: Q8 row = cols int8; Q4 row = ceil(cols/2) bytes */
     size_t   codes_bytes;   /* used bytes in `codes` */
+    uint8_t  alias_mask;    /* bit 0: codes mmap-aliased (do not free); bit 1: row_scale mmap-aliased */
 } sp_frob_packed_tensor;
 
 /* Source-row reader: writes row `j` of the weight matrix as `cols` f32 into `dst`.
