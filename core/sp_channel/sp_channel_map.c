@@ -37,7 +37,7 @@
 #include <string.h>
 #include <stdint.h>
 
-/* ── CPUID helper (x86 only) ─────────────────────────────────────────────── */
+/* ── CPUID helpers (x86 only) ────────────────────────────────────────────── */
 
 #if defined(__x86_64__) || defined(__i386__)
 static unsigned int x86_cpuid_ecx(unsigned int leaf) {
@@ -52,7 +52,37 @@ static unsigned int x86_cpuid_ecx(unsigned int leaf) {
     (void)eax; (void)ebx; (void)edx;
     return ecx;
 }
+
+/* __get_cpuid refuses hypervisor leaves (0x4000xxxx) because they exceed the
+ * normal max leaf.  Use __cpuid_count / __cpuid directly. */
+static void x86_cpuid_raw(unsigned int leaf,
+                           unsigned int *a, unsigned int *b,
+                           unsigned int *c, unsigned int *d) {
+    *a = *b = *c = *d = 0;
+#if defined(__GNUC__) || defined(__clang__)
+    __cpuid_count(leaf, 0, *a, *b, *c, *d);
+#elif defined(_MSC_VER)
+    int info[4] = {0};
+    __cpuid(info, (int)leaf);
+    *a = (unsigned int)info[0]; *b = (unsigned int)info[1];
+    *c = (unsigned int)info[2]; *d = (unsigned int)info[3];
+#endif
+}
 #endif /* x86 */
+
+/* On Windows 11, Hyper-V/VBS sets CPUID bit 31 even on the root partition
+ * (bare metal). The KVP registry key is written by the Hyper-V integration
+ * service only inside guest VMs — absent on the host/root partition. */
+#ifdef _WIN32
+static int is_hyperv_guest(void) {
+    HKEY hk;
+    LONG rc = RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+        "SOFTWARE\\Microsoft\\Virtual Machine\\Guest\\Parameters",
+        0, KEY_READ, &hk);
+    if (rc == ERROR_SUCCESS) { RegCloseKey(hk); return 1; }
+    return 0;
+}
+#endif
 
 #ifndef _WIN32
 static int cpuinfo_has_hypervisor(void) {
@@ -82,11 +112,31 @@ int sp_detect_virtualisation(void) {
 
     /* CPUID leaf 1 ECX bit 31: hypervisor present (x86 only) */
 #if defined(__x86_64__) || defined(__i386__)
-    if (x86_cpuid_ecx(1u) & (1u << 31)) return 1;
+    if (x86_cpuid_ecx(1u) & (1u << 31)) {
+#ifdef _WIN32
+        /* Windows 11 VBS/Hyper-V sets this bit on the root partition (bare
+         * metal) as well as in guests. Check the hypervisor vendor first. */
+        unsigned int hv_a, hv_b, hv_c, hv_d;
+        x86_cpuid_raw(0x40000000u, &hv_a, &hv_b, &hv_c, &hv_d);
+        char vendor[13] = {0};
+        memcpy(vendor,     &hv_b, 4);
+        memcpy(vendor + 4, &hv_c, 4);
+        memcpy(vendor + 8, &hv_d, 4);
+        if (memcmp(vendor, "Microsoft Hv", 12) == 0) {
+            /* Hyper-V: KVP key present → guest; absent → root partition */
+            if (is_hyperv_guest()) return 1;
+            /* Root partition with VBS — not a VM; huge-page alloc decides */
+        } else {
+            return 1;  /* VMware / KVM / VirtualBox / etc. */
+        }
+#else
+        return 1;
+#endif
+    }
 #endif
 
 #ifdef _WIN32
-    return 0;   /* CPUID bit is the sole Windows signal */
+    return 0;
 #else
     if (cpuinfo_has_hypervisor()) return 1;
     /* /sys/hypervisor/type present on Xen PV */
