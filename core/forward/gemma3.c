@@ -67,7 +67,7 @@ int gemma3_forward(const qwen3_model *m, const int32_t *tokens, int n_tok, float
     float *sc  = (float *)malloc((size_t)n_tok * sizeof(float));       /* attn scores */
     if (!x || !nx || !q || !k || !vv || !ao || !ap || !g || !up || !dn || !sc) goto done;
 
-    /* embedding lookup, scaled by sqrt(n_embd) */
+    /* embedding lookup; scale by sqrt(n_embd) */
     for (int t = 0; t < n_tok; t++) {
         if (sp_embed_row(m, tokens[t], E, x + (size_t)t * E)) goto done;
         float *xt = x + (size_t)t * E;

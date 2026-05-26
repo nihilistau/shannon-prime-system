@@ -165,6 +165,7 @@ sp_status              sp_model_verify_spinors(const sp_model *m, int full_sweep
  * unmapping. Returns NULL on error (sp_last_error has detail). */
 struct qwen3_model;
 struct qwen3_model *sp_model_to_qwen3(const sp_model *m);
+struct qwen3_model *sp_model_to_gemma3(const sp_model *m);
 
 /* Hoist the runnable qwen3_model into the sp_model handle (built once, shared
  * across sessions). store_qm takes ownership: sp_model_unload calls free_fn(qm)
