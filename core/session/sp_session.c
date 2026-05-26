@@ -97,7 +97,7 @@ sp_status sp_session_create(const sp_model *m, const sp_session_config *cfg,
     if (cap == 0) cap = SP_SESSION_CTX_FALLBACK;
     s->hist_cap = cap;
     s->hist = (int32_t *)malloc(cap * sizeof(int32_t));
-    if (!s->hist) { qwen3_free(qm); free(s); sp_set_error("sp_session_create: OOM (history)"); return SP_ENOMEM; }
+    if (!s->hist) { free(s); sp_set_error("sp_session_create: OOM (history)"); return SP_ENOMEM; }
 
     *out_session = s;
     return SP_OK;
