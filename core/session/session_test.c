@@ -12,6 +12,7 @@
 #include "sp/spinor_block.h"
 #include "sp/arena.h"
 #include "qwen3_fixture.h"
+#include "gemma3_fixture.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -551,6 +552,157 @@ static void T_ZERO_COPY_ALIAS(void) {
     sp_model_unload(m); cleanup_files();
 }
 
+/* ── Phase 3 Cell 1: Gemma3 bridge tests ── */
+
+static int load_g3_fixture(sp_gemma3_fixture_info *info, sp_model **out) {
+    uint8_t *mb = NULL, *tb = NULL;
+    if (sp_gemma3_fixture_build(&mb, &tb, info)) return 1;
+    int rc = sp_gemma3_fixture_write("fx_g3.spm", mb, info->model_len)
+           | sp_gemma3_fixture_write("fx_g3.spt", tb, info->tok_len);
+    free(mb); free(tb);
+    if (rc) return 1;
+    return (sp_model_load("fx_g3.spm", "fx_g3.spt", out) == SP_OK) ? 0 : 1;
+}
+static void cleanup_g3_files(void) { remove("fx_g3.spm"); remove("fx_g3.spt"); }
+
+static void T_GEMMA3_ALIAS(void) {
+    /* E_ZERO_COPY (Gemma3): bridge codes + row_scale alias the mmap (alias_mask==0x3). */
+    sp_gemma3_fixture_info info; sp_model *m = NULL;
+    SP_CHECK(load_g3_fixture(&info, &m) == 0, "Gemma3 fixture load");
+    if (!m) { cleanup_g3_files(); return; }
+
+    SP_CHECK(sp_model_borrow_qm(m) == NULL, "borrow before session -> NULL");
+    sp_session *s = NULL;
+    SP_CHECK_EQ_I64(sp_session_create(m, NULL, NULL, &s), SP_OK, "create -> SP_OK");
+    qwen3_model *qm = sp_model_borrow_qm(m);
+    SP_CHECK(qm != NULL, "borrow after create -> non-NULL");
+    SP_CHECK(qm->cfg.arch == SP_ARCH_GEMMA3, "arch == SP_ARCH_GEMMA3");
+
+    const sp_arena_tensor *at = sp_arena_find(qm->arena, "token_embd.weight");
+    SP_CHECK(at != NULL, "arena find token_embd.weight");
+    if (at) {
+        SP_CHECK(at->pt.alias_mask == 0x3, "token_embd alias_mask == 0x3");
+        const sp_tensor_entry *e = sp_model_find_tensor(m, "token_embd.weight");
+        if (e) {
+            const void *mmap_codes = sp_model_tensor_data(m, e);
+            SP_CHECK(at->pt.codes == (const uint8_t *)mmap_codes,
+                     "token_embd codes == mmap (zero-copy)");
+        }
+        const sp_tensor_entry *se = sp_model_find_tensor(m, "token_embd.weight.scale");
+        if (se) {
+            const void *mmap_scale = sp_model_tensor_data(m, se);
+            SP_CHECK((const void *)at->pt.row_scale == mmap_scale,
+                     "token_embd row_scale == mmap (zero-copy)");
+        }
+    }
+
+    sp_session_destroy(s);
+    sp_model_unload(m); cleanup_g3_files();
+}
+
+static void T_GEMMA3_DECODE_TRAJECTORY(void) {
+    /* Phase 3 Cell 1: session Gemma3 decode trajectory matches gemma3_forward O(n²). */
+    sp_gemma3_fixture_info info; sp_model *m = NULL;
+    SP_CHECK(load_g3_fixture(&info, &m) == 0, "Gemma3 fixture load");
+    if (!m) { cleanup_g3_files(); return; }
+    const uint32_t V = info.n_vocab;
+
+    /* reference: build model via sp_model_to_gemma3 + O(n²) decode */
+    qwen3_model *ref = sp_model_to_gemma3(m);
+    SP_CHECK(ref != NULL, "sp_model_to_gemma3 reference");
+
+    int32_t ref_seq[NPROMPT + NGEN];
+    memcpy(ref_seq, TOKS, (size_t)NPROMPT * sizeof(int32_t));
+    float *ref_lg = (float *)malloc((size_t)(NPROMPT + NGEN) * V * sizeof(float));
+    SP_CHECK(ref_lg != NULL, "alloc ref logits");
+
+    if (ref && ref_lg) {
+        /* prefill: generate logits for all NPROMPT positions */
+        SP_CHECK(gemma3_forward(ref, ref_seq, (int)NPROMPT, ref_lg) == 0, "ref prefill");
+        ref_seq[NPROMPT] = argmax_f(ref_lg + (size_t)(NPROMPT - 1u) * V, V);
+        for (uint32_t k = 1; k < NGEN; k++) {
+            SP_CHECK(gemma3_forward(ref, ref_seq, (int)(NPROMPT + k), ref_lg) == 0, "ref step");
+            ref_seq[NPROMPT + k] = argmax_f(ref_lg + (size_t)(NPROMPT + k - 1u) * V, V);
+        }
+    }
+
+    sp_session *s = NULL; sp_session_config cfg; memset(&cfg, 0, sizeof cfg); cfg.deterministic = 1;
+    SP_CHECK_EQ_I64(sp_session_create(m, &cfg, NULL, &s), SP_OK, "create");
+    float *lg = (float *)malloc((size_t)V * sizeof(float));
+    SP_CHECK_EQ_I64(sp_prefill_chunk(s, TOKS, NPROMPT, lg, V), SP_OK, "prefill");
+
+    int t = argmax_f(lg, V), matched = 1; uint32_t first_div = NGEN;
+    if (ref && ref_lg) {
+        for (uint32_t k = 0; k < NGEN; k++) {
+            if (t != ref_seq[NPROMPT + k]) { matched = 0; first_div = k; break; }
+            if (k + 1 < NGEN) {
+                if (sp_decode_step(s, t, lg, V) != SP_OK) { matched = 0; first_div = k; break; }
+                t = argmax_f(lg, V);
+            }
+        }
+    }
+    SP_CHECK(matched, "Gemma3 session greedy trajectory == gemma3_forward O(n²) over 100 steps");
+    if (!matched) fprintf(stderr, "    [G3-traj] first divergence at step %u\n", first_div);
+    size_t pos = 0; sp_session_position(s, &pos);
+    SP_CHECK_EQ_I64(pos, NPROMPT + (NGEN - 1u), "position == prompt + 99 decode steps");
+
+    free(lg); free(ref_lg);
+    if (ref) qwen3_free(ref);
+    sp_session_destroy(s); sp_model_unload(m); cleanup_g3_files();
+}
+
+static void T_PARITY_CROSS_LOAD_GEMMA3(void) {
+    /* Phase 3 Cell 1: engine-transcoded Gemma3-1B .sp-model cross-loads in math-core;
+     * arch fields round-trip; prefill produces finite logits. Skips if artifact absent. */
+    const char *mpath = "D:/F/shannon-prime-repos/shannon-prime-system-engine/"
+                        "build-cpu/tests/gemma3_rt.sp-model";
+    const char *tpath = "D:/F/shannon-prime-repos/shannon-prime-system-engine/"
+                        "build-cpu/tests/gemma3_rt.sp-tokenizer";
+    FILE *probe = fopen(mpath, "rb");
+    if (!probe) {
+        fprintf(stderr, "    [G3-cross] artifact absent — SKIP\n");
+        return;
+    }
+    fclose(probe);
+
+    sp_model *m = NULL;
+    SP_CHECK_EQ_I64(sp_model_load(mpath, tpath, &m), SP_OK,
+                    "sp_model_load (engine-transcoded Gemma3-1B)");
+    if (!m) return;
+
+    sp_arch_info ai; memset(&ai, 0, sizeof ai);
+    SP_CHECK_EQ_I64(sp_model_arch(m, &ai), SP_OK, "sp_model_arch");
+    SP_CHECK_EQ_I64(ai.arch_id,    SP_ARCH_ID_GEMMA3, "arch_id == GEMMA3");
+    SP_CHECK_EQ_I64(ai.n_layers,              26,     "n_layers == 26");
+    SP_CHECK_EQ_I64(ai.hidden_dim,          1152,     "hidden_dim == 1152");
+    SP_CHECK_EQ_I64(ai.n_heads,                4,     "n_heads == 4");
+    SP_CHECK_EQ_I64(ai.n_kv_heads,             1,     "n_kv_heads == 1");
+    SP_CHECK_EQ_I64(ai.head_dim,             256,     "head_dim == 256");
+    SP_CHECK(ai.swa_window > 0, "swa_window > 0 (Gemma3 local-attn)");
+    SP_CHECK_EQ_I64(ai.preferred_precision, SP_PRECISION_FP16, "preferred_precision == FP16");
+    fprintf(stderr, "    [G3-cross] arch: n_ff=%u  rms_eps=%.2e  swa=%u  prec=%u\n",
+            ai.n_ff, (double)ai.rms_eps, ai.swa_window, ai.preferred_precision);
+
+    static const int32_t g3_toks[4] = { 2, 7, 3, 42 };
+    const uint32_t V = ai.vocab_size;
+    sp_session *s = NULL;
+    sp_session_config scfg; memset(&scfg, 0, sizeof scfg);
+    scfg.deterministic = 1; scfg.max_context = 32;
+    SP_CHECK_EQ_I64(sp_session_create(m, &scfg, NULL, &s), SP_OK, "sp_session_create");
+    float *lg = (float *)malloc((size_t)V * sizeof(float));
+    SP_CHECK(lg != NULL, "alloc logits");
+    if (s && lg) {
+        SP_CHECK_EQ_I64(sp_prefill_chunk(s, g3_toks, 4u, lg, V), SP_OK, "prefill");
+        int finite = 1;
+        for (uint32_t i = 0; i < V; i++) if (!isfinite(lg[i])) { finite = 0; break; }
+        SP_CHECK(finite, "cross-load prefill all logits finite (G3-cross)");
+        if (finite) fprintf(stderr, "    [G3-cross] argmax: tok %d\n", argmax_f(lg, V));
+    }
+    free(lg);
+    if (s) sp_session_destroy(s);
+    sp_model_unload(m);
+}
+
 int main(void) {
     SP_RUN(T_PARITY_KV_SPINOR);
     SP_RUN(T_PARITY_Q4_BRIDGE);
@@ -565,5 +717,8 @@ int main(void) {
     SP_RUN(T_ARCH_GROWTH_NEW);
     SP_RUN(T_SESSION_PRECISION_PRECEDENCE);
     SP_RUN(T_ZERO_COPY_ALIAS);
+    SP_RUN(T_GEMMA3_ALIAS);
+    SP_RUN(T_GEMMA3_DECODE_TRAJECTORY);
+    SP_RUN(T_PARITY_CROSS_LOAD_GEMMA3);
     return SP_DONE();
 }
