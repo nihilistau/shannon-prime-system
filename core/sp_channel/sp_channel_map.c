@@ -558,3 +558,108 @@ sp_status sp_channel_map_dims(const sp_channel_map *m,
 }
 
 void sp_channel_map_free(sp_channel_map *m) { free(m); }
+
+/* ── Channel-pair allocator ───────────────────────────────────────────────── */
+
+#define SP_PAIR_CACHE_LINE 64u
+
+static sp_status alloc_pair_fallback(sp_channel_pair_arena *arena,
+                                     void **ptr_a_out, void **ptr_b_out) {
+    void *blk = calloc(1, 2u * SP_PAIR_CACHE_LINE);
+    if (!blk) return SP_ENOMEM;
+    arena->base     = blk;
+    arena->n_pages  = 0;
+    arena->page_size = 0;
+    arena->is_huge  = 0;
+    *ptr_a_out = blk;
+    *ptr_b_out = (char *)blk + SP_PAIR_CACHE_LINE;
+    return SP_OK;
+}
+
+sp_status sp_alloc_channel_pair(const sp_channel_map *m,
+                                void **ptr_a_out,
+                                void **ptr_b_out,
+                                sp_channel_pair_arena **arena_out) {
+    if (!ptr_a_out || !ptr_b_out || !arena_out) {
+        sp_set_error("sp_alloc_channel_pair: NULL arg");
+        return SP_EBADARG;
+    }
+    *ptr_a_out = *ptr_b_out = NULL;
+    *arena_out = NULL;
+
+    struct sp_channel_pair_arena *arena =
+        (struct sp_channel_pair_arena *)calloc(1, sizeof *arena);
+    if (!arena) return SP_ENOMEM;
+
+    /* DISABLED path: log warning and return malloc fallback */
+    if (!m || m->mode == SP_CHANNEL_DISABLED) {
+        fprintf(stderr,
+            "SP_WARN: Virtualized memory controller detected, disabling TailSlayer\n");
+        sp_status rc = alloc_pair_fallback(arena, ptr_a_out, ptr_b_out);
+        if (rc != SP_OK) { free(arena); return rc; }
+        *arena_out = arena;
+        return SP_OK;
+    }
+
+    /* LIVE path: allocate huge-page arena, scan for channel-diverse pair */
+    size_t hp_size = detect_huge_page_size();
+    void *base = sp_alloc_huge(4, hp_size);
+    if (!base) {
+        fprintf(stderr,
+            "SP_WARN: sp_alloc_channel_pair: huge-page alloc failed — DISABLED fallback\n");
+        sp_status rc = alloc_pair_fallback(arena, ptr_a_out, ptr_b_out);
+        if (rc != SP_OK) { free(arena); return rc; }
+        *arena_out = arena;
+        return SP_OK;
+    }
+
+    arena->base      = base;
+    arena->n_pages   = 4;
+    arena->page_size = hp_size;
+    arena->is_huge   = 1;
+
+    /* Scan cache-line-aligned addresses within the arena for a diverse pair */
+    uintptr_t scan_start = (uintptr_t)base;
+    uintptr_t scan_end   = (uintptr_t)base + 4u * hp_size - SP_PAIR_CACHE_LINE;
+    void     *found_a    = NULL;
+    void     *found_b    = NULL;
+    uint32_t  ch_a       = SP_CHANNEL_UNSPECIFIED;
+
+    for (uintptr_t p = scan_start; p < scan_end; p += SP_PAIR_CACHE_LINE) {
+        uint32_t ch = sp_channel_of(m, p);
+        if (!found_a) {
+            found_a = (void *)p;
+            ch_a    = ch;
+        } else if (ch != ch_a) {
+            found_b = (void *)p;
+            break;
+        }
+    }
+
+    if (!found_b) {
+        /* No diverse pair found — fall back rather than failing hard */
+        sp_free_huge(base, 4, hp_size);
+        fprintf(stderr,
+            "SP_WARN: sp_alloc_channel_pair: no channel-diverse pair in arena — DISABLED fallback\n");
+        arena->base = NULL; arena->n_pages = 0; arena->page_size = 0;
+        arena->is_huge = 0;
+        sp_status rc = alloc_pair_fallback(arena, ptr_a_out, ptr_b_out);
+        if (rc != SP_OK) { free(arena); return rc; }
+        *arena_out = arena;
+        return SP_OK;
+    }
+
+    *ptr_a_out = found_a;
+    *ptr_b_out = found_b;
+    *arena_out = arena;
+    return SP_OK;
+}
+
+void sp_free_channel_pair(sp_channel_pair_arena *arena) {
+    if (!arena) return;
+    if (arena->is_huge)
+        sp_free_huge(arena->base, arena->n_pages, arena->page_size);
+    else
+        free(arena->base);
+    free(arena);
+}
