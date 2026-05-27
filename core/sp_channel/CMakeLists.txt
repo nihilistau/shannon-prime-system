@@ -26,3 +26,13 @@ endif()
 if(TARGET test_channel)
     target_include_directories(test_channel PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
+
+# M_TS_HEDGE bench — separate executable (sp_add_module allows only one TEST target).
+add_executable(bench_ts_hedge bench_ts_hedge.c)
+target_link_libraries(bench_ts_hedge PRIVATE sp_channel)
+target_include_directories(bench_ts_hedge PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/include)
+if(UNIX)
+    target_link_libraries(bench_ts_hedge PRIVATE Threads::Threads)
+endif()

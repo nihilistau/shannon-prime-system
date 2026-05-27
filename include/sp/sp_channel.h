@@ -87,6 +87,30 @@ sp_status sp_channel_host_fingerprint(char *buf, size_t buf_len);
 /* Destroy. Safe to call with NULL. */
 void sp_channel_map_free(sp_channel_map *m);
 
+/* ── Channel-pair allocator ─────────────────────────────────────────────────
+ * Allocates two cache-line-aligned pointers guaranteed to reside on distinct
+ * memory channels (LIVE mode) or falls back to malloc with a warning (DISABLED
+ * mode, VM/CI environments).
+ *
+ * LIVE path: allocates a 4 × huge-page arena (to keep virtual-bit arithmetic
+ *   valid) and scans it with sp_channel_of() to find two addresses on distinct
+ *   channels.  *arena_out holds the arena handle for sp_free_channel_pair().
+ *
+ * DISABLED/fallback path: logs SP_WARN and returns two malloc'd pointers with
+ *   channels = SP_CHANNEL_UNSPECIFIED.  sp_free_channel_pair() still works.
+ *
+ * Returns SP_ENOMEM on allocation failure.  Never returns a non-OK status for
+ * the DISABLED path — same safety contract as sp_channel_map_build. */
+typedef struct sp_channel_pair_arena sp_channel_pair_arena;
+
+sp_status sp_alloc_channel_pair(const sp_channel_map *m,
+                                void **ptr_a_out,
+                                void **ptr_b_out,
+                                sp_channel_pair_arena **arena_out);
+
+/* Free the arena returned by sp_alloc_channel_pair.  Safe to call with NULL. */
+void sp_free_channel_pair(sp_channel_pair_arena *arena);
+
 #ifdef __cplusplus
 }
 #endif

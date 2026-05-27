@@ -54,4 +54,13 @@ int sp_detect_virtualisation(void);
  * CAP_SYS_ADMIN on Linux ≥ 4.0).  Always 0 on Windows. */
 int sp_pagemap_privileged(void);
 
+/* Opaque handle for sp_alloc_channel_pair / sp_free_channel_pair.
+ * Defined here so bench_ts_hedge.c (internal) can inspect it if needed. */
+struct sp_channel_pair_arena {
+    void   *base;       /* huge-page arena (is_huge=1) or calloc block (is_huge=0) */
+    size_t  n_pages;    /* non-zero only on huge-page path */
+    size_t  page_size;  /* non-zero only on huge-page path */
+    int     is_huge;
+};
+
 #endif /* SP_CHANNEL_INTERNAL_H */
