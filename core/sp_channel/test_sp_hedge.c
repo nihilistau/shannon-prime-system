@@ -128,11 +128,94 @@ static void T_HEDGE_REPEATED(void) {
     sp_hedge_pool_destroy(pool);
 }
 
+/* ── T_HEDGE_BULK_SMALL — §16.3.1 ─────────────────────────────────────── */
+static void T_HEDGE_BULK_SMALL(void) {
+    sp_hedge_pool *pool = NULL;
+    sp_status rc = sp_hedge_pool_create(&pool, TEST_CORES, 2, 8);
+    SP_CHECK(rc == SP_OK, "bulk_small: pool_create");
+    if (!pool) return;
+
+    const size_t N = 8192;
+    uint8_t *src_a = (uint8_t *)malloc(N);
+    uint8_t *src_b = (uint8_t *)malloc(N);
+    uint8_t *dst_a = (uint8_t *)malloc(N);
+    uint8_t *dst_b = (uint8_t *)malloc(N);
+    SP_CHECK(src_a && src_b && dst_a && dst_b, "bulk_small: alloc");
+    if (src_a && src_b && dst_a && dst_b) {
+        fill_rand(src_a, N, 0xCAFE);
+        fill_rand(src_b, N, 0xBEEF);
+        memset(dst_a, 0, N);
+        memset(dst_b, 0, N);
+        rc = sp_hedge_read_bulk(pool, src_a, dst_a, src_b, dst_b, N);
+        SP_CHECK(rc == SP_OK, "bulk_small: read_bulk SP_OK");
+        SP_CHECK(memcmp(dst_a, src_a, N) == 0, "bulk_small: dst_a == src_a");
+        SP_CHECK(memcmp(dst_b, src_b, N) == 0, "bulk_small: dst_b == src_b");
+    }
+    free(src_a); free(src_b); free(dst_a); free(dst_b);
+    sp_hedge_pool_destroy(pool);
+}
+
+/* ── T_HEDGE_BULK_LARGE — 1 MB transfer ─────────────────────────────── */
+static void T_HEDGE_BULK_LARGE(void) {
+    sp_hedge_pool *pool = NULL;
+    sp_status rc = sp_hedge_pool_create(&pool, TEST_CORES, 2, 8);
+    SP_CHECK(rc == SP_OK, "bulk_large: pool_create");
+    if (!pool) return;
+
+    const size_t N = 1024 * 1024;
+    uint8_t *src_a = (uint8_t *)malloc(N);
+    uint8_t *src_b = (uint8_t *)malloc(N);
+    uint8_t *dst_a = (uint8_t *)malloc(N);
+    uint8_t *dst_b = (uint8_t *)malloc(N);
+    SP_CHECK(src_a && src_b && dst_a && dst_b, "bulk_large: alloc");
+    if (src_a && src_b && dst_a && dst_b) {
+        fill_rand(src_a, N, 0x1234);
+        fill_rand(src_b, N, 0x5678);
+        memset(dst_a, 0, N);
+        memset(dst_b, 0, N);
+        rc = sp_hedge_read_bulk(pool, src_a, dst_a, src_b, dst_b, N);
+        SP_CHECK(rc == SP_OK, "bulk_large: read_bulk SP_OK");
+        SP_CHECK(memcmp(dst_a, src_a, N) == 0, "bulk_large: dst_a == src_a (1 MB)");
+        SP_CHECK(memcmp(dst_b, src_b, N) == 0, "bulk_large: dst_b == src_b (1 MB)");
+    }
+    free(src_a); free(src_b); free(dst_a); free(dst_b);
+    sp_hedge_pool_destroy(pool);
+}
+
+/* ── T_HEDGE_BULK_N1_FALLBACK ─────────────────────────────────────────── */
+static void T_HEDGE_BULK_N1_FALLBACK(void) {
+    int cores[1] = {0};
+    sp_hedge_pool *pool = NULL;
+    sp_status rc = sp_hedge_pool_create(&pool, cores, 1, 8);
+    SP_CHECK(rc == SP_OK, "bulk_n1: pool_create");
+    if (!pool) return;
+
+    const size_t N = 256;
+    uint8_t src_a[256], src_b[256], dst_a[256], dst_b[256];
+    fill_rand(src_a, N, 0xAA);
+    fill_rand(src_b, N, 0xBB);
+    memset(dst_a, 0, N);
+    memset(dst_b, 0xFF, N);  /* sentinel: b should not be touched */
+
+    rc = sp_hedge_read_bulk(pool, src_a, dst_a, src_b, dst_b, N);
+    SP_CHECK(rc == SP_OK, "bulk_n1: read_bulk SP_OK");
+    SP_CHECK(memcmp(dst_a, src_a, N) == 0, "bulk_n1: dst_a == src_a");
+    /* dst_b must be unchanged (all 0xFF) */
+    uint8_t sentinel[256];
+    memset(sentinel, 0xFF, N);
+    SP_CHECK(memcmp(dst_b, sentinel, N) == 0, "bulk_n1: dst_b unchanged (b ignored)");
+
+    sp_hedge_pool_destroy(pool);
+}
+
 int main(void) {
     SP_RUN(T_HEDGE_POOL_CREATE_DESTROY);
     SP_RUN(T_HEDGE_PAIR_1);
     SP_RUN(T_HEDGE_SPINOR_1);
     SP_RUN(T_HEDGE_N1_FALLBACK);
     SP_RUN(T_HEDGE_REPEATED);
+    SP_RUN(T_HEDGE_BULK_SMALL);
+    SP_RUN(T_HEDGE_BULK_LARGE);
+    SP_RUN(T_HEDGE_BULK_N1_FALLBACK);
     return SP_DONE();
 }
