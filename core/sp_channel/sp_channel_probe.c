@@ -1,33 +1,53 @@
-/* sp_channel_probe.c — hedge-read timing probes for GF(2) channel recovery.
+/* sp_channel_probe.c — hedge-read timing probes with persistent thread pool.
  *
- * Each probe: flush two addresses A and A^(1<<bit) from cache, then race two
- * OS threads to read them.  The P99 of MAX(latency_A, latency_B) over N samples
- * discriminates same-channel (high-tail contention) from different-channel
- * (low-tail parallel service).
+ * Replacing the old per-sample CreateThread/pthread_create approach that added
+ * 1–100 µs thread-creation jitter — 1000× the ~100 ns DRAM contention signal.
  *
- * Thread failure (privilege denied / resource limit) returns non-zero so the
- * caller can fall back to DISABLED rather than producing garbage data. */
+ * Two reader threads are spawned once per probe_pool.  A lock-free spin-barrier
+ * (volatile int cmd/done + RDTSC) synchronises each sample with ~20-cycle
+ * overhead instead of microseconds.  Workers are pinned to distinct physical
+ * cores (best-effort) to avoid L1/L2 bandwidth bottleneck before the memory
+ * controller sees contention. */
 
+#if !defined(_WIN32) && !defined(_GNU_SOURCE)
+#  define _GNU_SOURCE   /* pthread_setaffinity_np, cpu_set_t */
+#endif
+
+#define _CRT_SECURE_NO_WARNINGS
 #ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#  ifdef _MSC_VER
+#    include <intrin.h>   /* __rdtsc() */
+#  endif
 #else
-#include <pthread.h>
-#include <time.h>
+#  include <pthread.h>
+#  include <sched.h>
+#  include <time.h>
 #endif
 
 #include "sp_channel_internal.h"
 #include <stdlib.h>
 #include <string.h>
 
-/* ── Monotonic nanosecond clock ───────────────────────────────────────────── */
+/* ── Platform alignment ───────────────────────────────────────────────────── */
 
+#if defined(_MSC_VER)
+#  define SP_CHAN_ALIGN64 __declspec(align(64))
+#elif defined(__GNUC__) || defined(__clang__)
+#  define SP_CHAN_ALIGN64 __attribute__((aligned(64)))
+#else
+#  define SP_CHAN_ALIGN64
+#endif
+
+/* ── Monotonic nanosecond clock (non-x86 fallback only) ─────────────────── */
+/* Compiled only on non-x86 platforms where rdtsc_now() delegates to it.     */
+#if !defined(_M_X64) && !defined(_M_IX86) && !defined(__x86_64__) && !defined(__i386__)
 static uint64_t mono_ns(void) {
 #ifdef _WIN32
     LARGE_INTEGER freq, t;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&t);
-    /* Avoid __int128: split into quotient and remainder parts */
     LONGLONG q = t.QuadPart / freq.QuadPart;
     LONGLONG r = t.QuadPart % freq.QuadPart;
     return (uint64_t)(q * 1000000000LL + r * 1000000000LL / freq.QuadPart);
@@ -37,8 +57,9 @@ static uint64_t mono_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 #endif
 }
+#endif /* non-x86 guard */
 
-/* ── Cache-line flush ─────────────────────────────────────────────────────── */
+/* ── Cache-line flush and memory fence ───────────────────────────────────── */
 
 static void cache_flush(volatile void *p) {
 #if defined(__x86_64__) || defined(__i386__)
@@ -59,63 +80,225 @@ static void mfence(void) {
 #endif
 }
 
-/* ── Hedge-read threads ───────────────────────────────────────────────────── */
+/* ── Worker context: 128 bytes, 2 separate cache lines, no false sharing ─── *
+ *
+ * Line 0 (offset 0–63):  quit + cmd + done + 52 bytes padding
+ * Line 1 (offset 64–127): addr + lat + 48 bytes padding
+ *
+ * Keeping control words and payload on separate lines ensures that the main
+ * thread's writes to cmd/done and the worker's reads of addr/lat never fight
+ * over the same cache line. */
 
 typedef struct {
-    volatile char *addr;
-    uint64_t       latency_ns;
-} hedge_arg;
+    volatile int       quit;        /* line 0: control words             */
+    volatile int       cmd;         /* 0 = IDLE, 1 = GO                  */
+    volatile int       done;
+    char              _ctl_pad[52]; /* pad line 0 to 64 bytes: 64-3×4=52 */
+    volatile char     *addr;        /* line 1: per-sample payload         */
+    volatile uint64_t  lat;         /* TSC cycle count for this read      */
+    char              _dat_pad[48]; /* pad line 1 to 64 bytes: 64-8-8=48 */
+} SP_CHAN_ALIGN64 probe_worker_ctx;
 
+_Static_assert(sizeof(probe_worker_ctx) == 128,
+               "probe_worker_ctx must be 128 bytes (2 cache lines)");
+
+/* ── Pool (opaque to callers; forward-declared in sp_channel_internal.h) ─── */
+
+struct sp_probe_pool {
+    probe_worker_ctx wA;      /* 128 bytes at offset 0   */
+    probe_worker_ctx wB;      /* 128 bytes at offset 128 */
+    uint64_t         tsc_hz;  /* TSC cycles per second   */
 #ifdef _WIN32
-static DWORD WINAPI hedge_reader(LPVOID arg_v) {
-    hedge_arg *a = (hedge_arg *)arg_v;
-    uint64_t t0  = mono_ns();
-    volatile char x = *a->addr; (void)x;
-    a->latency_ns   = mono_ns() - t0;
-    return 0;
-}
-#else
-static void *hedge_reader(void *arg_v) {
-    hedge_arg *a = (hedge_arg *)arg_v;
-    uint64_t t0  = mono_ns();
-    volatile char x = *a->addr; (void)x;
-    a->latency_ns   = mono_ns() - t0;
-    return NULL;
-}
-#endif
-
-/* Flush both addresses, race two threads, return the MAX latency.
- * Returns 0 on success, non-zero if thread creation failed. */
-static int hedge_pair(volatile char *A, volatile char *B, uint64_t *max_lat) {
-    cache_flush(A); cache_flush(B); mfence();
-
-    hedge_arg argA = { A, 0 };
-    hedge_arg argB = { B, 0 };
-
-#ifdef _WIN32
-    HANDLE hA = CreateThread(NULL, 0, hedge_reader, &argA, 0, NULL);
-    HANDLE hB = CreateThread(NULL, 0, hedge_reader, &argB, 0, NULL);
-    if (!hA || !hB) {
-        if (hA) CloseHandle(hA);
-        if (hB) CloseHandle(hB);
-        return 1;
-    }
-    HANDLE hs[2] = { hA, hB };
-    WaitForMultipleObjects(2, hs, TRUE, 2000);
-    CloseHandle(hA); CloseHandle(hB);
+    HANDLE    hA, hB;
 #else
     pthread_t tA, tB;
-    if (pthread_create(&tA, NULL, hedge_reader, &argA) != 0) return 1;
-    if (pthread_create(&tB, NULL, hedge_reader, &argB) != 0) {
-        pthread_join(tA, NULL); return 1;
-    }
-    pthread_join(tA, NULL);
-    pthread_join(tB, NULL);
 #endif
+};
 
-    *max_lat = (argA.latency_ns > argB.latency_ns)
-               ? argA.latency_ns : argB.latency_ns;
+/* ── RDTSC: ~20-cycle overhead vs QPC ~100-300 cycles ────────────────────── */
+
+static uint64_t rdtsc_now(void) {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    return __rdtsc();
+#elif defined(__x86_64__) || defined(__i386__)
+    unsigned hi, lo;
+    __asm__ volatile("rdtsc" : "=d"(hi), "=a"(lo));
+    return ((uint64_t)hi << 32) | (uint64_t)lo;
+#else
+    return mono_ns();  /* non-x86: treat ns as cycles; calibrate_tsc_hz → 1e9 */
+#endif
+}
+
+/* ── Spin-wait hint ───────────────────────────────────────────────────────── */
+
+static void sp_pause(void) {
+#if defined(_MSC_VER)
+    _mm_pause();
+#elif defined(__x86_64__) || defined(__i386__)
+    __asm__ volatile("pause" ::: "memory");
+#endif
+}
+
+/* ── Cooperative yield: lets a co-scheduled thread run on the same CPU ─────── *
+ * Used in both main's done-wait and the worker's IDLE-reset spin so that      *
+ * threads sharing the same logical CPU hand off to each other without waiting  *
+ * for the OS timer interrupt (~15 ms).  In the cross-core case sp_yield on    *
+ * an otherwise-idle core returns immediately with no meaningful overhead.      */
+static void sp_yield(void) {
+#ifdef _WIN32
+    SwitchToThread();
+#else
+    sched_yield();
+#endif
+}
+
+/* ── TSC frequency calibration ───────────────────────────────────────────── */
+
+static uint64_t calibrate_tsc_hz(void) {
+#if defined(_WIN32)
+    /* Windows QPC frequency equals the invariant TSC frequency on modern HW */
+    LARGE_INTEGER freq;
+    QueryPerformanceFrequency(&freq);
+    return (uint64_t)freq.QuadPart;
+#elif defined(__x86_64__) || defined(__i386__)
+    /* 5 ms busy-spin to measure TSC tick rate against CLOCK_MONOTONIC */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    uint64_t c0 = rdtsc_now();
+    uint64_t ns0 = (uint64_t)t0.tv_sec * 1000000000ULL + (uint64_t)t0.tv_nsec;
+    uint64_t ns_elapsed;
+    do {
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        uint64_t ns1 = (uint64_t)t1.tv_sec * 1000000000ULL + (uint64_t)t1.tv_nsec;
+        ns_elapsed = ns1 - ns0;
+    } while (ns_elapsed < 5000000ULL);
+    uint64_t c1 = rdtsc_now();
+    if (ns_elapsed == 0) return 3000000000ULL;
+    return (c1 - c0) * 1000000000ULL / ns_elapsed;
+#else
+    return 1000000000ULL;  /* rdtsc_now() returns ns directly on non-x86 */
+#endif
+}
+
+/* ── Worker thread: spin-barrier IDLE → GO → DONE → IDLE ─────────────────── */
+
+#ifdef _WIN32
+static DWORD WINAPI probe_worker_fn(LPVOID arg_v) {
+#else
+static void *probe_worker_fn(void *arg_v) {
+#endif
+    probe_worker_ctx *ctx = (probe_worker_ctx *)arg_v;
+    for (;;) {
+        /* IDLE spin: wait for a new GO (cmd=1 AND done=0).
+         * x86 TSO guarantees that if we observe cmd=1 we also observe all
+         * prior main-thread stores, including the done=0 reset — so the
+         * two-field test is race-free without any extra fence.  Using done=0
+         * as a co-condition also eliminates the old second spin: after setting
+         * done=1 we re-enter IDLE immediately; done=1 keeps us parked here
+         * until main resets done=0 for the next probe. */
+        while (!ctx->quit && !(ctx->cmd && !ctx->done)) sp_pause();
+        if (ctx->quit) break;
+
+        /* GO: time the cache-line read with RDTSC */
+        uint64_t t0 = rdtsc_now();
+        volatile char x = *ctx->addr; (void)x;
+        ctx->lat  = rdtsc_now() - t0;
+        ctx->done = 1;
+    }
+#ifdef _WIN32
     return 0;
+#else
+    return NULL;
+#endif
+}
+
+/* ── Public pool API ──────────────────────────────────────────────────────── */
+
+probe_pool *sp_probe_pool_create(void) {
+    probe_pool *pool;
+#ifdef _WIN32
+    pool = (probe_pool *)_aligned_malloc(sizeof *pool, 64);
+#else
+    if (posix_memalign((void **)&pool, 64, sizeof *pool) != 0) pool = NULL;
+#endif
+    if (!pool) return NULL;
+    memset(pool, 0, sizeof *pool);
+
+    pool->tsc_hz = calibrate_tsc_hz();
+
+#ifdef _WIN32
+    pool->hA = CreateThread(NULL, 0, probe_worker_fn, &pool->wA, 0, NULL);
+    pool->hB = CreateThread(NULL, 0, probe_worker_fn, &pool->wB, 0, NULL);
+    if (!pool->hA || !pool->hB) {
+        if (pool->hA) { pool->wA.quit = 1; WaitForSingleObject(pool->hA, 1000); CloseHandle(pool->hA); }
+        if (pool->hB) { pool->wB.quit = 1; WaitForSingleObject(pool->hB, 1000); CloseHandle(pool->hB); }
+        _aligned_free(pool);
+        return NULL;
+    }
+    /* Best-effort: pin workers to distinct physical cores */
+    (void)SetThreadAffinityMask(pool->hA, (DWORD_PTR)1 << 0);
+    (void)SetThreadAffinityMask(pool->hB, (DWORD_PTR)1 << 2);
+#else
+    if (pthread_create(&pool->tA, NULL, probe_worker_fn, &pool->wA) != 0) {
+        free(pool); return NULL;
+    }
+    if (pthread_create(&pool->tB, NULL, probe_worker_fn, &pool->wB) != 0) {
+        pool->wA.quit = 1;
+        pthread_join(pool->tA, NULL);
+        free(pool); return NULL;
+    }
+    /* Best-effort: pin workers to distinct physical cores */
+    {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset); CPU_SET(0, &cpuset);
+        (void)pthread_setaffinity_np(pool->tA, sizeof cpuset, &cpuset);
+        CPU_ZERO(&cpuset); CPU_SET(2, &cpuset);
+        (void)pthread_setaffinity_np(pool->tB, sizeof cpuset, &cpuset);
+    }
+#endif
+    return pool;
+}
+
+void sp_probe_pool_destroy(probe_pool *pool) {
+    if (!pool) return;
+    /* Signal workers to exit from either spin (IDLE or IDLE-reset) */
+    pool->wA.quit = 1; pool->wB.quit = 1;
+    pool->wA.cmd  = 0; pool->wB.cmd  = 0;  /* release any cmd==1 spin */
+#ifdef _WIN32
+    if (pool->hA) { WaitForSingleObject(pool->hA, 2000); CloseHandle(pool->hA); }
+    if (pool->hB) { WaitForSingleObject(pool->hB, 2000); CloseHandle(pool->hB); }
+    _aligned_free(pool);
+#else
+    pthread_join(pool->tA, NULL);
+    pthread_join(pool->tB, NULL);
+    free(pool);
+#endif
+}
+
+/* ── Pooled hedge pair: flush → GO spin-barrier → collect max cycles ─────── */
+
+static void hedge_pair_pooled(probe_pool *pool,
+                               volatile char *A, volatile char *B,
+                               uint64_t *cycles_out) {
+    /* Reset done flags BEFORE signalling GO so main's done-spin is not stale */
+    pool->wA.done = 0;
+    pool->wB.done = 0;
+    cache_flush(A); cache_flush(B); mfence();
+    pool->wA.addr = A;
+    pool->wB.addr = B;
+    pool->wA.cmd = 1;   /* GO: wake worker A */
+    pool->wB.cmd = 1;   /* GO: wake worker B */
+    /* Adaptive wait: spin first, yield only when workers need more time.
+     * Workers finish in ~300 ns when cross-core; the 5000-pause threshold
+     * is never reached in that case so sp_yield never fires.  If workers
+     * share a physical core with the main thread the threshold acts as a
+     * fallback to let the OS schedule the worker. */
+    for (int _sp = 0; !pool->wA.done || !pool->wB.done; _sp++) {
+        if (_sp < 5000) { sp_pause(); } else { sp_yield(); _sp = 0; }
+    }
+    *cycles_out = (pool->wA.lat > pool->wB.lat) ? pool->wA.lat : pool->wB.lat;
+    pool->wA.cmd = 0;   /* IDLE reset */
+    pool->wB.cmd = 0;
 }
 
 /* ── qsort helper ────────────────────────────────────────────────────────── */
@@ -129,18 +312,15 @@ static int cmp_u64(const void *a, const void *b) {
 /* ── Public probe function ────────────────────────────────────────────────── */
 
 int sp_probe_bit(uintptr_t base_addr, int bit, size_t huge_page_size,
-                 int n_probes, sp_probe_result *result_out) {
-    if (!result_out || n_probes <= 0 || bit < CHAN_BIT_LO || bit >= CHAN_BIT_HI)
+                 int n_probes, probe_pool *pool, sp_probe_result *result_out) {
+    if (!result_out || !pool || n_probes <= 0 || bit < CHAN_BIT_LO || bit >= CHAN_BIT_HI)
         return 1;
 
-    /* Place A one huge page into the allocation so flipping any bit in
-     * [12, 24) keeps B within the 4-page region regardless of direction. */
     uintptr_t A   = base_addr + huge_page_size;
     uintptr_t B   = A ^ ((uintptr_t)1 << bit);
     uintptr_t end = base_addr + (uintptr_t)4u * huge_page_size;
 
     if (B < base_addr || B >= end) {
-        /* B out of range — cannot probe; conservatively mark same-channel */
         result_out->bit             = bit;
         result_out->is_same_channel = 1;
         result_out->p99_ns          = 0;
@@ -150,16 +330,12 @@ int sp_probe_bit(uintptr_t base_addr, int bit, size_t huge_page_size,
     uint64_t *samples = (uint64_t *)malloc((size_t)n_probes * sizeof *samples);
     if (!samples) return 1;
 
-    int fail = 0;
     for (int i = 0; i < n_probes; i++) {
-        uint64_t lat = 0;
-        if (hedge_pair((volatile char *)A, (volatile char *)B, &lat) != 0) {
-            fail = 1; break;
-        }
-        samples[i] = lat;
+        uint64_t cycles = 0;
+        hedge_pair_pooled(pool, (volatile char *)A, (volatile char *)B, &cycles);
+        /* Convert TSC cycles to nanoseconds */
+        samples[i] = (pool->tsc_hz > 0) ? (cycles * 1000000000ULL / pool->tsc_hz) : cycles;
     }
-
-    if (fail) { free(samples); return 1; }
 
     qsort(samples, (size_t)n_probes, sizeof *samples, cmp_u64);
 
@@ -167,8 +343,7 @@ int sp_probe_bit(uintptr_t base_addr, int bit, size_t huge_page_size,
     uint64_t p99 = samples[(size_t)((n_probes * 99) / 100)];
     free(samples);
 
-    /* Same-channel heuristic: P99 > 1.5 × P50.
-     * Written as p99 > p50 + p50/2 to avoid large multiplications. */
+    /* Same-channel heuristic: P99 > 1.5 × P50 */
     int same = (p50 > 0u && p99 > p50 + p50 / 2u) ? 1 : 0;
 
     result_out->bit             = bit;
