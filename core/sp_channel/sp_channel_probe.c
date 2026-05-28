@@ -83,11 +83,15 @@ static void mfence(void) {
 /* ── Worker context: 128 bytes, 2 separate cache lines, no false sharing ─── *
  *
  * Line 0 (offset 0–63):  quit + cmd + done + 52 bytes padding
- * Line 1 (offset 64–127): addr + lat + 48 bytes padding
+ * Line 1 (offset 64–127): addr(8) + lat(8) + fire_tsc(8) + 40 bytes padding
  *
- * Keeping control words and payload on separate lines ensures that the main
- * thread's writes to cmd/done and the worker's reads of addr/lat never fight
- * over the same cache line. */
+ * fire_tsc: TSC rendezvous timestamp.  Both workers spin until rdtsc_now() >=
+ * fire_tsc before issuing their DRAM loads, ensuring simultaneous access to A
+ * and B.  Without synchronisation, worker A starts 100-300 cycles before B;
+ * A's read completes before B arrives at the memory controller, eliminating
+ * any channel-contention signal.  x86 TSO guarantees that if a worker sees
+ * cmd=1 it also sees the prior fire_tsc store, so the field is always valid
+ * when the worker enters the GO phase. */
 
 typedef struct {
     volatile int       quit;        /* line 0: control words             */
@@ -96,7 +100,8 @@ typedef struct {
     char              _ctl_pad[52]; /* pad line 0 to 64 bytes: 64-3×4=52 */
     volatile char     *addr;        /* line 1: per-sample payload         */
     volatile uint64_t  lat;         /* TSC cycle count for this read      */
-    char              _dat_pad[48]; /* pad line 1 to 64 bytes: 64-8-8=48 */
+    volatile uint64_t  fire_tsc;    /* rendezvous: spin until RDTSC >= this */
+    char              _dat_pad[40]; /* pad line 1 to 64 bytes: 64-8-8-8=40 */
 } SP_CHAN_ALIGN64 probe_worker_ctx;
 
 _Static_assert(sizeof(probe_worker_ctx) == 128,
@@ -139,6 +144,17 @@ static void sp_pause(void) {
 #endif
 }
 
+/* LFENCE: serialises RDTSC against OOO loads on Tiger Lake / Alder Lake.
+ * Without it, the second rdtsc can retire before the volatile load on
+ * aggressive superscalar pipelines, collapsing the measured interval to ~0. */
+static void sp_lfence(void) {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    _mm_lfence();
+#elif defined(__x86_64__) || defined(__i386__)
+    __asm__ volatile("lfence" ::: "memory");
+#endif
+}
+
 /* ── Cooperative yield: lets a co-scheduled thread run on the same CPU ─────── *
  * Used in both main's done-wait and the worker's IDLE-reset spin so that      *
  * threads sharing the same logical CPU hand off to each other without waiting  *
@@ -156,10 +172,22 @@ static void sp_yield(void) {
 
 static uint64_t calibrate_tsc_hz(void) {
 #if defined(_WIN32)
-    /* Windows QPC frequency equals the invariant TSC frequency on modern HW */
-    LARGE_INTEGER freq;
-    QueryPerformanceFrequency(&freq);
-    return (uint64_t)freq.QuadPart;
+    /* QPC on Windows may be backed by HPET (10 MHz) or ACPI (3.58 MHz), NOT
+     * the invariant TSC.  Measure RDTSC cycles that elapse in a 10 ms QPC
+     * interval to get the true TSC rate regardless of the QPC source. */
+    LARGE_INTEGER qpf, t0_qpc, t1_qpc;
+    QueryPerformanceFrequency(&qpf);
+    QueryPerformanceCounter(&t0_qpc);
+    uint64_t c0 = rdtsc_now();
+    uint64_t wait_ticks = (uint64_t)qpf.QuadPart / 100;  /* 10 ms */
+    do { QueryPerformanceCounter(&t1_qpc); }
+    while ((uint64_t)(t1_qpc.QuadPart - t0_qpc.QuadPart) < wait_ticks);
+    uint64_t c1 = rdtsc_now();
+    uint64_t elapsed = (uint64_t)(t1_qpc.QuadPart - t0_qpc.QuadPart);
+    if (elapsed == 0) return 3000000000ULL;
+    /* tsc_hz = (c1-c0) × qpf / elapsed_qpc_ticks */
+    uint64_t hz = (c1 - c0) * (uint64_t)qpf.QuadPart / elapsed;
+    return hz > 0 ? hz : 3000000000ULL;
 #elif defined(__x86_64__) || defined(__i386__)
     /* 5 ms busy-spin to measure TSC tick rate against CLOCK_MONOTONIC */
     struct timespec t0, t1;
@@ -199,9 +227,19 @@ static void *probe_worker_fn(void *arg_v) {
         while (!ctx->quit && !(ctx->cmd && !ctx->done)) sp_pause();
         if (ctx->quit) break;
 
-        /* GO: time the cache-line read with RDTSC */
+        /* GO: wait for the TSC rendezvous so both workers issue their DRAM loads
+         * simultaneously.  Without this, worker A starts 100-300 cycles before B
+         * (coherence skew), and A's read completes before B even arrives at the
+         * memory controller — eliminating the channel-contention signal. */
+        while (rdtsc_now() < (uint64_t)ctx->fire_tsc) sp_pause();
+
+        /* LFENCE before t0 serialises RDTSC against speculative execution;
+         * LFENCE after the load prevents the second RDTSC from retiring before
+         * the volatile read (Tiger Lake OOO). */
+        sp_lfence();
         uint64_t t0 = rdtsc_now();
         volatile char x = *ctx->addr; (void)x;
+        sp_lfence();
         ctx->lat  = rdtsc_now() - t0;
         ctx->done = 1;
     }
@@ -235,7 +273,10 @@ probe_pool *sp_probe_pool_create(void) {
         _aligned_free(pool);
         return NULL;
     }
-    /* Best-effort: pin workers to distinct physical cores */
+    /* Pin workers to P-cores 0 and 2.  On Tiger Lake / Beast Canyon these are
+     * both P-cores on the same Ring Bus, giving the best cache-coherence signal.
+     * Core 0 receives DPCs/IRQs but we now use P90 (not P99) so the ~1%
+     * interrupt rate does not pollute the percentile we measure. */
     (void)SetThreadAffinityMask(pool->hA, (DWORD_PTR)1 << 0);
     (void)SetThreadAffinityMask(pool->hB, (DWORD_PTR)1 << 2);
 #else
@@ -286,6 +327,13 @@ static void hedge_pair_pooled(probe_pool *pool,
     cache_flush(A); cache_flush(B); mfence();
     pool->wA.addr = A;
     pool->wB.addr = B;
+    /* Set rendezvous 1000 cycles ahead: enough for cache coherence to propagate
+     * cmd=1 to both cores and for both workers to enter the fire_tsc spin before
+     * the rendezvous fires.  1000 cycles ≈ 312 ns at 3.2 GHz.  x86 TSO ensures
+     * workers that see cmd=1 also see the prior fire_tsc stores. */
+    uint64_t fire = rdtsc_now() + 1000;
+    pool->wA.fire_tsc = fire;
+    pool->wB.fire_tsc = fire;
     pool->wA.cmd = 1;   /* GO: wake worker A */
     pool->wB.cmd = 1;   /* GO: wake worker B */
     /* Adaptive wait: spin first, yield only when workers need more time.
@@ -293,8 +341,11 @@ static void hedge_pair_pooled(probe_pool *pool,
      * is never reached in that case so sp_yield never fires.  If workers
      * share a physical core with the main thread the threshold acts as a
      * fallback to let the OS schedule the worker. */
+    /* 200 PAUSEs ≈ 620 ns at 3.2 GHz — enough for cross-core workers (~300 ns)
+     * to finish without yielding.  If workers share a core with main, we yield
+     * quickly (not after a 22 µs stall). */
     for (int _sp = 0; !pool->wA.done || !pool->wB.done; _sp++) {
-        if (_sp < 5000) { sp_pause(); } else { sp_yield(); _sp = 0; }
+        if (_sp < 200) { sp_pause(); } else { sp_yield(); _sp = 0; }
     }
     *cycles_out = (pool->wA.lat > pool->wB.lat) ? pool->wA.lat : pool->wB.lat;
     pool->wA.cmd = 0;   /* IDLE reset */
@@ -340,14 +391,19 @@ int sp_probe_bit(uintptr_t base_addr, int bit, size_t huge_page_size,
     qsort(samples, (size_t)n_probes, sizeof *samples, cmp_u64);
 
     uint64_t p50 = samples[(size_t)(n_probes / 2)];
-    uint64_t p99 = samples[(size_t)((n_probes * 99) / 100)];
+    /* P90 instead of P99: with 512 samples, P90 = 52nd-from-top.
+     * Windows DPC/interrupt rate is ~1% → ~5 spikes per 512 samples → P99 is
+     * contaminated, P90 is clean.  P90 faithfully reflects DRAM latency. */
+    uint64_t p90 = samples[(size_t)((n_probes * 90) / 100)];
     free(samples);
 
-    /* Same-channel heuristic: P99 > 1.5 × P50 */
-    int same = (p50 > 0u && p99 > p50 + p50 / 2u) ? 1 : 0;
+    /* Same-channel heuristic: P90 > 1.5 × P50 */
+    int same = (p50 > 0u && p90 > p50 + p50 / 2u) ? 1 : 0;
 
     result_out->bit             = bit;
     result_out->is_same_channel = same;
-    result_out->p99_ns          = p99;
+    result_out->p50_ns          = p50;
+    result_out->p90_ns          = p90;
+    result_out->p99_ns          = p90;   /* compat alias — actually P90 */
     return 0;
 }
