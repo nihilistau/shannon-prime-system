@@ -112,40 +112,42 @@ sp_status sp_alloc_channel_pair(const sp_channel_map *m,
 /* Free the arena returned by sp_alloc_channel_pair.  Safe to call with NULL. */
 void sp_free_channel_pair(sp_channel_pair_arena *arena);
 
-/* ── Hedge-read primitives (§16.3 TS.HEDGE) ────────────────────────────────
- * Single-thread PREFETCH + volatile LOAD through channel-paired addresses.
- * No pauses, no thread races, no TSC rendezvous on the hot path.
- *
- * Callers are responsible for channel placement (sp_alloc_channel_pair).
- * These functions return bitwise-correct data even when a and b are on the
- * SAME channel (CI/DISABLED path): correctness is channel-independent.
- *
- * Prefetch hint: NTA (non-temporal, streaming).  For reused hot sets
- * (§16.5 KSTE upper tier), a T0-hinted variant is Phase F7+ scope.
+/* ── §16.3 TS.HEDGE: persistent-pool hedge-read primitives ─────────────────
+ * Pattern: hedged_reader.hpp:124,138-152 (Laurie TailSlayer).
+ * N worker threads, each pinned to a dedicated core at startup.  Hot path =
+ * atomic publication slot + worker memcpy + atomic completion count.
+ * No CLFLUSH, no TSC rendezvous, no LFENCE, no per-read thread spawn.
  */
 
-/* Replica hedge: a and b carry IDENTICAL data (caller's algebraic invariant).
- * Both channels are prefetched; data is loaded from a; channel B is warmed for
- * the NEXT iteration in a stream of reads (load-balancing, not winner-takes-all). */
-void sp_hedge_read64_replica(const void *a, const void *b, uint64_t *out);
+/* Opaque pool handle.  Created once at module startup; destroyed at teardown. */
+typedef struct sp_hedge_pool sp_hedge_pool;
 
-/* Pair hedge: a and b carry INDEPENDENT data (e.g. q1 / q2 CRT residues).
- * Both channels prefetched simultaneously; latency ≈ max(lat_A, lat_B)
- * rather than lat_A + lat_B. */
-void sp_hedge_read_pair64(const void *a, const void *b,
-                          uint64_t *out_a, uint64_t *out_b);
+/* Create persistent pool.  Spawns n_channels threads; pins each to core_ids[i].
+ * max_bytes: maximum n_bytes accepted by sp_hedge_read_pair (SP_EBADARG if exceeded).
+ * n_channels=1: no thread spawned; sp_hedge_read_pair is a direct memcpy of side a.
+ * Returns SP_ENOMEM on allocation failure, SP_EBADARG on NULL/bad args. */
+sp_status sp_hedge_pool_create(sp_hedge_pool **out,
+                               const int *core_ids,
+                               size_t n_channels,
+                               size_t max_bytes);
 
-/* Block hedge: general n_bytes variant; interleaves PREFETCH with LOAD in
- * 64-byte (cache-line) strides.  Writes n_bytes from a→out_a, b→out_b. */
-void sp_hedge_read_block(const void *a, const void *b, size_t n_bytes,
-                         uint8_t *out_a, uint8_t *out_b);
+void sp_hedge_pool_destroy(sp_hedge_pool *pool);
 
-/* Spinor hedge: 63-byte replica hedge.  Caller's invariant: a and b carry the
- * same sp_spinor_block_t on independent channels.  Writes a's content to *out;
- * channel B is warmed for the next call in a KV-read stream. */
-void sp_hedge_read_spinor(const sp_spinor_block_t *a,
-                          const sp_spinor_block_t *b,
-                          sp_spinor_block_t *out);
+/* Hedged pair read.  Publishes (a, b) to worker slots via atomic store-release;
+ * workers memcpy into local buffers on their pinned cores; caller spins on
+ * completion count (acquire) then copies results to out_a, out_b.
+ * NOT reentrant.  n_bytes must be <= max_bytes passed to pool_create. */
+sp_status sp_hedge_read_pair(sp_hedge_pool *pool,
+                             const void *a, const void *b,
+                             size_t n_bytes,
+                             void *out_a, void *out_b);
+
+/* Spinor wrapper: 63-byte blocks, both sides.  out_a and out_b are independent. */
+sp_status sp_hedge_read_spinor(sp_hedge_pool *pool,
+                               const sp_spinor_block_t *a,
+                               const sp_spinor_block_t *b,
+                               sp_spinor_block_t *out_a,
+                               sp_spinor_block_t *out_b);
 
 #ifdef __cplusplus
 }
