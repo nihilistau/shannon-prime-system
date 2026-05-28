@@ -18,6 +18,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "sp/sp_status.h"
+#include "sp/spinor_block.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -110,6 +111,41 @@ sp_status sp_alloc_channel_pair(const sp_channel_map *m,
 
 /* Free the arena returned by sp_alloc_channel_pair.  Safe to call with NULL. */
 void sp_free_channel_pair(sp_channel_pair_arena *arena);
+
+/* ── Hedge-read primitives (§16.3 TS.HEDGE) ────────────────────────────────
+ * Single-thread PREFETCH + volatile LOAD through channel-paired addresses.
+ * No pauses, no thread races, no TSC rendezvous on the hot path.
+ *
+ * Callers are responsible for channel placement (sp_alloc_channel_pair).
+ * These functions return bitwise-correct data even when a and b are on the
+ * SAME channel (CI/DISABLED path): correctness is channel-independent.
+ *
+ * Prefetch hint: NTA (non-temporal, streaming).  For reused hot sets
+ * (§16.5 KSTE upper tier), a T0-hinted variant is Phase F7+ scope.
+ */
+
+/* Replica hedge: a and b carry IDENTICAL data (caller's algebraic invariant).
+ * Both channels are prefetched; data is loaded from a; channel B is warmed for
+ * the NEXT iteration in a stream of reads (load-balancing, not winner-takes-all). */
+void sp_hedge_read64_replica(const void *a, const void *b, uint64_t *out);
+
+/* Pair hedge: a and b carry INDEPENDENT data (e.g. q1 / q2 CRT residues).
+ * Both channels prefetched simultaneously; latency ≈ max(lat_A, lat_B)
+ * rather than lat_A + lat_B. */
+void sp_hedge_read_pair64(const void *a, const void *b,
+                          uint64_t *out_a, uint64_t *out_b);
+
+/* Block hedge: general n_bytes variant; interleaves PREFETCH with LOAD in
+ * 64-byte (cache-line) strides.  Writes n_bytes from a→out_a, b→out_b. */
+void sp_hedge_read_block(const void *a, const void *b, size_t n_bytes,
+                         uint8_t *out_a, uint8_t *out_b);
+
+/* Spinor hedge: 63-byte replica hedge.  Caller's invariant: a and b carry the
+ * same sp_spinor_block_t on independent channels.  Writes a's content to *out;
+ * channel B is warmed for the next call in a KV-read stream. */
+void sp_hedge_read_spinor(const sp_spinor_block_t *a,
+                          const sp_spinor_block_t *b,
+                          sp_spinor_block_t *out);
 
 #ifdef __cplusplus
 }
