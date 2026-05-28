@@ -194,12 +194,46 @@ static size_t detect_huge_page_size(void) {
 #endif
 }
 
+#ifdef _WIN32
+#include <windows.h>
+/* Returns 1 if SeLockMemoryPrivilege was successfully enabled, 0 otherwise.
+ * AdjustTokenPrivileges succeeds (returns TRUE) even when the privilege is
+ * absent from the token — GetLastError() == ERROR_NOT_ALL_ASSIGNED in that
+ * case.  We check for that to surface actionable diagnostics. */
+static int force_enable_large_pages(void) {
+    HANDLE hToken;
+    int ok = 0;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+        TOKEN_PRIVILEGES tp;
+        if (LookupPrivilegeValue(NULL, SE_LOCK_MEMORY_NAME, &tp.Privileges[0].Luid)) {
+            tp.PrivilegeCount = 1;
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            AdjustTokenPrivileges(hToken, FALSE, &tp, 0, NULL, 0);
+            ok = (GetLastError() != ERROR_NOT_ALL_ASSIGNED);
+        }
+        CloseHandle(hToken);
+    }
+    return ok;
+}
+#endif
+
 void *sp_alloc_huge(size_t n_pages, size_t page_size) {
     size_t sz = n_pages * page_size;
 #ifdef _WIN32
-    return VirtualAlloc(NULL, (SIZE_T)sz,
-                        MEM_COMMIT | MEM_RESERVE | MEM_LARGE_PAGES,
-                        PAGE_READWRITE);
+    if (!force_enable_large_pages()) {
+        fprintf(stderr,
+            "SP_WARN: sp_channel: SeLockMemoryPrivilege not in token — "
+            "re-run as Administrator (right-click → Run as Administrator)\n");
+        return NULL;
+    }
+    void *ptr = VirtualAlloc(NULL, (SIZE_T)sz,
+                             MEM_COMMIT | MEM_RESERVE | MEM_LARGE_PAGES,
+                             PAGE_READWRITE);
+    if (!ptr)
+        fprintf(stderr,
+            "SP_WARN: sp_channel: VirtualAlloc(MEM_LARGE_PAGES, %zu) failed — "
+            "error %lu\n", sz, (unsigned long)GetLastError());
+    return ptr;
 #else
     void *ptr = mmap(NULL, sz, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
@@ -497,14 +531,25 @@ sp_status sp_channel_map_build(sp_channel_map **out) {
     memset(results, 0, sizeof results);
     int n_probes = 512;
     int probe_ok = 1;
+
+    probe_pool *pool = sp_probe_pool_create();
+    if (!pool) {
+        fprintf(stderr, "SP_WARN: sp_channel: probe pool init failed — DISABLED\n");
+        sp_free_huge(hp_base, 4, hp_size);
+        m->mode = SP_CHANNEL_DISABLED;
+        *out = m;
+        return SP_OK;
+    }
+
     for (int i = 0; i < n_bits && probe_ok; i++) {
         if (sp_probe_bit((uintptr_t)hp_base, CHAN_BIT_LO + i,
-                         hp_size, n_probes, &results[i]) != 0) {
+                         hp_size, n_probes, pool, &results[i]) != 0) {
             fprintf(stderr, "SP_WARN: sp_channel: probe bit %d failed — DISABLED\n",
                     CHAN_BIT_LO + i);
             probe_ok = 0;
         }
     }
+    sp_probe_pool_destroy(pool);
     sp_free_huge(hp_base, 4, hp_size);
 
     if (!probe_ok) {
