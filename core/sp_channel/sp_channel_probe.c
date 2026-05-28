@@ -362,6 +362,12 @@ static int cmp_u64(const void *a, const void *b) {
 
 /* ── Public probe function ────────────────────────────────────────────────── */
 
+/* DIAGNOSTIC / CALIBRATION ONLY.  The TSC rendezvous (fire_tsc, 1000-cycle
+ * wait), LFENCE pairs, and RDTSC timing in this function exist to extract the
+ * GF(2) channel map from DRAM timing — they write the bin file once.  The
+ * TailSlayer runtime path (sp_alloc_channel_pair) loads that bin file and does
+ * O(1) sp_channel_of lookups with zero probe overhead.  Do NOT call sp_probe_bit
+ * on the critical path. */
 int sp_probe_bit(uintptr_t base_addr, int bit, size_t huge_page_size,
                  int n_probes, probe_pool *pool, sp_probe_result *result_out) {
     if (!result_out || !pool || n_probes <= 0 || bit < CHAN_BIT_LO || bit >= CHAN_BIT_HI)

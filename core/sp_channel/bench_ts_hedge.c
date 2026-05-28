@@ -1,13 +1,17 @@
 /* bench_ts_hedge.c — M_TS_HEDGE: DDR channel topology via hedge-read timing.
  *
- * Probes every address bit in [CHAN_BIT_LO, CHAN_BIT_HI).  For each bit, two
- * threads race to read A and A^(1<<bit); P90 of MAX(latA, latB) is measured.
- * Same-channel pairs (bit flips within one DRAM channel) show elevated P90
- * because the memory controller serialises both requests.
+ * PURPOSE: One-time oracle calibration tool.  Probes address bits to extract
+ * the GF(2) channel map and write it to the bin file on disk.  The TSC
+ * rendezvous (fire_tsc), LFENCE pairs, and percentile measurement are
+ * diagnostic machinery that exists only here — TailSlayer's runtime path
+ * (sp_alloc_channel_pair) loads the cached bin file and does O(1) channel
+ * selection with zero probe or pause overhead.
  *
- * Gate: "tuning to maximum" — prints the best-achieved ratio, exits 0 always
- * (on bare metal) unless probe setup fails.  The GF(2) channel map is cached
- * by sp_channel_map_build and reused across runs.
+ * Method: probe each address bit in [CHAN_BIT_LO, CHAN_BIT_HI).  For each bit,
+ * two threads are synchronised via TSC rendezvous and race to read A and
+ * A^(1<<bit); P90 of MAX(latA, latB) is measured.  Same-channel pairs show
+ * elevated P90 (memory controller serialises both requests).  Reports the
+ * maximum achieved P90 ratio as the gate.
  *
  * In VM/CI (DISABLED path) the bench exits 0 with REQUIRES_LIVE_MODE. */
 
