@@ -29,6 +29,16 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+      # bench_ts_hedge probes physical DRAM channels (calibration-only tool that
+      # writes the GF(2) channel bin file).  Reserve huge pages so MAP_HUGETLB
+      # succeeds; on GitHub Actions (VM) virt detection fires and the bench
+      # exits 0 with REQUIRES_LIVE_MODE — this verifies the M_TS_FALLBACK gate.
+      # On a bare-metal Linux runner it runs LIVE and reports the P90 ratio.
+      - name: Bench M_TS_HEDGE (DISABLED/fallback on CI VM, LIVE on bare metal)
+        run: |
+          echo 64 | sudo tee /proc/sys/vm/nr_hugepages || true
+          ./build/core/sp_channel/bench_ts_hedge
+
   windows-msvc:
     runs-on: windows-latest
     steps:
