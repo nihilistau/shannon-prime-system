@@ -64,19 +64,19 @@ static uint64_t mono_ns(void) {
 static void cache_flush(volatile void *p) {
 #if defined(__x86_64__) || defined(__i386__)
     __asm__ volatile("clflush (%0)" :: "r"(p) : "memory");
-#elif defined(_WIN32) && (defined(_M_X64) || defined(_M_IX86))
-    _mm_clflush(p);
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    /* _mm_clflush takes void const * — cast away volatile (clflush is read-only) */
+    _mm_clflush((void const *)(uintptr_t)p);
 #else
     (void)p;
-    __asm__ volatile("" ::: "memory");
 #endif
 }
 
 static void mfence(void) {
-#if defined(__x86_64__) || defined(__i386__)
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    _mm_mfence();
+#elif defined(__x86_64__) || defined(__i386__)
     __asm__ volatile("mfence" ::: "memory");
-#else
-    __asm__ volatile("" ::: "memory");
 #endif
 }
 
