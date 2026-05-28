@@ -44,16 +44,22 @@
 
 /* ── Per-worker context: 2 cache lines (128 bytes), no false sharing ────── *
  * Line 0 (bytes 0-63):  control (should_exit, core_id, n_bytes, src_addr,
- *                        completion_ptr) + 32-byte pad.
- * Line 1 (bytes 64-127): 64-byte result buffer (result_inline).            */
+ *                        completion_ptr, dst_addr) + 24-byte pad.
+ * Line 1 (bytes 64-127): 64-byte inline result buffer for read_pair/spinor.
+ *
+ * dst_addr is set by the caller before publishing src_addr.  Acquire fence
+ * on src_addr orders the dst_addr write — worker observes both atomically.
+ * read_pair sets dst_addr = &result_inline[0]; read_bulk sets it to the
+ * caller-provided buffer. */
 typedef struct {
     atomic_int            should_exit;    /*  4 bytes */
     int                   core_id;        /*  4 bytes */
     size_t                n_bytes;        /*  8 bytes */
     atomic_uintptr_t      src_addr;       /*  8 bytes — NULL=idle, else work addr */
     atomic_int           *completion_ptr; /*  8 bytes — points to pool->completion */
-    char                  _pad[32];       /* 32 bytes — line 0 total = 64 bytes */
-    uint8_t               result_inline[64]; /* line 1 */
+    atomic_uintptr_t      dst_addr;       /*  8 bytes — caller-provided write target */
+    char                  _pad[24];       /* 24 bytes — line 0 total = 64 bytes */
+    uint8_t               result_inline[64]; /* line 1 — used by read_pair/spinor */
 } SP_HEDGE_ALIGN64 sp_hedge_worker_ctx;
 
 _Static_assert(sizeof(sp_hedge_worker_ctx) == 128,
@@ -106,8 +112,12 @@ static void *sp_hedge_worker_fn(void *arg_v) {
             if (atomic_load_explicit(&ctx->should_exit, memory_order_relaxed))
                 goto done;
         }
-        /* Drain: always complete after acquiring non-NULL src. */
-        memcpy(ctx->result_inline, (const void *)raw, ctx->n_bytes);
+        /* Drain: always complete after acquiring non-NULL src.
+         * dst_addr was set by caller BEFORE src_addr release → acquire on
+         * src_addr orders the dst_addr write, so a relaxed load is safe. */
+        const uintptr_t dst = atomic_load_explicit(&ctx->dst_addr,
+                                                   memory_order_relaxed);
+        memcpy((void *)dst, (const void *)raw, ctx->n_bytes);
         atomic_store_explicit(&ctx->src_addr, 0u, memory_order_relaxed);
         atomic_fetch_add_explicit(ctx->completion_ptr, 1, memory_order_release);
     }
@@ -153,6 +163,7 @@ sp_status sp_hedge_pool_create(sp_hedge_pool **out,
     for (int i = 0; i < 2; i++) {
         atomic_init(&pool->workers[i].should_exit, 0);
         atomic_init(&pool->workers[i].src_addr, 0u);
+        atomic_init(&pool->workers[i].dst_addr, 0u);
         pool->workers[i].core_id        = core_ids[i];
         pool->workers[i].completion_ptr = &pool->completion;
     }
@@ -219,9 +230,16 @@ sp_status sp_hedge_read_pair(sp_hedge_pool *pool,
     /* Reset completion (relaxed; ordered by release-acquire on src_addr). */
     atomic_store_explicit(&pool->completion, 0, memory_order_relaxed);
 
-    /* Publish n_bytes then src_addr (release ensures n_bytes visible to workers). */
+    /* Publish n_bytes, dst_addr (→ each worker's result_inline), then src_addr
+     * (release ensures all preceding writes visible to workers via acquire). */
     pool->workers[0].n_bytes = n_bytes;
     pool->workers[1].n_bytes = n_bytes;
+    atomic_store_explicit(&pool->workers[0].dst_addr,
+                          (uintptr_t)pool->workers[0].result_inline,
+                          memory_order_relaxed);
+    atomic_store_explicit(&pool->workers[1].dst_addr,
+                          (uintptr_t)pool->workers[1].result_inline,
+                          memory_order_relaxed);
     atomic_store_explicit(&pool->workers[0].src_addr,
                           (uintptr_t)srcs[0], memory_order_release);
     atomic_store_explicit(&pool->workers[1].src_addr,
@@ -233,6 +251,48 @@ sp_status sp_hedge_read_pair(sp_hedge_pool *pool,
 
     if (out_a) memcpy(out_a, pool->workers[0].result_inline, n_bytes);
     if (out_b) memcpy(out_b, pool->workers[1].result_inline, n_bytes);
+    return SP_OK;
+}
+
+/* ── sp_hedge_read_bulk (§16.3.1) ──────────────────────────────────────── *
+ * Workers memcpy n_bytes directly from src_a → dst_a and src_b → dst_b in
+ * parallel.  No intermediate result_inline copy.  Amortizes pool overhead
+ * across the bulk transfer. */
+sp_status sp_hedge_read_bulk(sp_hedge_pool *pool,
+                             const void *src_a, void *dst_a,
+                             const void *src_b, void *dst_b,
+                             size_t n_bytes)
+{
+    if (!pool) return SP_EBADARG;
+    if (n_bytes == 0) return SP_OK;
+    if (!src_a || !dst_a) return SP_EBADARG;
+
+    /* N=1 fallback: direct memcpy of side a; b ignored. */
+    if (pool->n_channels == 1) {
+        memcpy(dst_a, src_a, n_bytes);
+        return SP_OK;
+    }
+    if (!src_b || !dst_b) return SP_EBADARG;
+
+    /* Reset completion counter (ordered by release-acquire on src_addr). */
+    atomic_store_explicit(&pool->completion, 0, memory_order_relaxed);
+
+    /* Publish n_bytes, dst_addr (caller buffers), then src_addr (release). */
+    pool->workers[0].n_bytes = n_bytes;
+    pool->workers[1].n_bytes = n_bytes;
+    atomic_store_explicit(&pool->workers[0].dst_addr,
+                          (uintptr_t)dst_a, memory_order_relaxed);
+    atomic_store_explicit(&pool->workers[1].dst_addr,
+                          (uintptr_t)dst_b, memory_order_relaxed);
+    atomic_store_explicit(&pool->workers[0].src_addr,
+                          (uintptr_t)src_a, memory_order_release);
+    atomic_store_explicit(&pool->workers[1].src_addr,
+                          (uintptr_t)src_b, memory_order_release);
+
+    /* Spin on completion. */
+    while (atomic_load_explicit(&pool->completion, memory_order_acquire) < 2)
+        ;
+
     return SP_OK;
 }
 

@@ -149,6 +149,17 @@ sp_status sp_hedge_read_spinor(sp_hedge_pool *pool,
                                sp_spinor_block_t *out_a,
                                sp_spinor_block_t *out_b);
 
+/* §16.3.1 batch hedge: workers memcpy n_bytes directly into caller-provided
+ * dst_a / dst_b in parallel.  Amortizes pool overhead (~300 cyc/call) across
+ * the whole transfer, unlike sp_hedge_read_pair which pays one round-trip
+ * per call.  n_bytes is unbounded (caller manages buffer sizes).
+ * N=1: direct memcpy(dst_a, src_a, n_bytes); src_b/dst_b ignored.
+ * NOT reentrant (single pool serves one bulk read at a time). */
+sp_status sp_hedge_read_bulk(sp_hedge_pool *pool,
+                             const void *src_a, void *dst_a,
+                             const void *src_b, void *dst_b,
+                             size_t n_bytes);
+
 #ifdef __cplusplus
 }
 #endif
