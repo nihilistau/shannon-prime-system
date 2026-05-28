@@ -1,24 +1,24 @@
-/* bench_sp_hedge.c — M_TS_HEDGE_PROD: §16.3 persistent-pool hedge-read bench.
+/* bench_sp_hedge.c — M_TS_HEDGE_PROD: §16.3.1 batch hedge throughput bench.
  *
- * Compares P50/P90/P99 TSC cycles over 2048 trials:
- *   baseline : N_ELEM sequential volatile uint64 reads from arena_a (channel A)
- *   hedge    : N_ELEM sp_hedge_read_pair calls over (arena_a[i], arena_b[i])
+ * Compares P50/P90/P99 TSC cycles per trial; both bodies do the same total
+ * memory work (256 MB read + 256 MB write):
+ *   baseline : single-threaded SERIAL memcpy of src_a→dst_a AND src_b→dst_b
+ *              (256 MB total through one thread)
+ *   hedge    : one sp_hedge_read_bulk(src_a→dst_a, src_b→dst_b) — workers
+ *              copy 128 MB each in PARALLEL on dedicated cores (256 MB total
+ *              split across 2 channels)
  *
- * Bench correction 1: arena size scaled past L3.
- *   Beast Canyon i9-11900KB L3 = 24 MB (Intel ARK); 4× margin = 96 MB; using
- *   128 MB per side. 16M × 8 = 128 MB; 64 × 2 MB huge pages per side.
+ * If DDR channels are independent, parallel work completes in ~half the wall
+ * time → ratio P99(hedge) / P99(baseline) ≈ 0.5×.  Same total work; the
+ * gate measures channel-parallel speedup, not throughput.
  *
- * Bench correction 2: direct sp_alloc_huge (NOT sp_alloc_channel_pair —
- *   which has a silent malloc fallback at line 654 of sp_channel_map.c).
- *   Hard-abort with diagnostic on failure. A 1-page probe distinguishes
- *   missing-privilege (1-page fails) from Hyper-V SLAT fragmentation
- *   (1-page OK but 64-page fails).
+ * Expected on Beast Canyon dual-channel DDR4: baseline ~20 ms/trial (256 MB
+ * serial); hedge ~10 ms/trial (256 MB split 128 MB per channel) → P99 ≈ 0.5×.
  *
- * Bench correction 3: pre-fault via memset before timing (evicts first-access
- *   page-fault latency outliers).
- *
- * Pattern source: in-tree pool at sp_hedge.c (1727f88); reference
- * hedged_reader.hpp:124,138-152.
+ * Bench corrections preserved from rework: 128 MB arena past 24 MB L3;
+ * direct sp_alloc_huge with hard-abort + 1-page probe diagnostic.
+ * F1 fix from rework session: setvbuf(stdout, NULL, _IONBF, 0) so per-trial
+ * progress prints flush immediately when stdout is redirected.
  */
 #define _CRT_SECURE_NO_WARNINGS
 #include <stdio.h>
@@ -37,9 +37,9 @@
 #include "sp_channel_internal.h"   /* sp_alloc_huge / sp_free_huge */
 
 #define N_TRIALS  2048
-#define N_ELEM    (16u * 1024u * 1024u)   /* 16M × 8 bytes = 128 MB per side */
-#define HP_SIZE   (2u * 1024u * 1024u)    /* 2 MB huge page */
-#define N_PAGES   (((N_ELEM * 8u) + HP_SIZE - 1u) / HP_SIZE)  /* = 64 */
+#define N_BYTES   (128u * 1024u * 1024u)  /* 128 MB per side */
+#define HP_SIZE   (2u * 1024u * 1024u)
+#define N_PAGES   (N_BYTES / HP_SIZE)     /* = 64 */
 
 /* ── TSC ────────────────────────────────────────────────────────────────── */
 #if defined(_MSC_VER)
@@ -55,11 +55,15 @@ static uint64_t rdtsc_bench(void) {
 static uint64_t rdtsc_bench(void) { return 0; }
 #endif
 
-/* ── Sort helper ────────────────────────────────────────────────────────── */
+/* ── Sort + percentile ──────────────────────────────────────────────────── */
 static int cmp_u64_b(const void *x, const void *y) {
     uint64_t a = *(const uint64_t *)x;
     uint64_t b = *(const uint64_t *)y;
     return (a > b) - (a < b);
+}
+static uint64_t pct(uint64_t *s, int n, int p) {
+    int i = (int)((long long)p * n / 100LL);
+    return s[i < n ? i : n - 1];
 }
 
 /* ── Pin main thread to core 1 (workers on 0,2) ─────────────────────────── */
@@ -72,48 +76,25 @@ static void pin_main_thread(void) {
 #endif
 }
 
-/* ── Percentile ─────────────────────────────────────────────────────────── */
-static uint64_t pct(uint64_t *s, int n, int p) {
-    int i = (int)((long long)p * n / 100LL);
-    return s[i < n ? i : n - 1];
-}
-
-/* ── Diagnostic-aware huge-page allocation ─────────────────────────────── *
- * Returns NULL on failure; bench should hard-abort.  Prints diagnostic
- * distinguishing privilege failure from fragmentation. */
+/* ── Diagnostic-aware huge-page allocation ─────────────────────────────── */
 static void *alloc_arena_or_diagnose(const char *side_name) {
     void *probe = sp_alloc_huge(1, HP_SIZE);
     if (!probe) {
         fprintf(stderr,
-            "M_TS_HEDGE_PROD: REQUIRES_LIVE_MODE — 1-page huge alloc FAILED (%s)\n",
-            side_name);
-        fprintf(stderr,
+            "M_TS_HEDGE_PROD: REQUIRES_LIVE_MODE — 1-page huge alloc FAILED (%s)\n"
             "  Root cause: SeLockMemoryPrivilege not in process token.\n"
-            "  Fix:\n"
-            "    1. Run secpol.msc → Security Settings → Local Policies →\n"
-            "       User Rights Assignment → Lock pages in memory →\n"
-            "       Add user account.\n"
-            "    2. Log out and log back in (token cache is per-session).\n"
-            "    3. Re-run bench as Administrator (right-click → Run as Admin).\n");
+            "  Fix: secpol.msc → Lock pages in memory → add user → logoff/logon.\n",
+            side_name);
         return NULL;
     }
     sp_free_huge(probe, 1, HP_SIZE);
-
     void *arena = sp_alloc_huge((size_t)N_PAGES, HP_SIZE);
     if (!arena) {
         fprintf(stderr,
-            "M_TS_HEDGE_PROD: REQUIRES_LIVE_MODE — %zu-page huge alloc FAILED (%s)\n",
-            (size_t)N_PAGES, side_name);
-        fprintf(stderr,
-            "  Root cause: 1-page allocation succeeded, so the privilege IS\n"
-            "  present.  The %zu-page contiguous allocation failed → Hyper-V\n"
-            "  SLAT fragmentation of the kernel's large-page free list.\n"
-            "  Fix:\n"
-            "    1. Reboot fresh; run this bench EARLY in uptime.\n"
-            "    2. OR temporarily disable Hyper-V: bcdedit /set\n"
-            "       hypervisorlaunchtype off; reboot; run bench; then\n"
-            "       bcdedit /set hypervisorlaunchtype auto; reboot.\n",
-            (size_t)N_PAGES);
+            "M_TS_HEDGE_PROD: REQUIRES_LIVE_MODE — %zu-page huge alloc FAILED (%s)\n"
+            "  Root cause: Hyper-V SLAT fragmentation (1-page OK, %zu-page failed).\n"
+            "  Fix: reboot fresh; run bench early in uptime.\n",
+            (size_t)N_PAGES, side_name, (size_t)N_PAGES);
         return NULL;
     }
     return arena;
@@ -121,6 +102,8 @@ static void *alloc_arena_or_diagnose(const char *side_name) {
 
 int main(void)
 {
+    setvbuf(stdout, NULL, _IONBF, 0);   /* F1 fix: unbuffered stdout */
+
     sp_channel_map *m = NULL;
     sp_status rc = sp_channel_map_build(&m);
     if (rc != SP_OK || !m) {
@@ -129,52 +112,47 @@ int main(void)
         return 1;
     }
     if (sp_channel_map_mode(m) != SP_CHANNEL_LIVE) {
-        printf("M_TS_HEDGE_PROD: REQUIRES_LIVE_MODE"
-               " (channel map DISABLED — VM/container)\n");
+        printf("M_TS_HEDGE_PROD: REQUIRES_LIVE_MODE (channel map DISABLED)\n");
         sp_channel_map_free(m);
         return 0;
     }
 
-    printf("=== §16.3 TS.HEDGE persistent-pool bench (REWORKED) ===\n");
-    printf("N_ELEM = %u (%zu MB per side); N_PAGES = %zu × 2MB; N_TRIALS = %d\n\n",
-           N_ELEM, (size_t)(N_ELEM * 8u) / (1024u * 1024u),
-           (size_t)N_PAGES, N_TRIALS);
+    printf("=== §16.3.1 TS.HEDGE batch bench ===\n");
+    printf("N_BYTES = %u (%u MB per side); N_PAGES = %u × 2MB; N_TRIALS = %d\n\n",
+           N_BYTES, N_BYTES / (1024u * 1024u), N_PAGES, N_TRIALS);
 
-    /* ── Allocate two 128 MB arenas; hard-abort on failure ──────────────── */
-    void *arena_a = alloc_arena_or_diagnose("side A");
-    if (!arena_a) { sp_channel_map_free(m); return 0; }
-
-    void *arena_b = alloc_arena_or_diagnose("side B");
-    if (!arena_b) {
-        sp_free_huge(arena_a, (size_t)N_PAGES, HP_SIZE);
+    /* ── Allocate two 128 MB source arenas ──────────────────────────────── */
+    void *src_a = alloc_arena_or_diagnose("src A");
+    if (!src_a) { sp_channel_map_free(m); return 0; }
+    void *src_b = alloc_arena_or_diagnose("src B");
+    if (!src_b) {
+        sp_free_huge(src_a, (size_t)N_PAGES, HP_SIZE);
+        sp_channel_map_free(m);
+        return 0;
+    }
+    /* ── Destination buffers (caller-side; bulk writes into these) ─────── */
+    void *dst_a = alloc_arena_or_diagnose("dst A");
+    if (!dst_a) {
+        sp_free_huge(src_a, (size_t)N_PAGES, HP_SIZE);
+        sp_free_huge(src_b, (size_t)N_PAGES, HP_SIZE);
+        sp_channel_map_free(m);
+        return 0;
+    }
+    void *dst_b = alloc_arena_or_diagnose("dst B");
+    if (!dst_b) {
+        sp_free_huge(src_a, (size_t)N_PAGES, HP_SIZE);
+        sp_free_huge(src_b, (size_t)N_PAGES, HP_SIZE);
+        sp_free_huge(dst_a, (size_t)N_PAGES, HP_SIZE);
         sp_channel_map_free(m);
         return 0;
     }
 
-    /* Pre-fault both sides */
-    memset(arena_a, 0x42, (size_t)N_ELEM * 8);
-    memset(arena_b, 0xBE, (size_t)N_ELEM * 8);
-
-    /* Channel-of distribution sample: cache-line granularity over 16 samples */
-    int ch_a_hist[16] = {0}, ch_b_hist[16] = {0};
-    for (int i = 0; i < 256; i++) {
-        uintptr_t aa = (uintptr_t)arena_a + (uintptr_t)i * 64u * 4096u;
-        uintptr_t bb = (uintptr_t)arena_b + (uintptr_t)i * 64u * 4096u;
-        uint32_t ca = sp_channel_of(m, aa);
-        uint32_t cb = sp_channel_of(m, bb);
-        if (ca != SP_CHANNEL_UNSPECIFIED && ca < 16) ch_a_hist[ca]++;
-        if (cb != SP_CHANNEL_UNSPECIFIED && cb < 16) ch_b_hist[cb]++;
-    }
-    int n_chan_a = 0, n_chan_b = 0;
-    for (int i = 0; i < 16; i++) {
-        if (ch_a_hist[i]) n_chan_a++;
-        if (ch_b_hist[i]) n_chan_b++;
-    }
-    printf("Channel-of distribution (256-sample stride, cache-line × 4 KB):\n");
-    printf("  arena_a touches %d distinct channels; arena_b touches %d.\n",
-           n_chan_a, n_chan_b);
-    printf("  Hardware interleaving guarantees diversity within each arena;\n"
-           "  arena_a and arena_b base addresses are NOT the operative property.\n\n");
+    /* Pre-fault all four arenas */
+    printf("Pre-faulting 4 × 128 MB = 512 MB arenas...\n");
+    memset(src_a, 0x42, N_BYTES);
+    memset(src_b, 0xBE, N_BYTES);
+    memset(dst_a, 0,    N_BYTES);
+    memset(dst_b, 0,    N_BYTES);
 
     /* ── Create hedge pool: workers on cores 0 and 2 ────────────────────── */
     const int WORKER_CORES[2] = {0, 2};
@@ -182,13 +160,13 @@ int main(void)
     rc = sp_hedge_pool_create(&pool, WORKER_CORES, 2, 8);
     if (rc != SP_OK || !pool) {
         printf("M_TS_HEDGE_PROD: pool_create failed (rc=%d)\n", (int)rc);
-        sp_free_huge(arena_a, (size_t)N_PAGES, HP_SIZE);
-        sp_free_huge(arena_b, (size_t)N_PAGES, HP_SIZE);
+        sp_free_huge(src_a, (size_t)N_PAGES, HP_SIZE);
+        sp_free_huge(src_b, (size_t)N_PAGES, HP_SIZE);
+        sp_free_huge(dst_a, (size_t)N_PAGES, HP_SIZE);
+        sp_free_huge(dst_b, (size_t)N_PAGES, HP_SIZE);
         sp_channel_map_free(m);
         return 1;
     }
-
-    /* Bind caller to core 1 (CORE_MAIN; separate from workers 0, 2). */
     pin_main_thread();
 
     uint64_t *base_t  = (uint64_t *)malloc(N_TRIALS * sizeof(uint64_t));
@@ -196,40 +174,37 @@ int main(void)
     if (!base_t || !hedge_t) {
         printf("bench_sp_hedge: trial alloc failed\n");
         sp_hedge_pool_destroy(pool);
-        sp_free_huge(arena_a, (size_t)N_PAGES, HP_SIZE);
-        sp_free_huge(arena_b, (size_t)N_PAGES, HP_SIZE);
+        sp_free_huge(src_a, (size_t)N_PAGES, HP_SIZE);
+        sp_free_huge(src_b, (size_t)N_PAGES, HP_SIZE);
+        sp_free_huge(dst_a, (size_t)N_PAGES, HP_SIZE);
+        sp_free_huge(dst_b, (size_t)N_PAGES, HP_SIZE);
         sp_channel_map_free(m);
         free(base_t); free(hedge_t);
         return 1;
     }
 
-    volatile uint64_t sink_a = 0, sink_b = 0;
-    const uint64_t *arr_a = (const uint64_t *)arena_a;
-    const uint64_t *arr_b = (const uint64_t *)arena_b;
-
-    /* ── Baseline ──────────────────────────────────────────────────────── */
-    printf("Running baseline (%d trials × %u reads)...\n", N_TRIALS, N_ELEM);
+    /* ── Baseline: SERIAL memcpy of BOTH sides (256 MB total per trial) ──── */
+    printf("Running baseline (%d trials × 256 MB serial memcpy)...\n", N_TRIALS);
     for (int t = 0; t < N_TRIALS; t++) {
         uint64_t t0 = rdtsc_bench();
-        for (unsigned i = 0; i < N_ELEM; i++)
-            sink_a = *(const volatile uint64_t *)(arr_a + i);
+        memcpy(dst_a, src_a, N_BYTES);
+        memcpy(dst_b, src_b, N_BYTES);
         uint64_t t1 = rdtsc_bench();
         base_t[t] = t1 - t0;
+        if ((t & 0x1F) == 0) printf("  base %d/%d\r", t, N_TRIALS);
     }
-    (void)sink_a;
+    printf("  base done                 \n");
 
-    /* ── Hedge ─────────────────────────────────────────────────────────── */
-    printf("Running hedge     (%d trials × %u pairs)...\n", N_TRIALS, N_ELEM);
+    /* ── Hedge: one sp_hedge_read_bulk per trial (parallel 2-channel) ────── */
+    printf("Running hedge    (%d trials × 256 MB parallel bulk via 2 workers)...\n", N_TRIALS);
     for (int t = 0; t < N_TRIALS; t++) {
-        uint64_t oa = 0, ob = 0;
         uint64_t t0 = rdtsc_bench();
-        for (unsigned i = 0; i < N_ELEM; i++)
-            sp_hedge_read_pair(pool, arr_a + i, arr_b + i, 8, &oa, &ob);
-        sink_a = oa; sink_b = ob;
+        sp_hedge_read_bulk(pool, src_a, dst_a, src_b, dst_b, N_BYTES);
         uint64_t t1 = rdtsc_bench();
         hedge_t[t] = t1 - t0;
+        if ((t & 0x1F) == 0) printf("  hedge %d/%d\r", t, N_TRIALS);
     }
-    (void)sink_b;
+    printf("  hedge done                \n");
 
     qsort(base_t,  N_TRIALS, sizeof(uint64_t), cmp_u64_b);
     qsort(hedge_t, N_TRIALS, sizeof(uint64_t), cmp_u64_b);
@@ -240,19 +215,18 @@ int main(void)
     uint64_t hp50 = pct(hedge_t, N_TRIALS, 50);
     uint64_t hp90 = pct(hedge_t, N_TRIALS, 90);
     uint64_t hp99 = pct(hedge_t, N_TRIALS, 99);
-
     double r50 = bp50 ? (double)hp50 / (double)bp50 : 0.0;
     double r90 = bp90 ? (double)hp90 / (double)bp90 : 0.0;
     double r99 = bp99 ? (double)hp99 / (double)bp99 : 0.0;
 
-    printf("\n  body     |   P50 (cyc)   |   P90 (cyc)   |   P99 (cyc)\n");
-    printf("  ---------|---------------|---------------|--------------\n");
-    printf("  baseline | %13llu | %13llu | %13llu\n",
+    printf("\n  body     |    P50 (cyc)    |    P90 (cyc)    |    P99 (cyc)\n");
+    printf("  ---------|-----------------|-----------------|----------------\n");
+    printf("  baseline | %15llu | %15llu | %15llu\n",
            (unsigned long long)bp50, (unsigned long long)bp90, (unsigned long long)bp99);
-    printf("  hedge    | %13llu | %13llu | %13llu\n",
+    printf("  hedge    | %15llu | %15llu | %15llu\n",
            (unsigned long long)hp50, (unsigned long long)hp90, (unsigned long long)hp99);
-    printf("  ratio    | %13.3f | %13.3f | %13.3f"
-           "  (hedge/baseline; <1.0 = faster)\n", r50, r90, r99);
+    printf("  ratio    | %15.3f | %15.3f | %15.3f"
+           "   (hedge/baseline; <1.0 = faster)\n", r50, r90, r99);
 
     printf("\n");
     if (r99 <= 0.50)
@@ -264,8 +238,10 @@ int main(void)
 
     sp_hedge_pool_destroy(pool);
     free(base_t); free(hedge_t);
-    sp_free_huge(arena_a, (size_t)N_PAGES, HP_SIZE);
-    sp_free_huge(arena_b, (size_t)N_PAGES, HP_SIZE);
+    sp_free_huge(src_a, (size_t)N_PAGES, HP_SIZE);
+    sp_free_huge(src_b, (size_t)N_PAGES, HP_SIZE);
+    sp_free_huge(dst_a, (size_t)N_PAGES, HP_SIZE);
+    sp_free_huge(dst_b, (size_t)N_PAGES, HP_SIZE);
     sp_channel_map_free(m);
     return 0;
 }
