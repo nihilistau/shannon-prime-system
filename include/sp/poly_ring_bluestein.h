@@ -38,6 +38,7 @@
 #define SP_POLY_RING_BLUESTEIN_H
 
 #include <stdint.h>
+#include "sp/sp_l1.h"   /* sp_compute_ntt_dispatch_fn (Sprint NTT.5b) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -78,6 +79,29 @@ int64_t sp_pr_bluestein_inner(sp_pr_bluestein_ctx *ctx,
 void sp_pr_bluestein_mul(sp_pr_bluestein_ctx *ctx,
                          const int32_t *a, const int32_t *b,
                          int64_t *out);
+
+/* ── Sprint NTT.5b: opt-in compute backend dispatch ──
+ *
+ * Attach (or detach) a compute-backend dispatcher for the inner length-M NTT
+ * calls. When set, the 4× ntt_forward + 1× ntt_inverse pattern inside
+ * sp_pr_bluestein_inner / sp_pr_bluestein_mul routes through (forward, inverse)
+ * instead of math-core's host ntt_crt path. Pointwise multiply remains host-
+ * side (small + cheap; lifting it would add a dispatch round-trip).
+ *
+ * Pass NULL for all three (handle, forward, inverse) to clear the backend.
+ * Setting just one of forward/inverse to NULL while the other is non-NULL is
+ * accepted; the NULL direction falls back to host. (This makes it possible to
+ * dispatch forward-only or inverse-only during incremental bring-up.)
+ *
+ * Thread-safety: caller-serialized with all other ctx accessors. NOT safe to
+ * call concurrently with sp_pr_bluestein_inner/mul on the same ctx.
+ *
+ * The handle is opaque — this TU never dereferences it. Lifetime must extend
+ * past the last sp_pr_bluestein_inner/mul call that uses the backend. */
+void sp_pr_bluestein_set_backend(sp_pr_bluestein_ctx *ctx,
+                                 void *handle,
+                                 sp_compute_ntt_dispatch_fn forward,
+                                 sp_compute_ntt_dispatch_fn inverse);
 
 #ifdef __cplusplus
 }
