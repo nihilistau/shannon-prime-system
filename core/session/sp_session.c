@@ -151,10 +151,23 @@ sp_status sp_prefill_chunk(sp_session *s, const int32_t *tokens, size_t n_tokens
 
     float *tmp = (float *)malloc(new_len * (size_t)s->n_vocab * sizeof(float));
     if (!tmp) { sp_set_error("sp_prefill_chunk: OOM (logits scratch)"); return SP_ENOMEM; }
+    /* NTT.5c: extract the session's registered compute backend (NTT.5b
+     * sp_session_register_compute_backend) and pass it as an explicit
+     * triple to the forward's _ex2 entry point. This avoids a circular
+     * dependency between the forward and session CMake modules — the
+     * forward TU stays ignorant of struct sp_session entirely.
+     *
+     * The `_ex2` variants thread the triple into sp_pr_bluestein_set_backend
+     * inside the NTT-attention overlay when SP_ENGINE_NTT_ATTN=1 + HD ∈
+     * {2..256} ∖ {512} + at least one backend pointer is non-NULL. All
+     * three NULL = host-only path. */
+    void *bh                            = s->compute_backend_handle;
+    sp_compute_ntt_dispatch_fn bfwd     = s->compute_backend_forward;
+    sp_compute_ntt_dispatch_fn binv     = s->compute_backend_inverse;
     sp_arch_t _arch = s->qm->cfg.arch;
-    int frc = (_arch == SP_ARCH_GEMMA3) ? gemma3_forward(s->qm, s->hist, (int)new_len, tmp)
-            : (_arch == SP_ARCH_QWEN25)  ? qwen25_forward(s->qm, s->hist, (int)new_len, tmp)
-            :                              qwen3_forward(s->qm, s->hist, (int)new_len, tmp);
+    int frc = (_arch == SP_ARCH_GEMMA3) ? gemma3_forward_ex2(s->qm, s->hist, (int)new_len, tmp,    bh, bfwd, binv)
+            : (_arch == SP_ARCH_QWEN25)  ? qwen25_forward_ex2(s->qm, s->hist, (int)new_len, tmp,    bh, bfwd, binv)
+            :                              qwen3_forward_ex2 (s->qm, s->hist, (int)new_len, tmp, NULL, bh, bfwd, binv);
     if (frc != 0) {
         free(tmp); sp_set_error("sp_prefill_chunk: forward failed"); return SP_EBADSTATE;
     }
