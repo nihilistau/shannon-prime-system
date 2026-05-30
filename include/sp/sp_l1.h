@@ -155,6 +155,72 @@ sp_status sp_session_clone   (const sp_session *s, volatile int *cancel_flag,
 sp_status sp_session_rewind  (sp_session *s, size_t n_tokens);
 sp_status sp_session_position(const sp_session *s, size_t *pos_out);
 
+/* ── §5 compute backend registration (Sprint NTT.5b) ──
+ *
+ * The Bluestein wrapper in math-core (sp_pr_bluestein_*) and any future backend-
+ * aware math-core kernel may route its inner NTT calls through a caller-supplied
+ * dispatch function rather than the host ntt_crt path. The dispatcher is supplied
+ * by L2 (the daemon's FastRPC trampoline; or any other compute backend) and the
+ * session stores the (opaque handle, forward fn, inverse fn) triple. Backend-
+ * awareness is OPT-IN: existing host code paths keep running unchanged when no
+ * backend is registered.
+ *
+ * Operator + Gemini pre-authorized this L1 ABI extension on 2026-05-30; see
+ * tools/sp_compute_skel/docs/PLAN-NTT-5b.md for the architectural review.
+ *
+ * Stability: handle is OPAQUE — L1 stores the pointer as-is and re-emits it
+ * verbatim to the dispatcher; L1 never dereferences it. Lifetime: caller must
+ * keep the backing object alive at least until sp_session_destroy (or until
+ * unregistration via NULL pointers) returns. */
+
+/* Opaque compute backend handle. L1 never dereferences it. */
+typedef struct sp_compute_backend_handle sp_compute_backend_handle;
+
+/* Dispatch function for one prime, one direction.
+ *
+ *   handle: backend-supplied opaque pointer (re-emitted verbatim from registration)
+ *   q_idx : 0 for q_1 = 1073738753, 1 for q_2 = 1073732609
+ *   N     : transform length (math-core ntt_init admissible: 128, 256, 512)
+ *   in    : N × u32 LE input residues in [0, q)
+ *   out   : N × u32 LE output residues in [0, q)
+ *
+ * Forward and inverse have identical signatures. The math-core wrapper handles
+ * CRT recombination across the two per-prime invocations; the dispatcher only
+ * services one prime per call.
+ *
+ * Returns 0 on success, -1 on error. */
+typedef int (*sp_compute_ntt_dispatch_fn)(
+    void *handle, int q_idx, int N,
+    const uint32_t *in, uint32_t *out);
+
+/* Register a compute backend for this session. After registration, math-core
+ * kernels that opt into backend dispatch (currently: sp_pr_bluestein_*) route
+ * inner NTT calls through forward/inverse instead of the host ntt_crt path.
+ *
+ * Pass NULL handle + NULL forward + NULL inverse to unregister.
+ *
+ * Lifetime of `handle`: caller-owned; must remain valid until either:
+ *   - sp_session_register_compute_backend is called again to replace/unregister,
+ *   - or sp_session_destroy returns.
+ *
+ * Thread-safety: caller-serialized with all other &mut sp_session operations
+ * (i.e. holding the L2 Mutex<SpSession> guard). NOT safe to call concurrently
+ * with a forward call on the same session.
+ *
+ * Returns SP_OK on success; SP_EBADARG on a NULL session pointer. */
+sp_status sp_session_register_compute_backend(
+    sp_session *s,
+    void *handle,
+    sp_compute_ntt_dispatch_fn forward,
+    sp_compute_ntt_dispatch_fn inverse);
+
+/* Read-back accessors so the math-core wrappers (which take const sp_session *)
+ * can pull the registered backend without exposing struct sp_session internals.
+ * NULL fields mean "no backend registered" — caller-side fallback to host path. */
+void *sp_session_compute_backend_handle (const sp_session *s);
+sp_compute_ntt_dispatch_fn sp_session_compute_backend_forward(const sp_session *s);
+sp_compute_ntt_dispatch_fn sp_session_compute_backend_inverse(const sp_session *s);
+
 #ifdef __cplusplus
 }
 #endif

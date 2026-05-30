@@ -526,6 +526,128 @@ static void T_NTT5A_BLUESTEIN_MUL_BIT_EXACT(void) {
              "Bluestein mul is bit-exact per-coefficient vs schoolbook");
 }
 
+/* ---- T_NTT5B_BACKEND_FORWARD_PASSTHROUGH (Stage 1) -----------------------
+ *
+ * Validates that sp_pr_bluestein_set_backend correctly routes the per-prime
+ * forward NTT through the supplied dispatch fn, with bit-exact output vs the
+ * no-backend host path. The stub forward implementation calls the public
+ * ntt_forward (which fuses both primes) and discards the wrong channel —
+ * functionally identical to math-core's per-prime forward_one, so the
+ * dispatched path must produce byte-identical output to the host path.
+ *
+ * Inverse is left NULL so pr_blue_convolve_M falls back to host ntt_inverse.
+ * This covers forward dispatch wiring; full forward+inverse dispatch is
+ * validated on-device by the Stage 3 smoke harness (which uses the real
+ * Hexagon HVX kernels via FastRPC).
+ *
+ * Stub forward: reinterpret the u32 input as int32 (values in [0, qP) fit
+ * trivially in int32 since q ≈ 2^30), call ntt_forward, keep the matching
+ * residue output channel.
+ */
+
+#include "sp/ntt_crt.h"   /* ntt_init/ntt_free/ntt_forward — only the existing
+                           * NTT.5a header chain pulls this in transitively */
+
+/* Cached inner ntt_ctx per M to avoid per-call init; one per M ∈ {128,256,512}. */
+typedef struct {
+    ntt_ctx *m128;
+    ntt_ctx *m256;
+    ntt_ctx *m512;
+} pr_blue_5b_stub_handle;
+
+static int pr_blue_5b_stub_forward(void *handle, int q_idx, int N,
+                                   const uint32_t *in, uint32_t *out) {
+    pr_blue_5b_stub_handle *h = (pr_blue_5b_stub_handle *)handle;
+    if (!h || !in || !out) return -1;
+    ntt_ctx *ctx = NULL;
+    if      (N == 128) ctx = h->m128;
+    else if (N == 256) ctx = h->m256;
+    else if (N == 512) ctx = h->m512;
+    if (!ctx) return -1;
+
+    /* Reinterpret u32 as int32: values in [0, qP) ⊂ [0, 2^30) → positive int32. */
+    const int32_t *in_i32 = (const int32_t *)in;
+    /* Per-prime: keep q_idx channel, discard the other. ntt_forward reduces
+     * each input by qP internally, so feeding the q1-prepared u32 values
+     * to the q2 channel would produce different (still valid) residues —
+     * but we only KEEP the channel matching q_idx, so the discard is fine. */
+    uint32_t *scratch = (uint32_t *)malloc(sizeof(uint32_t) * (size_t)N);
+    if (!scratch) return -1;
+    if (q_idx == 0) {
+        ntt_forward(ctx, in_i32, out, scratch);
+    } else if (q_idx == 1) {
+        ntt_forward(ctx, in_i32, scratch, out);
+    } else {
+        free(scratch);
+        return -1;
+    }
+    free(scratch);
+    return 0;
+}
+
+static void T_NTT5B_BACKEND_FORWARD_PASSTHROUGH(void) {
+    rng_seed(0x5B7B5B7B5B7B5B7Bull);
+    pr_blue_5b_stub_handle handle = {
+        .m128 = ntt_init(128u),
+        .m256 = ntt_init(256u),
+        .m512 = ntt_init(512u),
+    };
+    SP_CHECK(handle.m128 && handle.m256 && handle.m512,
+             "ntt_init succeeded for stub backend inner ctxs");
+
+    const uint32_t Ns[8] = { 2u, 4u, 8u, 16u, 32u, 64u, 128u, 256u };
+    const int SEEDS_PER_N = 20;
+    int total_runs = 0;
+    int total_coeff_div = 0;
+
+    for (int ni = 0; ni < 8; ni++) {
+        uint32_t N = Ns[ni];
+        sp_pr_bluestein_ctx *host_ctx = sp_pr_bluestein_init(N);
+        sp_pr_bluestein_ctx *disp_ctx = sp_pr_bluestein_init(N);
+        SP_CHECK(host_ctx && disp_ctx,
+                 "sp_pr_bluestein_init for both host + dispatch ctx");
+        if (!host_ctx || !disp_ctx) {
+            sp_pr_bluestein_free(host_ctx);
+            sp_pr_bluestein_free(disp_ctx);
+            continue;
+        }
+        /* Dispatch ctx routes forward through the stub; inverse stays NULL,
+         * so it falls back to host ntt_inverse on the host_ctx baseline path. */
+        sp_pr_bluestein_set_backend(disp_ctx, &handle,
+                                    pr_blue_5b_stub_forward, NULL);
+
+        int32_t *a   = malloc(sizeof(int32_t) * N);
+        int32_t *b   = malloc(sizeof(int32_t) * N);
+        int64_t *got = malloc(sizeof(int64_t) * N);
+        int64_t *ref = malloc(sizeof(int64_t) * N);
+
+        for (int t = 0; t < SEEDS_PER_N; t++) {
+            for (uint32_t i = 0; i < N; i++) {
+                a[i] = rng_coeff_blue();
+                b[i] = rng_coeff_blue();
+            }
+            sp_pr_bluestein_mul(host_ctx, a, b, ref);
+            sp_pr_bluestein_mul(disp_ctx, a, b, got);
+            for (uint32_t i = 0; i < N; i++) {
+                if (got[i] != ref[i]) total_coeff_div++;
+            }
+            total_runs++;
+        }
+        free(a); free(b); free(got); free(ref);
+        sp_pr_bluestein_free(host_ctx);
+        sp_pr_bluestein_free(disp_ctx);
+    }
+    ntt_free(handle.m128);
+    ntt_free(handle.m256);
+    ntt_free(handle.m512);
+
+    fprintf(stderr,
+            "[T_NTT5B_BACKEND_FORWARD_PASSTHROUGH] runs=%d coeff-divergences=%d\n",
+            total_runs, total_coeff_div);
+    SP_CHECK(total_coeff_div == 0,
+             "Bluestein forward dispatch passthrough is bit-exact vs host path");
+}
+
 /* ---- T_NTT5A_NULL_FOR_INADMISSIBLE_N (Stage 5) --------------------------- */
 static void T_NTT5A_NULL_FOR_INADMISSIBLE_N(void) {
     /* N values that must return NULL:
@@ -561,6 +683,7 @@ int main(void) {
     SP_RUN(T_NTT5A_BLUESTEIN_BIT_EXACT_VS_SCHOOLBOOK);
     SP_RUN(T_NTT5A_VS_SP_PR_INNER_BIT_EXACT);
     SP_RUN(T_NTT5A_BLUESTEIN_MUL_BIT_EXACT);
+    SP_RUN(T_NTT5B_BACKEND_FORWARD_PASSTHROUGH);
     SP_RUN(T_NTT5A_NULL_FOR_INADMISSIBLE_N);
     return SP_DONE();
 }

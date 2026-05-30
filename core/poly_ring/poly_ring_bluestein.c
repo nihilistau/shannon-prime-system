@@ -272,6 +272,21 @@ struct sp_pr_bluestein_ctx {
                                           * clobbering our keep channel */
     int64_t  *D;                          /* signed length-M lin-conv int64 */
     uint32_t *c_fold_q1, *c_fold_q2;     /* folded length-N residues       */
+
+    /* ── Sprint NTT.5b: opt-in compute backend ──
+     * NULL fields = host path (the NTT.5a baseline). When non-NULL, the
+     * 4× ntt_forward + 1× ntt_inverse inner calls in pr_blue_convolve_M
+     * route through (forward, inverse) instead of math-core's host
+     * ntt_crt. Set via sp_pr_bluestein_set_backend. */
+    void                       *backend_handle;
+    sp_compute_ntt_dispatch_fn  backend_forward;
+    sp_compute_ntt_dispatch_fn  backend_inverse;
+    /* Per-call u32 scratch for backend dispatch (sized M). Math-core's host
+     * ntt_forward takes int32_t* in; the backend ABI takes uint32_t*. The
+     * int32 pad buffers above already hold values in [0, qP) so a memcpy-
+     * style reinterpret to u32 is safe. We keep dedicated u32 scratch to
+     * keep the conversion explicit and avoid aliasing UB. */
+    uint32_t *u32_pad_q1, *u32_pad_q2;   /* mirror of int32 pads as u32 */
 };
 
 /* ---- public API --------------------------------------------------------- */
@@ -315,14 +330,20 @@ sp_pr_bluestein_ctx *sp_pr_bluestein_init(uint32_t N) {
     ctx->D          = (int64_t  *)malloc(sizeof(int64_t)  * M);
     ctx->c_fold_q1  = (uint32_t *)malloc(sizeof(uint32_t) * N);
     ctx->c_fold_q2  = (uint32_t *)malloc(sizeof(uint32_t) * N);
+    /* Sprint NTT.5b: dedicated u32 mirrors of the int32 pad buffers,
+     * for the backend dispatch ABI (uint32_t* in/out). */
+    ctx->u32_pad_q1 = (uint32_t *)malloc(sizeof(uint32_t) * M);
+    ctx->u32_pad_q2 = (uint32_t *)malloc(sizeof(uint32_t) * M);
 
     if (!ctx->a_pad_q1 || !ctx->a_pad_q2 || !ctx->b_pad_q1 || !ctx->b_pad_q2 ||
         !ctx->a_res_q1 || !ctx->a_res_q2 || !ctx->b_res_q1 || !ctx->b_res_q2 ||
         !ctx->c_res_q1 || !ctx->c_res_q2 || !ctx->scratch_q1 || !ctx->scratch_q2 ||
-        !ctx->D || !ctx->c_fold_q1 || !ctx->c_fold_q2) {
+        !ctx->D || !ctx->c_fold_q1 || !ctx->c_fold_q2 ||
+        !ctx->u32_pad_q1 || !ctx->u32_pad_q2) {
         sp_pr_bluestein_free(ctx);
         return NULL;
     }
+    /* backend_* fields land NULL via calloc; explicit set_backend opts in. */
     return ctx;
 }
 
@@ -339,6 +360,7 @@ void sp_pr_bluestein_free(sp_pr_bluestein_ctx *ctx) {
     free(ctx->scratch_q1); free(ctx->scratch_q2);
     free(ctx->D);
     free(ctx->c_fold_q1); free(ctx->c_fold_q2);
+    free(ctx->u32_pad_q1); free(ctx->u32_pad_q2);
     free(ctx);
 }
 
@@ -378,28 +400,86 @@ static void pr_blue_twist_input(const sp_pr_bluestein_ctx *ctx,
     }
 }
 
-/* Drive math-core's CRT NTT pipeline to compute the length-M signed-
- * centered int64 linear convolution D of two outer-twisted, zero-padded
- * inputs. Twice ntt_forward per input (once per prime, discarding the
- * wrong channel) + 1 pointwise + 1 inverse. */
+/* Drive the CRT NTT pipeline to compute the length-M signed-centered int64
+ * linear convolution D of two outer-twisted, zero-padded inputs. Either path
+ * (host vs backend) ends at the same D buffer; downstream fold/untwist/garner
+ * is direction-agnostic.
+ *
+ * Host path: 4× ntt_forward (each fuses both primes from one int32 input;
+ * we discard the wrong channel via the scratch_qP buffers), 1× ntt_pointwise_mul,
+ * 1× ntt_inverse (which does its own CRT recombine internally).
+ *
+ * Backend path (NTT.5b): 4× backend_forward (one per (operand × prime) per the
+ * uniform per-prime u32 ABI), 1× ntt_pointwise_mul (host-side; small + cheap),
+ * 2× backend_inverse (one per prime; produces per-prime u32 residues in [0, q)),
+ * 1× ntt_crt_recombine (host-side; produces the same D buffer ntt_inverse would
+ * have produced).
+ *
+ * Per-direction NULL fallback: if backend_forward is NULL the forward path uses
+ * host; same for backend_inverse independently. This lets us validate forward-
+ * only or inverse-only dispatch during incremental bring-up. */
 static void pr_blue_convolve_M(sp_pr_bluestein_ctx *ctx) {
-    /* Forward a, q1 channel: feed a_pad_q1; keep a_res_q1; discard q2 ch. */
-    ntt_forward(ctx->inner, ctx->a_pad_q1, ctx->a_res_q1, ctx->scratch_q2);
-    /* Forward a, q2 channel: feed a_pad_q2; keep a_res_q2; discard q1 ch. */
-    ntt_forward(ctx->inner, ctx->a_pad_q2, ctx->scratch_q1, ctx->a_res_q2);
-    /* Forward b, q1 channel. */
-    ntt_forward(ctx->inner, ctx->b_pad_q1, ctx->b_res_q1, ctx->scratch_q2);
-    /* Forward b, q2 channel. */
-    ntt_forward(ctx->inner, ctx->b_pad_q2, ctx->scratch_q1, ctx->b_res_q2);
+    const uint32_t M = ctx->M;
+    const int     iM = (int)M;
+    void * const  h  = ctx->backend_handle;
+    const sp_compute_ntt_dispatch_fn fwd = ctx->backend_forward;
+    const sp_compute_ntt_dispatch_fn inv = ctx->backend_inverse;
 
-    /* Per-prime pointwise multiply. */
+    /* ── Forward NTTs (per operand, per prime) ── */
+    if (fwd) {
+        /* Backend dispatch path: uniform u32-LE in/out per prime. The pad
+         * buffers already hold values in [0, qP) (per pr_blue_twist_input),
+         * so the int32→u32 mirror is a value-preserving copy. */
+        for (uint32_t j = 0; j < M; j++) {
+            ctx->u32_pad_q1[j] = (uint32_t)ctx->a_pad_q1[j];
+            ctx->u32_pad_q2[j] = (uint32_t)ctx->a_pad_q2[j];
+        }
+        if (fwd(h, 0, iM, ctx->u32_pad_q1, ctx->a_res_q1) != 0 ||
+            fwd(h, 1, iM, ctx->u32_pad_q2, ctx->a_res_q2) != 0) {
+            /* Dispatch failure: fall back to host for this single call. The
+             * caller has no error channel from convolve_M; the smoke test
+             * will see the divergence via bit-exact compare and surface it. */
+            ntt_forward(ctx->inner, ctx->a_pad_q1, ctx->a_res_q1, ctx->scratch_q2);
+            ntt_forward(ctx->inner, ctx->a_pad_q2, ctx->scratch_q1, ctx->a_res_q2);
+        }
+        for (uint32_t j = 0; j < M; j++) {
+            ctx->u32_pad_q1[j] = (uint32_t)ctx->b_pad_q1[j];
+            ctx->u32_pad_q2[j] = (uint32_t)ctx->b_pad_q2[j];
+        }
+        if (fwd(h, 0, iM, ctx->u32_pad_q1, ctx->b_res_q1) != 0 ||
+            fwd(h, 1, iM, ctx->u32_pad_q2, ctx->b_res_q2) != 0) {
+            ntt_forward(ctx->inner, ctx->b_pad_q1, ctx->b_res_q1, ctx->scratch_q2);
+            ntt_forward(ctx->inner, ctx->b_pad_q2, ctx->scratch_q1, ctx->b_res_q2);
+        }
+    } else {
+        /* Host path (NTT.5a baseline). */
+        ntt_forward(ctx->inner, ctx->a_pad_q1, ctx->a_res_q1, ctx->scratch_q2);
+        ntt_forward(ctx->inner, ctx->a_pad_q2, ctx->scratch_q1, ctx->a_res_q2);
+        ntt_forward(ctx->inner, ctx->b_pad_q1, ctx->b_res_q1, ctx->scratch_q2);
+        ntt_forward(ctx->inner, ctx->b_pad_q2, ctx->scratch_q1, ctx->b_res_q2);
+    }
+
+    /* ── Per-prime pointwise multiply (host-side in either path) ── */
     ntt_pointwise_mul(ctx->inner,
                       ctx->a_res_q1, ctx->a_res_q2,
                       ctx->b_res_q1, ctx->b_res_q2,
                       ctx->c_res_q1, ctx->c_res_q2);
 
-    /* Length-M inverse + CRT to signed centered int64. */
-    ntt_inverse(ctx->inner, ctx->c_res_q1, ctx->c_res_q2, ctx->D);
+    /* ── Inverse + CRT ── */
+    if (inv) {
+        /* Backend dispatch path: two per-prime INTTs into u32 [0, q) residues,
+         * then host-side Garner via the public ntt_crt_recombine accessor.
+         * scratch_q1/scratch_q2 hold the per-prime residue outputs. */
+        if (inv(h, 0, iM, ctx->c_res_q1, ctx->scratch_q1) != 0 ||
+            inv(h, 1, iM, ctx->c_res_q2, ctx->scratch_q2) != 0) {
+            /* Dispatch failure → fall back to host */
+            ntt_inverse(ctx->inner, ctx->c_res_q1, ctx->c_res_q2, ctx->D);
+        } else {
+            ntt_crt_recombine(ctx->inner, ctx->scratch_q1, ctx->scratch_q2, ctx->D);
+        }
+    } else {
+        ntt_inverse(ctx->inner, ctx->c_res_q1, ctx->c_res_q2, ctx->D);
+    }
 }
 
 /* Fold D[0..M) into per-prime length-N residue vectors C_qP[k]:
@@ -465,6 +545,20 @@ void sp_pr_bluestein_mul(sp_pr_bluestein_ctx *ctx,
     for (uint32_t k = 0; k < N; k++)
         out[k] = pr_blue_garner(ctx->c_fold_q1[k], ctx->c_fold_q2[k],
                                 q1, q2, mu2, q1inv);
+}
+
+/* ── Sprint NTT.5b: opt-in compute backend setter ──
+ * Caller-serialized. Storage is a plain assign (3 word-sized fields). NULL
+ * combinations are accepted as-written; pr_blue_convolve_M checks each
+ * direction's pointer at dispatch time and falls back per-direction. */
+void sp_pr_bluestein_set_backend(sp_pr_bluestein_ctx *ctx,
+                                 void *handle,
+                                 sp_compute_ntt_dispatch_fn forward,
+                                 sp_compute_ntt_dispatch_fn inverse) {
+    if (!ctx) return;
+    ctx->backend_handle  = handle;
+    ctx->backend_forward = forward;
+    ctx->backend_inverse = inverse;
 }
 
 int64_t sp_pr_bluestein_inner(sp_pr_bluestein_ctx *ctx,

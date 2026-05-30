@@ -52,6 +52,13 @@ struct sp_session {
     size_t             kv_filled;   /* positions [0, kv_filled) hold valid KV */
     /* per-step scratch */
     float *sx, *snx, *sq, *sknew, *svnew, *sao, *sap, *sgg, *sup, *sdn, *ssc;
+    /* ── Sprint NTT.5b: optional compute backend (FastRPC dispatcher or other).
+     * NULL fields = host path. Set via sp_session_register_compute_backend.
+     * Caller owns `compute_backend_handle`; we only re-emit it to the dispatch
+     * fn pointers (we never dereference it ourselves). */
+    void                       *compute_backend_handle;
+    sp_compute_ntt_dispatch_fn  compute_backend_forward;
+    sp_compute_ntt_dispatch_fn  compute_backend_inverse;
 };
 
 static int cancelled(const sp_session *s) { return (s->cancel && *s->cancel) ? 1 : 0; }
@@ -553,4 +560,43 @@ sp_status sp_session_rewind(sp_session *s, size_t n_tokens) {
     s->pos -= n_tokens;
     if (s->kv_filled > s->pos) s->kv_filled = s->pos;   /* KV beyond the new position is stale */
     return SP_OK;
+}
+
+/* ── §5 Sprint NTT.5b: compute-backend registration + readback ───────────────
+ *
+ * The fields are calloc-zeroed at sp_session_create, so a session that never
+ * calls the registration fn is implicitly "host path only" — every consumer
+ * that reads via the getters sees NULL and falls back. The register fn
+ * stores (handle, forward, inverse) on the session; the getters are how
+ * math-core (currently sp_pr_bluestein_*) opts in to dispatch. The handle
+ * lifetime contract is in sp_l1.h.
+ *
+ * Validation: NULL session → SP_EBADARG. All-NULL handle+forward+inverse is
+ * the explicit "unregister" call (zeroes the fields). A partially-NULL
+ * combination (e.g. handle non-NULL but forward NULL) is accepted as written —
+ * downstream consumers MUST check the specific fn pointer they need before
+ * dispatching, and fall back when it's NULL. This matches the per-direction
+ * fallback the math-core wrappers implement. */
+sp_status sp_session_register_compute_backend(
+    sp_session *s,
+    void *handle,
+    sp_compute_ntt_dispatch_fn forward,
+    sp_compute_ntt_dispatch_fn inverse) {
+    if (!s) { sp_set_error("sp_session_register_compute_backend: null session"); return SP_EBADARG; }
+    s->compute_backend_handle  = handle;
+    s->compute_backend_forward = forward;
+    s->compute_backend_inverse = inverse;
+    return SP_OK;
+}
+
+void *sp_session_compute_backend_handle(const sp_session *s) {
+    return s ? s->compute_backend_handle : NULL;
+}
+
+sp_compute_ntt_dispatch_fn sp_session_compute_backend_forward(const sp_session *s) {
+    return s ? s->compute_backend_forward : NULL;
+}
+
+sp_compute_ntt_dispatch_fn sp_session_compute_backend_inverse(const sp_session *s) {
+    return s ? s->compute_backend_inverse : NULL;
 }
