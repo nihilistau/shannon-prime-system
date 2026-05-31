@@ -221,6 +221,88 @@ void *sp_session_compute_backend_handle (const sp_session *s);
 sp_compute_ntt_dispatch_fn sp_session_compute_backend_forward(const sp_session *s);
 sp_compute_ntt_dispatch_fn sp_session_compute_backend_inverse(const sp_session *s);
 
+/* ── §6 forward backend registration (Sprint WIRE-HEX) ──
+ *
+ * Distinct from the §5 NTT compute-backend hook (which only services inner NTT
+ * calls inside the Bluestein wrapper): this hook replaces the WHOLE prefill
+ * forward call with a caller-supplied dispatcher. Targets the engine's
+ * per-backend full-forward entry points (gemma3_forward_hexagon,
+ * gemma3_forward_cuda, gemma3_forward_vulkan) which run the entire transformer
+ * forward on accelerator silicon and return the full [n_tok * n_vocab] logits.
+ *
+ * Background — the 6-month gap this hook closes: the engine's ppl.c routes
+ * SP_BACKEND={cuda,vulkan,hexagon} to per-backend full-forward functions
+ * (src/forward/ppl.c:27-47), but sp_daemon's prefill/decode go through
+ * sp_session which always runs math-core's REFERENCE forward
+ * (lib/shannon-prime-system/core/forward/forward.c, identified as "pure-f32
+ * scalar" in core/forward_dispatch/forward_dispatch.c:1-15). Registration
+ * lets L2 plug the production forward in without engine code duplication.
+ *
+ * Scope: prefill_chunk only. decode_step (persistent KV) is NOT hooked in
+ * this sprint — backend forwards like gemma3_forward_hexagon re-run the full
+ * forward over the accumulated history per call (the engine's ppl-style
+ * usage). Hooking decode would require either re-running the full history
+ * per token (devastating to perf) or a per-backend persistent-KV variant
+ * (different sprint). The fallback for decode is the math-core reference
+ * path, identical to today's behavior.
+ *
+ * Stability: handle is OPAQUE; L1 stores and re-emits it verbatim. qm_opaque
+ * is the borrowed sp_session-owned qwen3_model pointer (see
+ * sp_session_qwen3_model below) — L1 emits its internal `qm` to the
+ * dispatcher; dispatcher casts to `const qwen3_model *` and calls into the
+ * engine's backend (which is what `gemma3_forward_hexagon` already takes).
+ * Lifetime: caller must keep handle alive at least until sp_session_destroy
+ * (or until unregistration via NULL fn) returns. */
+
+/* Full-forward dispatcher signature.
+ *
+ *   handle    : backend-supplied opaque pointer (re-emitted verbatim)
+ *   qm_opaque : session's borrowed qwen3_model pointer (treat as const qwen3_model *
+ *               on the engine side; L1 stores it as void *).
+ *   tokens    : n_tok int32 token IDs (the full accumulated history)
+ *   n_tok     : number of tokens
+ *   logits    : caller-allocated [n_tok * n_vocab] f32 output
+ *
+ * Returns 0 on success, non-zero on error (sp_prefill_chunk maps non-zero
+ * to SP_EBADSTATE). The dispatcher MUST write all n_tok positions' logits
+ * (sp_prefill_chunk extracts the LAST position for the caller). */
+typedef int (*sp_forward_dispatch_fn)(
+    void *handle, const void *qm_opaque,
+    const int32_t *tokens, int n_tok, float *logits);
+
+/* Register a forward backend for this session. After registration,
+ * sp_prefill_chunk dispatches the full forward through `fn` instead of the
+ * math-core reference. sp_decode_step is unaffected (persistent KV path).
+ *
+ * Pass NULL handle + NULL fn to unregister.
+ *
+ * Lifetime of `handle`: caller-owned; must remain valid until either:
+ *   - sp_session_register_forward_backend is called again to replace/unregister,
+ *   - or sp_session_destroy returns.
+ *
+ * Thread-safety: caller-serialized with all &mut sp_session operations
+ * (i.e. holding the L2 Mutex<SpSession> guard). NOT safe to call
+ * concurrently with a forward call on the same session.
+ *
+ * Returns SP_OK on success; SP_EBADARG on a NULL session pointer. */
+sp_status sp_session_register_forward_backend(
+    sp_session *s,
+    void *handle,
+    sp_forward_dispatch_fn fn);
+
+/* Read-back accessors. NULL fn means "no forward backend registered" —
+ * caller-side fallback to math-core reference path. */
+void *sp_session_forward_backend_handle(const sp_session *s);
+sp_forward_dispatch_fn sp_session_forward_backend_fn(const sp_session *s);
+
+/* Borrow accessor: the session's internal qwen3_model pointer. Used by L2
+ * trampolines that need to pass the model handle to a forward dispatcher
+ * (e.g. the engine's gemma3_forward_hexagon takes const qwen3_model *).
+ * NULL on a NULL session; never NULL on a successfully-created session.
+ * The pointer is borrowed from the model handle and remains valid for the
+ * session's lifetime; caller MUST NOT free it. */
+const void *sp_session_qwen3_model(const sp_session *s);
+
 #ifdef __cplusplus
 }
 #endif
