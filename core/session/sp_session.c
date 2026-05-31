@@ -187,7 +187,13 @@ sp_status sp_prefill_chunk(sp_session *s, const int32_t *tokens, size_t n_tokens
             :                              qwen3_forward_ex2 (s->qm, s->hist, (int)new_len, tmp, NULL, bh, bfwd, binv);
     }
     if (frc != 0) {
-        free(tmp); sp_set_error("sp_prefill_chunk: forward failed"); return SP_EBADSTATE;
+        /* Preserve any inner sp_set_error detail from the dispatched fn
+         * (e.g. sp_hex_host.c's "hexagon: ..." strings) — only overwrite
+         * with a generic message if no detail is present yet. */
+        const char *prev = sp_last_error();
+        if (!prev || prev[0] == '\0') sp_set_error("sp_prefill_chunk: forward failed");
+        free(tmp);
+        return SP_EBADSTATE;
     }
     memcpy(logits_last, tmp + (new_len - 1) * (size_t)s->n_vocab, (size_t)s->n_vocab * sizeof(float));
     free(tmp);
@@ -567,6 +573,17 @@ sp_status sp_session_clone(const sp_session *s, volatile int *cancel_flag, sp_se
     sp_session *c = *out;
     memcpy(c->hist, s->hist, s->pos * sizeof(int32_t));
     c->pos = s->pos;
+    /* Sprint WIRE-HEX + NTT.5b: propagate registered backends to the clone so
+     * the fork hits the same accelerator dispatch path as the parent. Both
+     * handle lifetimes are caller-owned (sp_l1.h:§5,§6); clone borrows the
+     * same handle pointers (no deep copy of opaque state). The parent's
+     * SpSession-side lifetime guard (AppState Arc) keeps them alive past the
+     * clone's last use. */
+    c->compute_backend_handle  = s->compute_backend_handle;
+    c->compute_backend_forward = s->compute_backend_forward;
+    c->compute_backend_inverse = s->compute_backend_inverse;
+    c->forward_backend_handle  = s->forward_backend_handle;
+    c->forward_backend_fn      = s->forward_backend_fn;
     if (s->kc || s->kcb) {   /* deep-copy the live KV so the fork doesn't re-prefill */
         if (ensure_decode_bufs(c)) { sp_session_destroy(c); *out = NULL; sp_set_error("sp_session_clone: OOM (KV)"); return SP_ENOMEM; }
         const qwen3_config *cf = &c->qm->cfg;
