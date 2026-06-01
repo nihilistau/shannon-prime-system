@@ -33,6 +33,12 @@ int sp_matmul(const qwen3_model *m, const gguf_tensor *W,
  * packed, else dequantized from the GGUF mapping). Returns 0 on success. */
 int sp_embed_row(const qwen3_model *m, int32_t tok, int E, float *dst);
 
+/* Generalised row dequant: row `row` (length `len`) of an arbitrary weight tensor
+ * `W` -> dst[len] (arena if packed, else GGUF mapping). Generalises sp_embed_row
+ * for any [len, n_rows] tensor — used by the Gemma4 AltUp per_layer_token_embd
+ * lookup. Returns 0 on success. */
+int sp_weight_row(const qwen3_model *m, const gguf_tensor *W, int row, int len, float *dst);
+
 /* Read a norm/scale weight tensor as f32: the owned f32 copy after source release,
  * else directly from the GGUF mapping. NULL if not found post-release. */
 const float *sp_as_f32(const qwen3_model *m, const gguf_tensor *t);

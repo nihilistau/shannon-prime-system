@@ -174,3 +174,16 @@ int sp_embed_row(const qwen3_model *m, int32_t tok, int E, float *dst) {
     if (!emb || rb == 0) return 1;
     return sp_dequant_row(emb + (size_t)tok * rb, m->token_embd->type, E, dst);
 }
+
+/* Generalised row dequant: row `row` (length `len`) of an arbitrary weight tensor
+ * W -> dst[len], from the arena (if W is packed there) else the GGUF mapping.
+ * Mirrors sp_embed_row for any [len, n_rows] tensor (Gemma4 per_layer_token_embd). */
+int sp_weight_row(const qwen3_model *m, const gguf_tensor *W, int row, int len, float *dst) {
+    if (!W) return 1;
+    const sp_arena_tensor *at = m->arena ? sp_arena_find(m->arena, W->name) : NULL;
+    if (at) return sp_arena_dequant_row(at, row, dst);
+    const uint8_t *p = (const uint8_t *)gguf_tensor_data(m->gguf, W);
+    size_t rb = row_bytes(W->type, len);
+    if (!p || rb == 0) return 1;
+    return sp_dequant_row(p + (size_t)row * rb, W->type, len, dst);
+}
