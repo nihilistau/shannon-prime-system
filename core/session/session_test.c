@@ -13,6 +13,7 @@
 #include "sp/arena.h"
 #include "qwen3_fixture.h"
 #include "gemma3_fixture.h"
+#include "gemma4_fixture.h"
 #include "qwen25_fixture.h"
 
 #include <stdlib.h>
@@ -949,6 +950,86 @@ static void T_NTT5C_HD_64_BIT_EXACT_VS_FP32_TOP1(void) {
     sp_model_unload(m); cleanup_q25_files();
 }
 
+/* ── Phase 3-G4: Gemma4 bridge tests ── */
+
+static int load_g4_fixture(sp_gemma4_fixture_info *info, sp_model **out) {
+    uint8_t *mb = NULL, *tb = NULL;
+    if (sp_gemma4_fixture_build(&mb, &tb, info)) return 1;
+    int rc = sp_gemma4_fixture_write("fx_g4.spm", mb, info->model_len)
+           | sp_gemma4_fixture_write("fx_g4.spt", tb, info->tok_len);
+    free(mb); free(tb);
+    if (rc) return 1;
+    return (sp_model_load("fx_g4.spm", "fx_g4.spt", out) == SP_OK) ? 0 : 1;
+}
+static void cleanup_g4_files(void) { remove("fx_g4.spm"); remove("fx_g4.spt"); }
+
+static void T_GEMMA4_ALIAS(void) {
+    /* Bridge reconstructs Gemma4: arch tag, zero-copy arena aliasing, and the
+     * AltUp per-layer-input globals are bound. */
+    sp_gemma4_fixture_info info; sp_model *m = NULL;
+    SP_CHECK(load_g4_fixture(&info, &m) == 0, "Gemma4 fixture load");
+    if (!m) { cleanup_g4_files(); return; }
+
+    sp_session *s = NULL;
+    SP_CHECK_EQ_I64(sp_session_create(m, NULL, NULL, &s), SP_OK, "create -> SP_OK");
+    qwen3_model *qm = sp_model_borrow_qm(m);
+    SP_CHECK(qm != NULL, "borrow after create -> non-NULL");
+    if (qm) {
+        SP_CHECK(qm->cfg.arch == SP_ARCH_GEMMA4, "arch == SP_ARCH_GEMMA4");
+        SP_CHECK(qm->cfg.g4_n_embd_per_layer == info.n_embd_per_layer, "g4_n_embd_per_layer populated");
+        SP_CHECK(qm->cfg.g4_swa_period == info.swa_period, "g4_swa_period populated");
+        SP_CHECK(qm->cfg.g4_n_kv_from_start == info.n_kv_from_start, "g4_n_kv_from_start populated");
+        SP_CHECK(qm->per_layer_token_embd != NULL, "per_layer_token_embd bound");
+        SP_CHECK(qm->per_layer_model_proj != NULL, "per_layer_model_proj bound");
+        SP_CHECK(qm->rope_freqs != NULL, "rope_freqs bound");
+        const sp_arena_tensor *at = sp_arena_find(qm->arena, "per_layer_token_embd.weight");
+        SP_CHECK(at != NULL && at->pt.alias_mask == 0x3, "per_layer_token_embd zero-copy alias");
+    }
+    sp_session_destroy(s);
+    sp_model_unload(m); cleanup_g4_files();
+}
+
+static void T_GEMMA4_PREFILL_PARITY(void) {
+    /* Session prefill (gemma4 dispatch) last-position logits == gemma4_forward
+     * reference, bit-exact in deterministic mode. Exercises both layer types
+     * (period=3), shared-KV reuse (kvfs=3), AltUp injection, and softcap. */
+    sp_gemma4_fixture_info info; sp_model *m = NULL;
+    SP_CHECK(load_g4_fixture(&info, &m) == 0, "Gemma4 fixture load");
+    if (!m) { cleanup_g4_files(); return; }
+    const uint32_t V = info.n_vocab;
+
+    qwen3_model *ref = sp_model_to_gemma4(m);
+    SP_CHECK(ref != NULL, "sp_model_to_gemma4 reference");
+    float *ref_lg = (float *)malloc((size_t)NTOK * V * sizeof(float));
+    SP_CHECK(ref_lg != NULL, "alloc ref logits");
+    int fwd_ok = (ref && ref_lg) ? (gemma4_forward(ref, TOKS, (int)NTOK, ref_lg) == 0) : 0;
+    SP_CHECK(fwd_ok, "gemma4_forward reference returns 0");
+
+    int finite = 1;
+    if (fwd_ok) for (uint32_t i = 0; i < V; i++) {
+        float z = ref_lg[(size_t)(NTOK - 1u) * V + i];
+        if (!(z == z) || z > 1e30f || z < -1e30f) { finite = 0; break; }
+    }
+    SP_CHECK(finite, "reference last-position logits finite (softcap-bounded)");
+
+    sp_session *s = NULL; sp_session_config cfg; memset(&cfg, 0, sizeof cfg); cfg.deterministic = 1;
+    SP_CHECK_EQ_I64(sp_session_create(m, &cfg, NULL, &s), SP_OK, "create");
+    float *lg = (float *)malloc((size_t)V * sizeof(float));
+    SP_CHECK_EQ_I64(sp_prefill_chunk(s, TOKS, NTOK, lg, V), SP_OK, "prefill");
+
+    int exact = 1;
+    if (fwd_ok && lg) {
+        const float *last = ref_lg + (size_t)(NTOK - 1u) * V;
+        for (uint32_t i = 0; i < V; i++) if (lg[i] != last[i]) { exact = 0; break; }
+    }
+    SP_CHECK(exact, "session prefill last-position == gemma4_forward (bit-exact)");
+
+    free(lg); free(ref_lg);
+    if (ref) qwen3_free(ref);
+    sp_session_destroy(s);
+    sp_model_unload(m); cleanup_g4_files();
+}
+
 int main(void) {
     SP_RUN(T_PARITY_KV_SPINOR);
     SP_RUN(T_PARITY_Q4_BRIDGE);
@@ -966,6 +1047,8 @@ int main(void) {
     SP_RUN(T_GEMMA3_ALIAS);
     SP_RUN(T_GEMMA3_DECODE_TRAJECTORY);
     SP_RUN(T_PARITY_CROSS_LOAD_GEMMA3);
+    SP_RUN(T_GEMMA4_ALIAS);
+    SP_RUN(T_GEMMA4_PREFILL_PARITY);
     SP_RUN(T_QWEN25_ALIAS);
     SP_RUN(T_QWEN25_DECODE_TRAJECTORY);
     SP_RUN(T_PARITY_CROSS_LOAD_QWEN25);

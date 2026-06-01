@@ -83,6 +83,8 @@ sp_status sp_session_create(const sp_model *m, const sp_session_config *cfg,
     if (!qm) {
         if (ai.arch_id == (uint32_t)SP_ARCH_ID_GEMMA3)
             qm = sp_model_to_gemma3(m);
+        else if (ai.arch_id == (uint32_t)SP_ARCH_ID_GEMMA4)
+            qm = sp_model_to_gemma4(m);
         else if (ai.arch_id == (uint32_t)SP_ARCH_ID_QWEN25)
             qm = sp_model_to_qwen25(m);
         else
@@ -183,6 +185,7 @@ sp_status sp_prefill_chunk(sp_session *s, const int32_t *tokens, size_t n_tokens
                                     s->hist, (int)new_len, tmp);
     } else {
         frc = (_arch == SP_ARCH_GEMMA3) ? gemma3_forward_ex2(s->qm, s->hist, (int)new_len, tmp,    bh, bfwd, binv)
+            : (_arch == SP_ARCH_GEMMA4)  ? gemma4_forward_ex2(s->qm, s->hist, (int)new_len, tmp,    bh, bfwd, binv)
             : (_arch == SP_ARCH_QWEN25)  ? qwen25_forward_ex2(s->qm, s->hist, (int)new_len, tmp,    bh, bfwd, binv)
             :                              qwen3_forward_ex2 (s->qm, s->hist, (int)new_len, tmp, NULL, bh, bfwd, binv);
     }
