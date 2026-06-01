@@ -19,6 +19,7 @@
  */
 #include "sp/sp_test.h"
 #include "sp/poly_ring.h"
+#include "sp/poly_ring_bluestein.h"   /* NTT.5a sibling API under test */
 #include "sp/ntt_crt.h"      /* SP_NTT_M for the schoolbook centering */
 
 #include <stdint.h>
@@ -274,10 +275,415 @@ static void T_PR_4(void) {
     sp_pr_free(c256); sp_pr_free(c512);
 }
 
+/* ========================================================================
+ *  NTT.5a Bluestein wrapper gates (T_NTT5A_*)
+ * ========================================================================
+ *
+ *  Tests the new sp_pr_bluestein_* API that extends polynomial-ring
+ *  attention from N ∈ {128, 256, 512} (direct sp_pr_init) to all powers of 2
+ *  N ∈ {2, 4, 8, 16, 32, 64, 128, 256} (Bluestein wrapper). N=512 stays on
+ *  direct sp_pr_init; non-power-of-2 N is mathematically unsupported with
+ *  our frozen primes regardless of algorithm.
+ *
+ *  Schoolbook oracle is identical in shape to the existing
+ *  schoolbook_negacyclic above, just parameterized for the wider N range.
+ *  The two oracles agree on the overlapping N ∈ {128, 256} (cross-check in
+ *  Stage 1's T_NTT5A_SCHOOLBOOK_CROSSCHECK), which is what gives the
+ *  Bluestein-vs-schoolbook gate its trust.
+ */
+
+/* Coefficient range pinned to [-2^14, 2^14) for the Bluestein gates. With
+ * N ≤ 256, |inner product| < 256 * 2^28 = 2^36 ≪ M/2 ≈ 2^59, and each
+ * linear-conv coefficient is also bounded by 2^36. This range is tighter
+ * than the existing T_PR coefficient range (2^23) and gives extra headroom
+ * vs the M_full/2 bit-exact recovery window. */
+static int32_t rng_coeff_blue(void) {
+    int32_t v = (int32_t)(rng_next() & 0x00007FFFu);    /* [0, 2^15) */
+    return v - (1 << 14);                                /* [-2^14, 2^14) */
+}
+
+/* All Bluestein-admissible N values (powers of 2 in [2, 256]). N=512 is
+ * intentionally NOT here — direct sp_pr_init handles it. */
+static const uint32_t kBluesteinNs[8] = { 2u, 4u, 8u, 16u, 32u, 64u, 128u, 256u };
+
+/* Schoolbook negacyclic inner product: c_0 of the negacyclic product, i.e.
+ * sum_i q_i k_i. With our coefficient range and N ≤ 256, computed in plain
+ * int64 with no modular reduction (the true integer fits and equals the
+ * centered Z_M residue). */
+static int64_t schoolbook_inner(uint32_t N, const int32_t *q, const int32_t *k) {
+    int64_t acc = 0;
+    for (uint32_t i = 0; i < N; i++) acc += (int64_t)q[i] * (int64_t)k[i];
+    return acc;
+}
+
+/* Schoolbook negacyclic product, parameterized over Bluestein-admissible N.
+ * Identical structure to the existing schoolbook_negacyclic at the top of
+ * this file; reproduced here because the existing one is private to the
+ * T_PR_1 section. Centered result mod M, identical to direct sp_pr_mul. */
+static void schoolbook_neg_mul(uint32_t N, const int32_t *a, const int32_t *b,
+                               int64_t *out) {
+    for (uint32_t k = 0; k < N; k++) out[k] = 0;
+    for (uint32_t i = 0; i < N; i++) {
+        for (uint32_t j = 0; j < N; j++) {
+            int64_t prod = (int64_t)a[i] * (int64_t)b[j];
+            uint32_t s = i + j;
+            if (s < N) out[s] += prod;
+            else       out[s - N] -= prod;
+        }
+    }
+    const int64_t M = SP_NTT_M;
+    for (uint32_t k = 0; k < N; k++) {
+        int64_t v = out[k] % M;
+        if (v < 0) v += M;
+        if (v > M / 2) v -= M;
+        out[k] = v;
+    }
+}
+
+/* ---- T_NTT5A_SCHOOLBOOK_CROSSCHECK (Stage 1) -----------------------------
+ * Cross-check the new schoolbook helpers against the EXISTING
+ * schoolbook_negacyclic on the overlapping N ∈ {128, 256}. This is the
+ * Stage 1 trust-the-oracle gate: if the two independent schoolbook
+ * implementations disagree, the Bluestein-vs-schoolbook gate is unreliable.
+ * The Stage 1 implementation skeleton of sp_pr_bluestein_init returns NULL
+ * for every N, so no actual Bluestein behavior is exercised at Stage 1. */
+static void T_NTT5A_SCHOOLBOOK_CROSSCHECK(void) {
+    rng_seed(0xCAFEF00D5A1A5A1Aull);
+    const uint32_t overlap_Ns[2] = { 128u, 256u };
+    for (int ni = 0; ni < 2; ni++) {
+        uint32_t N = overlap_Ns[ni];
+        int32_t *a = malloc(sizeof(int32_t) * N);
+        int32_t *b = malloc(sizeof(int32_t) * N);
+        int64_t *out_a = malloc(sizeof(int64_t) * N);
+        int64_t *out_b = malloc(sizeof(int64_t) * N);
+
+        int bad = 0;
+        for (int t = 0; t < 8 && !bad; t++) {
+            for (uint32_t i = 0; i < N; i++) {
+                a[i] = rng_coeff_blue();
+                b[i] = rng_coeff_blue();
+            }
+            schoolbook_negacyclic(N, a, b, out_a);    /* existing helper */
+            schoolbook_neg_mul   (N, a, b, out_b);    /* NTT.5a helper   */
+            for (uint32_t i = 0; i < N; i++)
+                if (out_a[i] != out_b[i]) { bad = 1; break; }
+
+            /* And the inner-product helper agrees with c_0 of the negacyclic
+             * product when k is the involuted form. */
+            int32_t *kinv = malloc(sizeof(int32_t) * N);
+            kinv[0] = b[0];
+            for (uint32_t j = 1; j < N; j++) kinv[j] = -b[N - j];
+            int64_t inner_ref = schoolbook_inner(N, a, b);
+            schoolbook_neg_mul(N, a, kinv, out_b);
+            if (out_b[0] != inner_ref) bad = 1;
+            free(kinv);
+        }
+        SP_CHECK(!bad, "T_NTT5A schoolbook oracle agrees with T_PR oracle");
+
+        free(a); free(b); free(out_a); free(out_b);
+    }
+
+    /* Stage 1 skeleton claim: sp_pr_bluestein_init returns NULL for every
+     * N before Stage 2 wires in the real implementation. This gate flips
+     * meaning at Stage 2 — at Stage 2+ we expect non-NULL for admissible N
+     * (T_NTT5A_NULL_FOR_INADMISSIBLE_N picks that up). */
+    SP_CHECK(sp_pr_bluestein_degree(NULL) == 0u,
+             "sp_pr_bluestein_degree(NULL) == 0");
+    sp_pr_bluestein_free(NULL);   /* must be safe */
+}
+
+/* ---- T_NTT5A_BLUESTEIN_BIT_EXACT_VS_SCHOOLBOOK (Stage 3) ----------------- */
+static void T_NTT5A_BLUESTEIN_BIT_EXACT_VS_SCHOOLBOOK(void) {
+    rng_seed(0xB1E5731411111111ull);
+    const int SEEDS_PER_N = 100;
+    int total_runs = 0;
+    int total_divergences = 0;
+    int per_N_divergences[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    int per_N_runs[8]        = { 0, 0, 0, 0, 0, 0, 0, 0 };
+
+    for (int ni = 0; ni < 8; ni++) {
+        uint32_t N = kBluesteinNs[ni];
+        sp_pr_bluestein_ctx *ctx = sp_pr_bluestein_init(N);
+        SP_CHECK(ctx != NULL, "sp_pr_bluestein_init returns ctx for admissible N");
+        if (!ctx) continue;
+        SP_CHECK_EQ_I64((int64_t)sp_pr_bluestein_degree(ctx), (int64_t)N,
+                        "sp_pr_bluestein_degree reports N");
+
+        int32_t *q = malloc(sizeof(int32_t) * N);
+        int32_t *k = malloc(sizeof(int32_t) * N);
+
+        for (int t = 0; t < SEEDS_PER_N; t++) {
+            for (uint32_t i = 0; i < N; i++) {
+                q[i] = rng_coeff_blue();
+                k[i] = rng_coeff_blue();
+            }
+            int64_t got  = sp_pr_bluestein_inner(ctx, q, k);
+            int64_t want = schoolbook_inner(N, q, k);
+            if (got != want) {
+                total_divergences++;
+                per_N_divergences[ni]++;
+            }
+            total_runs++;
+            per_N_runs[ni]++;
+        }
+
+        free(q); free(k);
+        sp_pr_bluestein_free(ctx);
+    }
+    fprintf(stderr,
+            "[T_NTT5A_BLUESTEIN_BIT_EXACT_VS_SCHOOLBOOK] runs=%d divergences=%d\n",
+            total_runs, total_divergences);
+    for (int ni = 0; ni < 8; ni++)
+        fprintf(stderr, "  N=%u: %d/%d divergences\n",
+                kBluesteinNs[ni], per_N_divergences[ni], per_N_runs[ni]);
+    SP_CHECK(total_divergences == 0,
+             "Bluestein inner is bit-exact vs schoolbook across all admissible N");
+}
+
+/* ---- T_NTT5A_VS_SP_PR_INNER_BIT_EXACT (Stage 3) -------------------------- */
+static void T_NTT5A_VS_SP_PR_INNER_BIT_EXACT(void) {
+    rng_seed(0x7E5701112201D0E5ull);
+    const uint32_t overlap_Ns[2] = { 128u, 256u };
+    const int SEEDS_PER_N = 100;
+    int total_runs = 0;
+    int total_divergences = 0;
+
+    for (int ni = 0; ni < 2; ni++) {
+        uint32_t N = overlap_Ns[ni];
+        sp_pr_ctx *direct = sp_pr_init(N);
+        sp_pr_bluestein_ctx *blue = sp_pr_bluestein_init(N);
+        SP_CHECK(direct && blue, "both contexts non-NULL for overlap N");
+        if (!direct || !blue) { sp_pr_free(direct); sp_pr_bluestein_free(blue); continue; }
+
+        int32_t *q = malloc(sizeof(int32_t) * N);
+        int32_t *k = malloc(sizeof(int32_t) * N);
+        for (int t = 0; t < SEEDS_PER_N; t++) {
+            for (uint32_t i = 0; i < N; i++) {
+                q[i] = rng_coeff_blue();
+                k[i] = rng_coeff_blue();
+            }
+            int64_t a = sp_pr_inner(direct, q, k);
+            int64_t b = sp_pr_bluestein_inner(blue, q, k);
+            if (a != b) total_divergences++;
+            total_runs++;
+        }
+        free(q); free(k);
+        sp_pr_free(direct);
+        sp_pr_bluestein_free(blue);
+    }
+    fprintf(stderr,
+            "[T_NTT5A_VS_SP_PR_INNER_BIT_EXACT] runs=%d divergences=%d\n",
+            total_runs, total_divergences);
+    SP_CHECK(total_divergences == 0,
+             "Bluestein inner == sp_pr_inner on overlapping N ∈ {128, 256}");
+}
+
+/* ---- T_NTT5A_BLUESTEIN_MUL_BIT_EXACT (Stage 4) --------------------------- */
+static void T_NTT5A_BLUESTEIN_MUL_BIT_EXACT(void) {
+    rng_seed(0xB1E573004D11D04Aull);
+    const int SEEDS_PER_N = 50;
+    int total_runs = 0;
+    int total_coeff_divergences = 0;
+    int per_N_coeff_divergences[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+
+    for (int ni = 0; ni < 8; ni++) {
+        uint32_t N = kBluesteinNs[ni];
+        sp_pr_bluestein_ctx *ctx = sp_pr_bluestein_init(N);
+        SP_CHECK(ctx != NULL, "sp_pr_bluestein_init for admissible N (mul gate)");
+        if (!ctx) continue;
+
+        int32_t *a   = malloc(sizeof(int32_t) * N);
+        int32_t *b   = malloc(sizeof(int32_t) * N);
+        int64_t *got = malloc(sizeof(int64_t) * N);
+        int64_t *ref = malloc(sizeof(int64_t) * N);
+
+        for (int t = 0; t < SEEDS_PER_N; t++) {
+            for (uint32_t i = 0; i < N; i++) {
+                a[i] = rng_coeff_blue();
+                b[i] = rng_coeff_blue();
+            }
+            sp_pr_bluestein_mul(ctx, a, b, got);
+            schoolbook_neg_mul (N, a, b, ref);
+            for (uint32_t i = 0; i < N; i++) {
+                if (got[i] != ref[i]) {
+                    total_coeff_divergences++;
+                    per_N_coeff_divergences[ni]++;
+                }
+            }
+            total_runs++;
+        }
+
+        free(a); free(b); free(got); free(ref);
+        sp_pr_bluestein_free(ctx);
+    }
+    fprintf(stderr,
+            "[T_NTT5A_BLUESTEIN_MUL_BIT_EXACT] runs=%d total-coeff-divergences=%d\n",
+            total_runs, total_coeff_divergences);
+    for (int ni = 0; ni < 8; ni++)
+        fprintf(stderr, "  N=%u: %d coeff divergences over %d runs\n",
+                kBluesteinNs[ni], per_N_coeff_divergences[ni], SEEDS_PER_N);
+    SP_CHECK(total_coeff_divergences == 0,
+             "Bluestein mul is bit-exact per-coefficient vs schoolbook");
+}
+
+/* ---- T_NTT5B_BACKEND_FORWARD_PASSTHROUGH (Stage 1) -----------------------
+ *
+ * Validates that sp_pr_bluestein_set_backend correctly routes the per-prime
+ * forward NTT through the supplied dispatch fn, with bit-exact output vs the
+ * no-backend host path. The stub forward implementation calls the public
+ * ntt_forward (which fuses both primes) and discards the wrong channel —
+ * functionally identical to math-core's per-prime forward_one, so the
+ * dispatched path must produce byte-identical output to the host path.
+ *
+ * Inverse is left NULL so pr_blue_convolve_M falls back to host ntt_inverse.
+ * This covers forward dispatch wiring; full forward+inverse dispatch is
+ * validated on-device by the Stage 3 smoke harness (which uses the real
+ * Hexagon HVX kernels via FastRPC).
+ *
+ * Stub forward: reinterpret the u32 input as int32 (values in [0, qP) fit
+ * trivially in int32 since q ≈ 2^30), call ntt_forward, keep the matching
+ * residue output channel.
+ */
+
+#include "sp/ntt_crt.h"   /* ntt_init/ntt_free/ntt_forward — only the existing
+                           * NTT.5a header chain pulls this in transitively */
+
+/* Cached inner ntt_ctx per M to avoid per-call init; one per M ∈ {128,256,512}. */
+typedef struct {
+    ntt_ctx *m128;
+    ntt_ctx *m256;
+    ntt_ctx *m512;
+} pr_blue_5b_stub_handle;
+
+static int pr_blue_5b_stub_forward(void *handle, int q_idx, int N,
+                                   const uint32_t *in, uint32_t *out) {
+    pr_blue_5b_stub_handle *h = (pr_blue_5b_stub_handle *)handle;
+    if (!h || !in || !out) return -1;
+    ntt_ctx *ctx = NULL;
+    if      (N == 128) ctx = h->m128;
+    else if (N == 256) ctx = h->m256;
+    else if (N == 512) ctx = h->m512;
+    if (!ctx) return -1;
+
+    /* Reinterpret u32 as int32: values in [0, qP) ⊂ [0, 2^30) → positive int32. */
+    const int32_t *in_i32 = (const int32_t *)in;
+    /* Per-prime: keep q_idx channel, discard the other. ntt_forward reduces
+     * each input by qP internally, so feeding the q1-prepared u32 values
+     * to the q2 channel would produce different (still valid) residues —
+     * but we only KEEP the channel matching q_idx, so the discard is fine. */
+    uint32_t *scratch = (uint32_t *)malloc(sizeof(uint32_t) * (size_t)N);
+    if (!scratch) return -1;
+    if (q_idx == 0) {
+        ntt_forward(ctx, in_i32, out, scratch);
+    } else if (q_idx == 1) {
+        ntt_forward(ctx, in_i32, scratch, out);
+    } else {
+        free(scratch);
+        return -1;
+    }
+    free(scratch);
+    return 0;
+}
+
+static void T_NTT5B_BACKEND_FORWARD_PASSTHROUGH(void) {
+    rng_seed(0x5B7B5B7B5B7B5B7Bull);
+    pr_blue_5b_stub_handle handle = {
+        .m128 = ntt_init(128u),
+        .m256 = ntt_init(256u),
+        .m512 = ntt_init(512u),
+    };
+    SP_CHECK(handle.m128 && handle.m256 && handle.m512,
+             "ntt_init succeeded for stub backend inner ctxs");
+
+    const uint32_t Ns[8] = { 2u, 4u, 8u, 16u, 32u, 64u, 128u, 256u };
+    const int SEEDS_PER_N = 20;
+    int total_runs = 0;
+    int total_coeff_div = 0;
+
+    for (int ni = 0; ni < 8; ni++) {
+        uint32_t N = Ns[ni];
+        sp_pr_bluestein_ctx *host_ctx = sp_pr_bluestein_init(N);
+        sp_pr_bluestein_ctx *disp_ctx = sp_pr_bluestein_init(N);
+        SP_CHECK(host_ctx && disp_ctx,
+                 "sp_pr_bluestein_init for both host + dispatch ctx");
+        if (!host_ctx || !disp_ctx) {
+            sp_pr_bluestein_free(host_ctx);
+            sp_pr_bluestein_free(disp_ctx);
+            continue;
+        }
+        /* Dispatch ctx routes forward through the stub; inverse stays NULL,
+         * so it falls back to host ntt_inverse on the host_ctx baseline path. */
+        sp_pr_bluestein_set_backend(disp_ctx, &handle,
+                                    pr_blue_5b_stub_forward, NULL);
+
+        int32_t *a   = malloc(sizeof(int32_t) * N);
+        int32_t *b   = malloc(sizeof(int32_t) * N);
+        int64_t *got = malloc(sizeof(int64_t) * N);
+        int64_t *ref = malloc(sizeof(int64_t) * N);
+
+        for (int t = 0; t < SEEDS_PER_N; t++) {
+            for (uint32_t i = 0; i < N; i++) {
+                a[i] = rng_coeff_blue();
+                b[i] = rng_coeff_blue();
+            }
+            sp_pr_bluestein_mul(host_ctx, a, b, ref);
+            sp_pr_bluestein_mul(disp_ctx, a, b, got);
+            for (uint32_t i = 0; i < N; i++) {
+                if (got[i] != ref[i]) total_coeff_div++;
+            }
+            total_runs++;
+        }
+        free(a); free(b); free(got); free(ref);
+        sp_pr_bluestein_free(host_ctx);
+        sp_pr_bluestein_free(disp_ctx);
+    }
+    ntt_free(handle.m128);
+    ntt_free(handle.m256);
+    ntt_free(handle.m512);
+
+    fprintf(stderr,
+            "[T_NTT5B_BACKEND_FORWARD_PASSTHROUGH] runs=%d coeff-divergences=%d\n",
+            total_runs, total_coeff_div);
+    SP_CHECK(total_coeff_div == 0,
+             "Bluestein forward dispatch passthrough is bit-exact vs host path");
+}
+
+/* ---- T_NTT5A_NULL_FOR_INADMISSIBLE_N (Stage 5) --------------------------- */
+static void T_NTT5A_NULL_FOR_INADMISSIBLE_N(void) {
+    /* N values that must return NULL:
+     *   - 1: degenerate
+     *   - 3, 5, 6, 7, 9: small non-powers-of-2 (odd factor blocks 2N-th root)
+     *   - 96, 100, 384: realistic but non-powers-of-2
+     *   - 512: powers-of-2 but excluded (direct sp_pr_init handles this)
+     *   - 1024: exceeds 2-adic valuation cap of the frozen primes
+     */
+    const uint32_t bad[] = { 1u, 3u, 5u, 6u, 7u, 9u, 96u, 100u, 384u, 512u, 1024u };
+    const int n_bad = (int)(sizeof(bad) / sizeof(bad[0]));
+    int all_null = 1;
+    for (int i = 0; i < n_bad; i++) {
+        sp_pr_bluestein_ctx *ctx = sp_pr_bluestein_init(bad[i]);
+        if (ctx != NULL) {
+            fprintf(stderr,
+                    "  [T_NTT5A_NULL_FOR_INADMISSIBLE_N] N=%u returned non-NULL\n",
+                    bad[i]);
+            all_null = 0;
+            sp_pr_bluestein_free(ctx);
+        }
+    }
+    SP_CHECK(all_null,
+             "sp_pr_bluestein_init returns NULL for every inadmissible N");
+}
+
 int main(void) {
     SP_RUN(T_PR_1);
     SP_RUN(T_PR_2);
     SP_RUN(T_PR_3);
     SP_RUN(T_PR_4);
+    SP_RUN(T_NTT5A_SCHOOLBOOK_CROSSCHECK);
+    SP_RUN(T_NTT5A_BLUESTEIN_BIT_EXACT_VS_SCHOOLBOOK);
+    SP_RUN(T_NTT5A_VS_SP_PR_INNER_BIT_EXACT);
+    SP_RUN(T_NTT5A_BLUESTEIN_MUL_BIT_EXACT);
+    SP_RUN(T_NTT5B_BACKEND_FORWARD_PASSTHROUGH);
+    SP_RUN(T_NTT5A_NULL_FOR_INADMISSIBLE_N);
     return SP_DONE();
 }

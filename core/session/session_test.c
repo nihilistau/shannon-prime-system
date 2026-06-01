@@ -853,6 +853,102 @@ static void T_PARITY_CROSS_LOAD_QWEN25(void) {
     sp_model_unload(m);
 }
 
+/* T_NTT5C_HD_64_BIT_EXACT_VS_FP32_TOP1 (NTT.5c Stage 1 gate).
+ *
+ * Validates that the new Bluestein-dispatched NTT-attention overlay in
+ * qwen25_forward_ex2 produces the SAME greedy-argmax token sequence as the
+ * fp32-attention baseline, on the qwen25 synthetic fixture (HD=8,
+ * power-of-2, Bluestein-admissible). HD=8 exercises the same code path
+ * that activates for HD=64 (Memory model Qwen2.5-Coder); the fixture
+ * being HD=8 just keeps the test fast.
+ *
+ * Methodology:
+ *   1. Build the qwen25 synthetic fixture (HD=8).
+ *   2. Load via sp_model_load + sp_session_create.
+ *   3. Baseline run: SP_ENGINE_NTT_ATTN unset; prefill + 5 decode steps;
+ *      record argmax sequence.
+ *   4. NTT-attention run: SP_ENGINE_NTT_ATTN=1; FRESH session; same prompt;
+ *      record argmax sequence.
+ *   5. Compare argmax sequences token-for-token.
+ *
+ * Pass criteria: argmax sequences match across all 5 positions. Per
+ * reference-lattice-decode-determinism, integer-NTT-attention's exact
+ * dot product matches fp32 dot product's argmax under the qwen25 forward
+ * shape; logits values may differ in low bits but argmax must be stable.
+ *
+ * Per feedback-no-silent-gate-revisions: if this gate fails, surface
+ * UPSTREAM, do NOT silently widen tolerance or skip. The first-divergence
+ * step number is logged for triage. */
+#ifdef _WIN32
+  #define SETENV(K, V) _putenv_s(K, V)
+  #define UNSETENV(K)  _putenv_s(K, "")
+#else
+  #include <stdlib.h>
+  #define SETENV(K, V) setenv(K, V, 1)
+  #define UNSETENV(K)  unsetenv(K)
+#endif
+
+static int run_q25_argmax_sequence(sp_model *m, uint32_t V, int *out_seq, int n_seq) {
+    sp_session *s = NULL;
+    sp_session_config cfg; memset(&cfg, 0, sizeof cfg); cfg.deterministic = 1;
+    if (sp_session_create(m, &cfg, NULL, &s) != SP_OK) return 1;
+    float *lg = (float *)malloc((size_t)V * sizeof(float));
+    if (!lg) { sp_session_destroy(s); return 1; }
+    if (sp_prefill_chunk(s, TOKS, NTOK, lg, V) != SP_OK) {
+        free(lg); sp_session_destroy(s); return 1;
+    }
+    out_seq[0] = argmax_f(lg, V);
+    for (int k = 1; k < n_seq; k++) {
+        if (sp_decode_step(s, out_seq[k - 1], lg, V) != SP_OK) {
+            free(lg); sp_session_destroy(s); return 1;
+        }
+        out_seq[k] = argmax_f(lg, V);
+    }
+    free(lg); sp_session_destroy(s);
+    return 0;
+}
+
+static void T_NTT5C_HD_64_BIT_EXACT_VS_FP32_TOP1(void) {
+    sp_qwen25_fixture_info info; sp_model *m = NULL;
+    SP_CHECK(load_q25_fixture(&info, &m) == 0, "Qwen2.5 fixture load (HD=8 Bluestein-admissible)");
+    if (!m) { cleanup_q25_files(); return; }
+    const uint32_t V = info.n_vocab;
+    enum { NSEQ = 5 };
+
+    /* Baseline: NTT-attention OFF. */
+    UNSETENV("SP_ENGINE_NTT_ATTN");
+    int seq_baseline[NSEQ] = {0};
+    int rc1 = run_q25_argmax_sequence(m, V, seq_baseline, NSEQ);
+    SP_CHECK(rc1 == 0, "baseline (NTT_ATTN unset) prefill+decode sequence completes");
+
+    /* NTT-attention overlay ON (Bluestein for HD=8). */
+    SETENV("SP_ENGINE_NTT_ATTN", "1");
+    int seq_ntt[NSEQ] = {0};
+    int rc2 = run_q25_argmax_sequence(m, V, seq_ntt, NSEQ);
+    SP_CHECK(rc2 == 0, "NTT_ATTN=1 (HD=8 Bluestein) prefill+decode sequence completes");
+    UNSETENV("SP_ENGINE_NTT_ATTN");
+
+    /* Compare argmax sequences token-for-token. */
+    int matched = 1, first_div = -1;
+    for (int k = 0; k < NSEQ; k++) {
+        if (seq_baseline[k] != seq_ntt[k]) { matched = 0; first_div = k; break; }
+    }
+    if (!matched) {
+        fprintf(stderr, "    [NTT5C-top1] baseline = [");
+        for (int k = 0; k < NSEQ; k++) fprintf(stderr, "%d%s", seq_baseline[k], k+1<NSEQ?",":"");
+        fprintf(stderr, "]\n    [NTT5C-top1] ntt      = [");
+        for (int k = 0; k < NSEQ; k++) fprintf(stderr, "%d%s", seq_ntt[k], k+1<NSEQ?",":"");
+        fprintf(stderr, "]\n    [NTT5C-top1] first divergence at step %d\n", first_div);
+    } else {
+        fprintf(stderr, "    [NTT5C-top1] argmax sequence matches: [%d,%d,%d,%d,%d]\n",
+                seq_baseline[0], seq_baseline[1], seq_baseline[2],
+                seq_baseline[3], seq_baseline[4]);
+    }
+    SP_CHECK(matched, "NTT_ATTN=1 argmax sequence == baseline (HD=8 Bluestein top-1 bit-exact)");
+
+    sp_model_unload(m); cleanup_q25_files();
+}
+
 int main(void) {
     SP_RUN(T_PARITY_KV_SPINOR);
     SP_RUN(T_PARITY_Q4_BRIDGE);
@@ -873,5 +969,6 @@ int main(void) {
     SP_RUN(T_QWEN25_ALIAS);
     SP_RUN(T_QWEN25_DECODE_TRAJECTORY);
     SP_RUN(T_PARITY_CROSS_LOAD_QWEN25);
+    SP_RUN(T_NTT5C_HD_64_BIT_EXACT_VS_FP32_TOP1);
     return SP_DONE();
 }

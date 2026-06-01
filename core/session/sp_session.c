@@ -52,6 +52,18 @@ struct sp_session {
     size_t             kv_filled;   /* positions [0, kv_filled) hold valid KV */
     /* per-step scratch */
     float *sx, *snx, *sq, *sknew, *svnew, *sao, *sap, *sgg, *sup, *sdn, *ssc;
+    /* ── Sprint NTT.5b: optional compute backend (FastRPC dispatcher or other).
+     * NULL fields = host path. Set via sp_session_register_compute_backend.
+     * Caller owns `compute_backend_handle`; we only re-emit it to the dispatch
+     * fn pointers (we never dereference it ourselves). */
+    void                       *compute_backend_handle;
+    sp_compute_ntt_dispatch_fn  compute_backend_forward;
+    sp_compute_ntt_dispatch_fn  compute_backend_inverse;
+    /* ── Sprint WIRE-HEX: optional full-forward backend (engine's per-backend
+     * gemma3_forward_hexagon / _cuda / _vulkan). NULL = host reference path.
+     * Set via sp_session_register_forward_backend. Caller owns the handle. */
+    void                       *forward_backend_handle;
+    sp_forward_dispatch_fn      forward_backend_fn;
 };
 
 static int cancelled(const sp_session *s) { return (s->cancel && *s->cancel) ? 1 : 0; }
@@ -144,12 +156,44 @@ sp_status sp_prefill_chunk(sp_session *s, const int32_t *tokens, size_t n_tokens
 
     float *tmp = (float *)malloc(new_len * (size_t)s->n_vocab * sizeof(float));
     if (!tmp) { sp_set_error("sp_prefill_chunk: OOM (logits scratch)"); return SP_ENOMEM; }
+    /* NTT.5c: extract the session's registered compute backend (NTT.5b
+     * sp_session_register_compute_backend) and pass it as an explicit
+     * triple to the forward's _ex2 entry point. This avoids a circular
+     * dependency between the forward and session CMake modules — the
+     * forward TU stays ignorant of struct sp_session entirely.
+     *
+     * The `_ex2` variants thread the triple into sp_pr_bluestein_set_backend
+     * inside the NTT-attention overlay when SP_ENGINE_NTT_ATTN=1 + HD ∈
+     * {2..256} ∖ {512} + at least one backend pointer is non-NULL. All
+     * three NULL = host-only path. */
+    void *bh                            = s->compute_backend_handle;
+    sp_compute_ntt_dispatch_fn bfwd     = s->compute_backend_forward;
+    sp_compute_ntt_dispatch_fn binv     = s->compute_backend_inverse;
     sp_arch_t _arch = s->qm->cfg.arch;
-    int frc = (_arch == SP_ARCH_GEMMA3) ? gemma3_forward(s->qm, s->hist, (int)new_len, tmp)
-            : (_arch == SP_ARCH_QWEN25)  ? qwen25_forward(s->qm, s->hist, (int)new_len, tmp)
-            :                              qwen3_forward(s->qm, s->hist, (int)new_len, tmp);
+    /* Sprint WIRE-HEX: if a full-forward backend is registered (e.g. the
+     * engine's gemma3_forward_hexagon via the daemon's android trampoline),
+     * dispatch through IT instead of the math-core reference forward. The
+     * backend re-runs the full forward over the accumulated history (same
+     * shape as the reference) and writes the full [new_len * n_vocab] logits
+     * into `tmp`; we extract the last position the same way either path. */
+    int frc;
+    if (s->forward_backend_fn) {
+        frc = s->forward_backend_fn(s->forward_backend_handle,
+                                    (const void *)s->qm,
+                                    s->hist, (int)new_len, tmp);
+    } else {
+        frc = (_arch == SP_ARCH_GEMMA3) ? gemma3_forward_ex2(s->qm, s->hist, (int)new_len, tmp,    bh, bfwd, binv)
+            : (_arch == SP_ARCH_QWEN25)  ? qwen25_forward_ex2(s->qm, s->hist, (int)new_len, tmp,    bh, bfwd, binv)
+            :                              qwen3_forward_ex2 (s->qm, s->hist, (int)new_len, tmp, NULL, bh, bfwd, binv);
+    }
     if (frc != 0) {
-        free(tmp); sp_set_error("sp_prefill_chunk: forward failed"); return SP_EBADSTATE;
+        /* Preserve any inner sp_set_error detail from the dispatched fn
+         * (e.g. sp_hex_host.c's "hexagon: ..." strings) — only overwrite
+         * with a generic message if no detail is present yet. */
+        const char *prev = sp_last_error();
+        if (!prev || prev[0] == '\0') sp_set_error("sp_prefill_chunk: forward failed");
+        free(tmp);
+        return SP_EBADSTATE;
     }
     memcpy(logits_last, tmp + (new_len - 1) * (size_t)s->n_vocab, (size_t)s->n_vocab * sizeof(float));
     free(tmp);
@@ -529,6 +573,17 @@ sp_status sp_session_clone(const sp_session *s, volatile int *cancel_flag, sp_se
     sp_session *c = *out;
     memcpy(c->hist, s->hist, s->pos * sizeof(int32_t));
     c->pos = s->pos;
+    /* Sprint WIRE-HEX + NTT.5b: propagate registered backends to the clone so
+     * the fork hits the same accelerator dispatch path as the parent. Both
+     * handle lifetimes are caller-owned (sp_l1.h:§5,§6); clone borrows the
+     * same handle pointers (no deep copy of opaque state). The parent's
+     * SpSession-side lifetime guard (AppState Arc) keeps them alive past the
+     * clone's last use. */
+    c->compute_backend_handle  = s->compute_backend_handle;
+    c->compute_backend_forward = s->compute_backend_forward;
+    c->compute_backend_inverse = s->compute_backend_inverse;
+    c->forward_backend_handle  = s->forward_backend_handle;
+    c->forward_backend_fn      = s->forward_backend_fn;
     if (s->kc || s->kcb) {   /* deep-copy the live KV so the fork doesn't re-prefill */
         if (ensure_decode_bufs(c)) { sp_session_destroy(c); *out = NULL; sp_set_error("sp_session_clone: OOM (KV)"); return SP_ENOMEM; }
         const qwen3_config *cf = &c->qm->cfg;
@@ -553,4 +608,83 @@ sp_status sp_session_rewind(sp_session *s, size_t n_tokens) {
     s->pos -= n_tokens;
     if (s->kv_filled > s->pos) s->kv_filled = s->pos;   /* KV beyond the new position is stale */
     return SP_OK;
+}
+
+/* ── §5 Sprint NTT.5b: compute-backend registration + readback ───────────────
+ *
+ * The fields are calloc-zeroed at sp_session_create, so a session that never
+ * calls the registration fn is implicitly "host path only" — every consumer
+ * that reads via the getters sees NULL and falls back. The register fn
+ * stores (handle, forward, inverse) on the session; the getters are how
+ * math-core (currently sp_pr_bluestein_*) opts in to dispatch. The handle
+ * lifetime contract is in sp_l1.h.
+ *
+ * Validation: NULL session → SP_EBADARG. All-NULL handle+forward+inverse is
+ * the explicit "unregister" call (zeroes the fields). A partially-NULL
+ * combination (e.g. handle non-NULL but forward NULL) is accepted as written —
+ * downstream consumers MUST check the specific fn pointer they need before
+ * dispatching, and fall back when it's NULL. This matches the per-direction
+ * fallback the math-core wrappers implement. */
+sp_status sp_session_register_compute_backend(
+    sp_session *s,
+    void *handle,
+    sp_compute_ntt_dispatch_fn forward,
+    sp_compute_ntt_dispatch_fn inverse) {
+    if (!s) { sp_set_error("sp_session_register_compute_backend: null session"); return SP_EBADARG; }
+    s->compute_backend_handle  = handle;
+    s->compute_backend_forward = forward;
+    s->compute_backend_inverse = inverse;
+    return SP_OK;
+}
+
+void *sp_session_compute_backend_handle(const sp_session *s) {
+    return s ? s->compute_backend_handle : NULL;
+}
+
+sp_compute_ntt_dispatch_fn sp_session_compute_backend_forward(const sp_session *s) {
+    return s ? s->compute_backend_forward : NULL;
+}
+
+sp_compute_ntt_dispatch_fn sp_session_compute_backend_inverse(const sp_session *s) {
+    return s ? s->compute_backend_inverse : NULL;
+}
+
+/* ── §6 Sprint WIRE-HEX: forward-backend registration + readback ───────────
+ *
+ * Plumbs the engine's per-backend full-forward entry points (currently
+ * gemma3_forward_hexagon; future _cuda / _vulkan) into sp_prefill_chunk so
+ * the daemon's chat path actually exercises accelerator silicon instead of
+ * the math-core reference. Decode (persistent KV) stays on the reference
+ * path — backend forwards don't expose a persistent-KV API. See sp_l1.h §6
+ * for the full ABI contract + lifetime rules.
+ *
+ * Validation: NULL session → SP_EBADARG. NULL handle + NULL fn is the
+ * "unregister" call (zeroes the fields). Both fields are calloc-zeroed at
+ * session create, so a session that never calls the registration fn keeps
+ * the existing math-core dispatch unchanged — backward-compatible with
+ * every existing daemon + smoke harness. */
+sp_status sp_session_register_forward_backend(
+    sp_session *s,
+    void *handle,
+    sp_forward_dispatch_fn fn) {
+    if (!s) { sp_set_error("sp_session_register_forward_backend: null session"); return SP_EBADARG; }
+    s->forward_backend_handle = handle;
+    s->forward_backend_fn     = fn;
+    return SP_OK;
+}
+
+void *sp_session_forward_backend_handle(const sp_session *s) {
+    return s ? s->forward_backend_handle : NULL;
+}
+
+sp_forward_dispatch_fn sp_session_forward_backend_fn(const sp_session *s) {
+    return s ? s->forward_backend_fn : NULL;
+}
+
+/* Borrowed accessor for the session's internal qwen3_model pointer. Returned
+ * as const void * to keep sp_l1.h free of qwen3_model's definition (which
+ * lives in sp/model.h, the engine-bridge header); the daemon-side trampoline
+ * casts back to const qwen3_model * before handing off to the backend. */
+const void *sp_session_qwen3_model(const sp_session *s) {
+    return s ? (const void *)s->qm : NULL;
 }

@@ -24,6 +24,7 @@
 #include "sp/forward_dispatch.h"   /* sp_matmul / sp_embed_row / sp_as_f32 / sp_kernels_read_env */
 #include "sp/forward_kernels.h"    /* sp_rmsnorm / sp_rmsnorm_head / sp_rope_neox / sp_attn_head */
 #include "sp/poly_ring.h"          /* sp_pr_init / sp_pr_inner / sp_pr_free (NTT-attention overlay) */
+#include "sp/poly_ring_bluestein.h"/* NTT.5a Bluestein wrapper for HD ∈ {2..256} ∖ {512} (NTT.5c) */
 #include "sp/spinor_block.h"       /* sp_spinor_* + the frozen 63-byte KV block contract */
 
 #include <stdlib.h>
@@ -81,8 +82,11 @@ static void read_env_knobs(void) {
     { const char *e = getenv("SP_KV_SPINOR_REF");   g_kv_spinor_ref = (e && e[0] == '1'); }
 }
 
-int qwen3_forward_ex(const qwen3_model *m, const int32_t *tokens, int n_tok,
-                     float *logits, sp_kste_tree_t *kv_trees) {
+int qwen3_forward_ex2(const qwen3_model *m, const int32_t *tokens, int n_tok,
+                      float *logits, sp_kste_tree_t *kv_trees,
+                      void *backend_handle,
+                      sp_compute_ntt_dispatch_fn backend_forward,
+                      sp_compute_ntt_dispatch_fn backend_inverse) {
     const qwen3_config *c = &m->cfg;
     const int E = (int)c->n_embd, FF = (int)c->n_ff, HD = (int)c->head_dim;
     const int NH = (int)c->n_head, NKV = (int)c->n_head_kv;
@@ -96,7 +100,14 @@ int qwen3_forward_ex(const qwen3_model *m, const int32_t *tokens, int n_tok,
     read_env_knobs();
 
     int rc = 1;
-    sp_pr_ctx *pr = NULL;          /* poly-ring context for NTT-attention (N=head_dim) */
+    /* NTT.5c: dispatch on HD between direct sp_pr (HD ∈ {128,256,512}) and
+     * Bluestein-wrapped sp_pr_bluestein (HD ∈ {2,4,8,16,32,64,128,256}).
+     * Direct is faster for HD ∈ {128,256,512} (no zero-pad); Bluestein is
+     * required for HD ∈ {2..64}. HD with odd factors leaves both NULL →
+     * overlay disabled (fp32 attention via sp_attn_head). */
+    sp_pr_ctx           *pr   = NULL;
+    sp_pr_bluestein_ctx *pr_b = NULL;
+    int overlay_active = 0;        /* set in init block when at least one ctx alloc'd */
     int32_t *qi = NULL, *ki = NULL;
     int32_t *kq = NULL;            /* int32 scratch for KSTE KV encoding */
     float *x   = (float *)malloc((size_t)n_tok * E * sizeof(float));   /* residual stream */
@@ -113,10 +124,36 @@ int qwen3_forward_ex(const qwen3_model *m, const int32_t *tokens, int n_tok,
     if (!x || !nx || !q || !k || !v || !ao || !ap || !g || !up || !dn || !sc) goto done;
 
     if (g_ntt_attn) {
-        pr = sp_pr_init((uint32_t)HD);          /* head_dim must be in {128,256,512} */
-        qi = (int32_t *)malloc((size_t)HD * sizeof(int32_t));
-        ki = (int32_t *)malloc((size_t)HD * sizeof(int32_t));
-        if (!pr || !qi || !ki) goto done;
+        /* HD dispatch — see comment above. */
+        if (HD == 128 || HD == 256 || HD == 512) {
+            pr = sp_pr_init((uint32_t)HD);
+            if (pr) overlay_active = 1;
+        } else if (HD >= 2 && HD <= 256 && (HD & (HD - 1)) == 0) {
+            pr_b = sp_pr_bluestein_init((uint32_t)HD);
+            if (pr_b) {
+                overlay_active = 1;
+                /* NTT.5c: if a compute backend triple was passed in
+                 * (NTT.5b path; SP_ENGINE_NTT_ATTN_HEX=1 daemon side
+                 * routes through here via sp_prefill_chunk extracting the
+                 * session's registered backend via the L1 readback
+                 * accessors), thread it through to the Bluestein ctx. The
+                 * setter is a no-op when all three are NULL. */
+                if (backend_handle || backend_forward || backend_inverse)
+                    sp_pr_bluestein_set_backend(pr_b, backend_handle,
+                                                backend_forward,
+                                                backend_inverse);
+            }
+        }
+        /* If HD has odd factors > 1 (e.g. 96, 192, 288, 384) both ctx stay
+         * NULL — overlay_active stays 0; the attention loop below falls
+         * through to the standard fp32 sp_attn_head path. Banned: do NOT
+         * propose mixed-radix or zero-padding HD (see
+         * reference-ntt-bluestein-arbitrary-n-escape). */
+        if (overlay_active) {
+            qi = (int32_t *)malloc((size_t)HD * sizeof(int32_t));
+            ki = (int32_t *)malloc((size_t)HD * sizeof(int32_t));
+            if (!qi || !ki) goto done;
+        }
     }
     if (kv_trees) {
         kq = (int32_t *)malloc((size_t)HD * sizeof(int32_t));
@@ -185,7 +222,11 @@ int qwen3_forward_ex(const qwen3_model *m, const int32_t *tokens, int n_tok,
                 int kvh = h / group;
                 const float *qh = q + (size_t)t * QD + (size_t)h * HD;
                 float *out = ao + (size_t)t * QD + (size_t)h * HD;
-                if (!g_ntt_attn) {
+                if (!g_ntt_attn || !overlay_active) {
+                    /* NTT.5c: overlay_active=0 covers both (a) g_ntt_attn=0
+                     * (env gate off) and (b) g_ntt_attn=1 but HD is not in
+                     * the Bluestein/direct admissible set (HD with odd
+                     * factors). Both cases route through fp32 sp_attn_head. */
                     sp_attn_head(qh, k, v, t, KVD, kvh, HD, ascale, -1, sc, out);
                     continue;
                 }
@@ -194,7 +235,11 @@ int qwen3_forward_ex(const qwen3_model *m, const int32_t *tokens, int n_tok,
                 for (int s = 0; s <= t; s++) {
                     const float *kh = k + (size_t)s * KVD + (size_t)kvh * HD;
                     for (int i = 0; i < HD; i++) ki[i] = (int32_t)lrintf(kh[i] * (float)SP_NTT_ATTN_SCALE);
-                    int64_t ip = sp_pr_inner(pr, qi, ki);   /* exact <q_int,k_int> */
+                    /* NTT.5c dispatch: pr_b (Bluestein) for HD ∈ {2..64,128,256}
+                     * when picked above; pr (direct) for HD ∈ {128,256,512}. At
+                     * most one of the two is non-NULL per overlay_active=1. */
+                    int64_t ip = pr_b ? sp_pr_bluestein_inner(pr_b, qi, ki)
+                                      : sp_pr_inner(pr, qi, ki);
                     float d = (float)((double)ip / (SP_NTT_ATTN_SCALE * SP_NTT_ATTN_SCALE)) * ascale;
                     sc[s] = d;
                     if (d > maxs) maxs = d;
@@ -237,12 +282,23 @@ int qwen3_forward_ex(const qwen3_model *m, const int32_t *tokens, int n_tok,
 done:
     free(x); free(nx); free(q); free(k); free(v); free(ao); free(ap);
     free(g); free(up); free(dn); free(sc);
-    free(qi); free(ki); free(kq); sp_pr_free(pr);
+    free(qi); free(ki); free(kq);
+    sp_pr_free(pr);
+    sp_pr_bluestein_free(pr_b);                 /* NTT.5c: free the Bluestein ctx if used */
     return rc;
 }
 
+/* NTT.5c: legacy entry points become wrappers passing the all-NULL backend
+ * triple (= host path). Existing callers (tools/probe, qwen3_generate,
+ * qwen3_forward_test) keep working unchanged; only sp_prefill_chunk has been
+ * updated to call _ex2 with the L1 session's registered backend. */
+int qwen3_forward_ex(const qwen3_model *m, const int32_t *tokens, int n_tok,
+                     float *logits, sp_kste_tree_t *kv_trees) {
+    return qwen3_forward_ex2(m, tokens, n_tok, logits, kv_trees, NULL, NULL, NULL);
+}
+
 int qwen3_forward(const qwen3_model *m, const int32_t *tokens, int n_tok, float *logits) {
-    return qwen3_forward_ex(m, tokens, n_tok, logits, NULL);
+    return qwen3_forward_ex2(m, tokens, n_tok, logits, NULL, NULL, NULL, NULL);
 }
 
 /* Persistent-KV O(n) greedy decode (GEN_KV). Each token is processed once: per-layer

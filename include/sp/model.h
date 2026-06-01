@@ -128,6 +128,58 @@ int qwen25_forward(const qwen3_model *m, const int32_t *tokens, int n_tokens,
 int qwen3_forward_ex(const qwen3_model *m, const int32_t *tokens, int n_tokens,
                      float *logits, sp_kste_tree_t *kv_trees);
 
+/* ── Sprint NTT.5c: backend-aware forward variants ──────────────────────────
+ *
+ * As qwen3_forward_ex / gemma3_forward / qwen25_forward, but additionally
+ * accepting an OPTIONAL compute-backend triple (handle, forward fn pointer,
+ * inverse fn pointer) so the NTT-attention overlay (gated by
+ * SP_ENGINE_NTT_ATTN=1) can route inner Bluestein NTT calls through a
+ * caller-supplied dispatcher (typically the daemon's FastRPC/Hexagon
+ * trampoline registered via sp_session_register_compute_backend in NTT.5b).
+ *
+ * Why a raw triple instead of `const sp_session*`? Two reasons:
+ *   1. ARCHITECTURAL: the `forward` library and the `session` library form
+ *      a dependency cycle if forward calls back into session accessors
+ *      (session DEPENDS sp_forward via CMake). Passing the triple keeps
+ *      `forward` ignorant of struct sp_session entirely; sp_prefill_chunk
+ *      in sp_session.c is the bridge that extracts the triple via the L1
+ *      readback accessors and forwards it.
+ *   2. REUSABILITY: any caller (not just sp_session) can supply a backend
+ *      triple. tools/probe could attach a backend without an L1 session.
+ *
+ * Pass `backend_handle=NULL && backend_forward=NULL && backend_inverse=NULL`
+ * to opt out (the host-only Bluestein path). Partially-NULL combinations
+ * are honored per the per-direction NULL fallback in sp_pr_bluestein_set_backend.
+ *
+ * The existing _ex / non-_ex entry points are preserved as thin wrappers
+ * passing the all-NULL triple, so non-L1 callers (tools/probe,
+ * qwen3_generate) keep working unchanged.
+ *
+ * Stable since NTT.5c (2026-05-31). See PLAN-NTT-5c.md §"Session-pointer
+ * threading analysis" for the rationale. The triple type is
+ * sp_compute_ntt_dispatch_fn from sp/sp_l1.h. */
+
+/* Pulls in sp_compute_ntt_dispatch_fn (the canonical L1 typedef). */
+#include "sp/sp_l1.h"
+
+int qwen3_forward_ex2 (const qwen3_model *m, const int32_t *tokens, int n_tokens,
+                       float *logits, sp_kste_tree_t *kv_trees,
+                       void *backend_handle,
+                       sp_compute_ntt_dispatch_fn backend_forward,
+                       sp_compute_ntt_dispatch_fn backend_inverse);
+
+int gemma3_forward_ex2(const qwen3_model *m, const int32_t *tokens, int n_tokens,
+                       float *logits,
+                       void *backend_handle,
+                       sp_compute_ntt_dispatch_fn backend_forward,
+                       sp_compute_ntt_dispatch_fn backend_inverse);
+
+int qwen25_forward_ex2(const qwen3_model *m, const int32_t *tokens, int n_tokens,
+                       float *logits,
+                       void *backend_handle,
+                       sp_compute_ntt_dispatch_fn backend_forward,
+                       sp_compute_ntt_dispatch_fn backend_inverse);
+
 /* Greedy (argmax) autoregressive generation. `seq` holds `n_prompt` prompt token
  * IDs and must have capacity for at least n_prompt + n_gen entries; generated
  * tokens are appended in place. Stops after n_gen tokens, or earlier if `eos_id`
