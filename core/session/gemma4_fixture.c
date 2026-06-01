@@ -22,10 +22,13 @@
 #define FX_HD_S   8u
 #define FX_NH_S   4u
 #define FX_NKV_S  2u
-/* global geometry */
+/* global geometry — REAL Gemma4 shape: n_head / n_head_kv are CONSTANT across
+ * layer types, head_dim is per-layer (global 16 / SWA 8), so the Q/K/V projection
+ * widths DIFFER per layer (SWA QD=32/KVD=16, global QD=64/KVD=32). This exercises
+ * the per-layer-width path in gemma4_forward / kv_step_gemma4. */
 #define FX_HD_G   16u
-#define FX_NH_G   2u
-#define FX_NKV_G  1u
+#define FX_NH_G   4u      /* == FX_NH_S  (constant n_head)    */
+#define FX_NKV_G  2u      /* == FX_NKV_S (constant n_head_kv) */
 #define FX_TOKBLOB 64u
 #define FX_MAXT   320
 
@@ -132,8 +135,8 @@ int sp_gemma4_fixture_build(uint8_t **model_buf, uint8_t **tok_buf,
     tspec T[FX_MAXT];
     int n = 0, rc = 0;
     char nm[96];
-    const uint32_t QD = FX_NH_G * FX_HD_G;   /* == FX_NH_S*FX_HD_S = 32 */
-    const uint32_t KVD = FX_NKV_G * FX_HD_G; /* == FX_NKV_S*FX_HD_S = 16 */
+    /* Q/K/V projection widths are PER-LAYER now (qd=nh*hd, kvd=nkv*hd with nh/nkv
+     * constant and hd per-layer); computed inside the layer loop below. */
 
     rc |= add_q8 (T, &n, "token_embd.weight",          FX_V, FX_E, 1u);
     rc |= add_q8 (T, &n, "per_layer_token_embd.weight", FX_V, FX_PL * FX_NL, 2u);
@@ -144,12 +147,16 @@ int sp_gemma4_fixture_build(uint8_t **model_buf, uint8_t **tok_buf,
     for (uint32_t L = 0; L < FX_NL && !rc; L++) {
         const int global = ((L % FX_PERIOD) == FX_PERIOD - 1u);
         const uint32_t hd  = global ? FX_HD_G  : FX_HD_S;
+        const uint32_t nh  = global ? FX_NH_G  : FX_NH_S;   /* constant, but keep explicit */
+        const uint32_t nkv = global ? FX_NKV_G : FX_NKV_S;
+        const uint32_t qd  = nh * hd;     /* per-layer Q width  (SWA 32 / global 64) */
+        const uint32_t kvd = nkv * hd;    /* per-layer KV width (SWA 16 / global 32) */
         const uint32_t s = (L + 1u) * 17u;
         snprintf(nm, sizeof nm, "blk.%u.attn_norm.weight",          L); rc |= add_f32(T, &n, nm, FX_E, 0.9f);
-        snprintf(nm, sizeof nm, "blk.%u.attn_q.weight",             L); rc |= add_q8 (T, &n, nm, QD,  FX_E, s+1u);
-        snprintf(nm, sizeof nm, "blk.%u.attn_k.weight",             L); rc |= add_q8 (T, &n, nm, KVD, FX_E, s+2u);
-        snprintf(nm, sizeof nm, "blk.%u.attn_v.weight",             L); rc |= add_q8 (T, &n, nm, KVD, FX_E, s+3u);
-        snprintf(nm, sizeof nm, "blk.%u.attn_output.weight",        L); rc |= add_q8 (T, &n, nm, FX_E, QD, s+4u);
+        snprintf(nm, sizeof nm, "blk.%u.attn_q.weight",             L); rc |= add_q8 (T, &n, nm, qd,  FX_E, s+1u);
+        snprintf(nm, sizeof nm, "blk.%u.attn_k.weight",             L); rc |= add_q8 (T, &n, nm, kvd, FX_E, s+2u);
+        snprintf(nm, sizeof nm, "blk.%u.attn_v.weight",             L); rc |= add_q8 (T, &n, nm, kvd, FX_E, s+3u);
+        snprintf(nm, sizeof nm, "blk.%u.attn_output.weight",        L); rc |= add_q8 (T, &n, nm, FX_E, qd, s+4u);
         snprintf(nm, sizeof nm, "blk.%u.attn_q_norm.weight",        L); rc |= add_f32(T, &n, nm, hd, 0.95f);
         snprintf(nm, sizeof nm, "blk.%u.attn_k_norm.weight",        L); rc |= add_f32(T, &n, nm, hd, 0.95f);
         snprintf(nm, sizeof nm, "blk.%u.post_attention_norm.weight", L); rc |= add_f32(T, &n, nm, FX_E, 0.9f);
