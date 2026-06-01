@@ -21,6 +21,6 @@ include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/sp_module.cmake)
 sp_add_module(session
     SOURCES      sp_session.c sp_model_bridge.c
     TEST         session_test.c
-    TEST_SOURCES qwen3_fixture.c gemma3_fixture.c qwen25_fixture.c
+    TEST_SOURCES qwen3_fixture.c gemma3_fixture.c gemma4_fixture.c qwen25_fixture.c
     TEST_NAME    T_SESSION
     DEPENDS      sp_io_format sp_forward sp_model sp_arena sp_frobenius sp_io_hash)
