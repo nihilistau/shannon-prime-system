@@ -572,8 +572,11 @@ static int kv_step_gemma4(sp_session *s, int32_t tok, int pos, float *out_logits
     const int   s_nh = (int)c->g4_nh_swa, s_nkv = (int)c->g4_nkv_swa, s_hd = (int)c->g4_hd_swa;
     const float g_base = c->rope_freq_base, s_base = c->g4_rope_base_swa;
     const int   SW = (int)c->sliding_window;
-    const int   QD  = g_nh * g_hd;     /* == s_nh*s_hd (constant proj width) */
-    const int   KVD = g_nkv * g_hd;    /* == s_nkv*s_hd (constant proj width) */
+    /* Real Gemma4: constant n_head/n_head_kv, per-layer head_dim → per-layer Q/K/V
+     * projection widths. The persistent cache slot is strided by KVD_cache (the
+     * max == global KVD); each layer writes/reads its own kvd contiguously within
+     * that slot (kvd <= KVD_cache). */
+    const int   KVD_cache = g_nkv * g_hd;   /* global KVD (max); cache slot stride */
     const int   P = (int)s->hist_cap;
     float *x = s->sx, *nx = s->snx, *q = s->sq, *knew = s->sknew, *vnew = s->svnew;
     float *ao = s->sao, *ap = s->sap, *gg = s->sgg, *up = s->sup, *dn = s->sdn, *sc = s->ssc;
@@ -617,13 +620,15 @@ static int kv_step_gemma4(sp_session *s, int32_t tok, int pos, float *out_logits
         const int   nkv = global ? g_nkv : s_nkv;
         const int   hd  = global ? g_hd  : s_hd;
         const int   grp = nh / nkv;
+        const int   qd  = nh * hd;     /* per-layer Q proj width */
+        const int   kvd = nkv * hd;    /* per-layer KV width (== owner's for reuse pairs) */
         const float rbase = global ? g_base : s_base;
         const float *ff = global ? sp_as_f32(m, m->rope_freqs) : NULL;
         const int   win = global ? -1 : SW;
         const float ascale = 1.0f;   /* Gemma4: self.scaling = 1.0 */
 
         sp_rmsnorm(x, sp_as_f32(m, ly->attn_norm), E, eps, nx);
-        if (sp_matmul(m, ly->attn_q, nx, 1, E, QD, q)) { free(ipl); free(pgate); free(pproj); free(ple); return 1; }
+        if (sp_matmul(m, ly->attn_q, nx, 1, E, qd, q)) { free(ipl); free(pgate); free(pproj); free(ple); return 1; }
         const float *qn = sp_as_f32(m, ly->attn_q_norm);
         for (int h = 0; h < nh; h++) {
             float *qh = q + (size_t)h * hd;
@@ -631,13 +636,15 @@ static int kv_step_gemma4(sp_session *s, int32_t tok, int pos, float *out_logits
             sp_rope_neox_freqs(qh, hd, pos, rbase, ff);
         }
 
-        /* KV: owner layers compute + store K/V[pos]; shared layers reuse owner. */
+        /* KV: owner layers compute + store K/V[pos]; shared layers reuse owner.
+         * Each layer's cache slot is strided by KVD_cache; the layer writes/reads
+         * its own kvd contiguously within the [0,pos] window at stride kvd. */
         const float *KC, *VC;
         int kv_layer;
         if (L < kvfs) {
             kv_layer = L;
-            if (sp_matmul(m, ly->attn_k, nx, 1, E, KVD, knew)) { free(ipl); free(pgate); free(pproj); free(ple); return 1; }
-            if (sp_matmul(m, ly->attn_v, nx, 1, E, KVD, vnew)) { free(ipl); free(pgate); free(pproj); free(ple); return 1; }
+            if (sp_matmul(m, ly->attn_k, nx, 1, E, kvd, knew)) { free(ipl); free(pgate); free(pproj); free(ple); return 1; }
+            if (sp_matmul(m, ly->attn_v, nx, 1, E, kvd, vnew)) { free(ipl); free(pgate); free(pproj); free(ple); return 1; }
             const float *kn = sp_as_f32(m, ly->attn_k_norm);
             for (int h = 0; h < nkv; h++) {
                 float *kh = knew + (size_t)h * hd;
@@ -645,21 +652,21 @@ static int kv_step_gemma4(sp_session *s, int32_t tok, int pos, float *out_logits
                 sp_rope_neox_freqs(kh, hd, pos, rbase, ff);
                 g4_rmsnorm_noweight(vnew + (size_t)h * hd, hd, eps);
             }
-            float *kcl = s->kc + (size_t)kv_layer * P * KVD, *vcl = s->vc + (size_t)kv_layer * P * KVD;
-            memcpy(kcl + (size_t)pos * KVD, knew, (size_t)KVD * sizeof(float));
-            memcpy(vcl + (size_t)pos * KVD, vnew, (size_t)KVD * sizeof(float));
+            float *kcl = s->kc + (size_t)kv_layer * P * KVD_cache, *vcl = s->vc + (size_t)kv_layer * P * KVD_cache;
+            memcpy(kcl + (size_t)pos * kvd, knew, (size_t)kvd * sizeof(float));
+            memcpy(vcl + (size_t)pos * kvd, vnew, (size_t)kvd * sizeof(float));
             KC = kcl; VC = vcl;
         } else {
             kv_layer = kvfs - (global ? 1 : 2);   /* shared SWA -> kvfs-2, shared global -> kvfs-1 */
-            KC = s->kc + (size_t)kv_layer * P * KVD;
-            VC = s->vc + (size_t)kv_layer * P * KVD;
+            KC = s->kc + (size_t)kv_layer * P * KVD_cache;
+            VC = s->vc + (size_t)kv_layer * P * KVD_cache;
         }
 
         for (int h = 0; h < nh; h++)
-            sp_attn_head(q + (size_t)h * hd, KC, VC, pos, KVD,
+            sp_attn_head(q + (size_t)h * hd, KC, VC, pos, kvd,
                          h / grp, hd, ascale, win, sc, ao + (size_t)h * hd);
 
-        if (sp_matmul(m, ly->attn_output, ao, 1, QD, E, ap)) { free(ipl); free(pgate); free(pproj); free(ple); return 1; }
+        if (sp_matmul(m, ly->attn_output, ao, 1, qd, E, ap)) { free(ipl); free(pgate); free(pproj); free(ple); return 1; }
         sp_rmsnorm(ap, sp_as_f32(m, ly->post_attn_norm), E, eps, nx);
         for (int i = 0; i < E; i++) x[i] += nx[i];
 

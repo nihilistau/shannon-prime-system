@@ -71,16 +71,20 @@ int gemma4_forward(const qwen3_model *m, const int32_t *tokens, int n_tok, float
     const int   s_nh = (int)c->g4_nh_swa, s_nkv = (int)c->g4_nkv_swa,   s_hd = (int)c->g4_hd_swa;
     const float g_base = c->rope_freq_base, s_base = c->g4_rope_base_swa;
     const int   SW = (int)c->sliding_window;
-    const int   QD  = g_nh * g_hd;     /* == s_nh*s_hd (constant proj width) */
-    const int   KVD = g_nkv * g_hd;    /* == s_nkv*s_hd (constant proj width) */
+    /* Real Gemma4 has CONSTANT n_head/n_head_kv but PER-LAYER head_dim (global 512,
+     * SWA 256), so the Q/K/V projection widths differ per layer type. Buffers are
+     * sized to the max; per-layer QD/KVD are computed inside the loop. (Stage-1
+     * assumed constant widths — corrected after GGUF dim inspection.) */
+    const int   QD_g = g_nh * g_hd, QD_s = s_nh * s_hd, QD_max = QD_g > QD_s ? QD_g : QD_s;
+    const int   KVD_g = g_nkv * g_hd, KVD_s = s_nkv * s_hd, KVD_max = KVD_g > KVD_s ? KVD_g : KVD_s;
 
     sp_kernels_read_env();
     int rc = 1;
 
     float  *x   = (float *)malloc((size_t)n_tok * E   * sizeof(float)); /* residual stream */
     float  *nx  = (float *)malloc((size_t)n_tok * E   * sizeof(float)); /* norm scratch */
-    float  *q   = (float *)malloc((size_t)n_tok * QD  * sizeof(float));
-    float  *ao  = (float *)malloc((size_t)n_tok * QD  * sizeof(float));
+    float  *q   = (float *)malloc((size_t)n_tok * QD_max * sizeof(float));
+    float  *ao  = (float *)malloc((size_t)n_tok * QD_max * sizeof(float));
     float  *ap  = (float *)malloc((size_t)n_tok * E   * sizeof(float));
     float  *g   = (float *)malloc((size_t)n_tok * FF  * sizeof(float));
     float  *up  = (float *)malloc((size_t)n_tok * FF  * sizeof(float));
@@ -133,6 +137,8 @@ int gemma4_forward(const qwen3_model *m, const int32_t *tokens, int n_tok, float
         const int   nkv = global ? g_nkv : s_nkv;
         const int   hd  = global ? g_hd  : s_hd;
         const int   grp = nh / nkv;
+        const int   qd  = nh * hd;     /* per-layer Q projection width (2048 SWA / 4096 global) */
+        const int   kvd = nkv * hd;    /* per-layer KV width (256 SWA / 512 global) */
         const float rbase = global ? g_base : s_base;
         const float *ff = global ? sp_as_f32(m, m->rope_freqs) : NULL; /* [hd/2] proportional factors */
         const int   win = global ? -1 : SW;
@@ -142,29 +148,29 @@ int gemma4_forward(const qwen3_model *m, const int32_t *tokens, int n_tok, float
         for (int t = 0; t < n_tok; t++)
             sp_rmsnorm(x + (size_t)t * E, sp_as_f32(m, ly->attn_norm), E, eps, nx + (size_t)t * E);
 
-        if (sp_matmul(m, ly->attn_q, nx, n_tok, E, QD, q)) goto done;
+        if (sp_matmul(m, ly->attn_q, nx, n_tok, E, qd, q)) goto done;
         const float *qn = sp_as_f32(m, ly->attn_q_norm);
         for (int t = 0; t < n_tok; t++)
             for (int h = 0; h < nh; h++) {
-                float *qh = q + (size_t)t * QD + (size_t)h * hd;
+                float *qh = q + (size_t)t * qd + (size_t)h * hd;
                 sp_rmsnorm_head(qh, qn, hd, eps);
                 sp_rope_neox_freqs(qh, hd, t, rbase, ff);
             }
 
         float *Kuse, *Vuse;
         if (L < kvfs) {
-            float *K  = (float *)malloc((size_t)n_tok * KVD * sizeof(float));
-            float *Vb = (float *)malloc((size_t)n_tok * KVD * sizeof(float));
+            float *K  = (float *)malloc((size_t)n_tok * kvd * sizeof(float));
+            float *Vb = (float *)malloc((size_t)n_tok * kvd * sizeof(float));
             if (!K || !Vb) { free(K); free(Vb); goto done; }
-            if (sp_matmul(m, ly->attn_k, nx, n_tok, E, KVD, K))  { free(K); free(Vb); goto done; }
-            if (sp_matmul(m, ly->attn_v, nx, n_tok, E, KVD, Vb)) { free(K); free(Vb); goto done; }
+            if (sp_matmul(m, ly->attn_k, nx, n_tok, E, kvd, K))  { free(K); free(Vb); goto done; }
+            if (sp_matmul(m, ly->attn_v, nx, n_tok, E, kvd, Vb)) { free(K); free(Vb); goto done; }
             const float *kn = sp_as_f32(m, ly->attn_k_norm);
             for (int t = 0; t < n_tok; t++)
                 for (int h = 0; h < nkv; h++) {
-                    float *kh = K  + (size_t)t * KVD + (size_t)h * hd;
+                    float *kh = K  + (size_t)t * kvd + (size_t)h * hd;
                     sp_rmsnorm_head(kh, kn, hd, eps);
                     sp_rope_neox_freqs(kh, hd, t, rbase, ff);
-                    g4_rmsnorm_noweight(Vb + (size_t)t * KVD + (size_t)h * hd, hd, eps);
+                    g4_rmsnorm_noweight(Vb + (size_t)t * kvd + (size_t)h * hd, hd, eps);
                 }
             Kst[L] = K; Vst[L] = Vb; Kuse = K; Vuse = Vb;
         } else {
@@ -175,10 +181,10 @@ int gemma4_forward(const qwen3_model *m, const int32_t *tokens, int n_tok, float
 
         for (int t = 0; t < n_tok; t++)
             for (int h = 0; h < nh; h++)
-                sp_attn_head(q + (size_t)t * QD + (size_t)h * hd, Kuse, Vuse, t, KVD,
-                             h / grp, hd, ascale, win, sc, ao + (size_t)t * QD + (size_t)h * hd);
+                sp_attn_head(q + (size_t)t * qd + (size_t)h * hd, Kuse, Vuse, t, kvd,
+                             h / grp, hd, ascale, win, sc, ao + (size_t)t * qd + (size_t)h * hd);
 
-        if (sp_matmul(m, ly->attn_output, ao, n_tok, QD, E, ap)) goto done;
+        if (sp_matmul(m, ly->attn_output, ao, n_tok, qd, E, ap)) goto done;
         for (int t = 0; t < n_tok; t++) {
             sp_rmsnorm(ap + (size_t)t * E, sp_as_f32(m, ly->post_attn_norm), E, eps, nx + (size_t)t * E);
             float *xt = x + (size_t)t * E; const float *pt = nx + (size_t)t * E;
