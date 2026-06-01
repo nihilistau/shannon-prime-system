@@ -19,7 +19,7 @@ include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/sp_module.cmake)
 # primitives); the overlay codecs poly_ring (NTT-attention sp_pr_*), kste (KSTE KV sp_kste_encode),
 # and vht2 (Spinor KV sp_spinor_*) are needed only by the Qwen3 forward_ex/decode overlay paths.
 sp_add_module(forward
-    SOURCES   forward.c gemma3.c qwen25.c generate.c
+    SOURCES   forward.c gemma3.c gemma4.c qwen25.c generate.c
     TEST      forward_test.c
     TEST_NAME T_FORWARD
     DEPENDS   sp_forward_dispatch sp_forward_kernels sp_poly_ring sp_kste sp_vht2)
