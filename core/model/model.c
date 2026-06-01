@@ -25,13 +25,32 @@ static const gguf_tensor *want(const gguf_ctx *g, const char *name) {
     return gguf_find_tensor(g, name);
 }
 
+/* Read a u64 scalar, OR if the key is an integer array (e.g. gemma4's
+ * per-layer feed_forward_length arr[i32,n_layer]), read element 0. Gemma4
+ * stores some shape metadata as per-layer arrays even though all entries are
+ * equal. Returns 1 on success. */
+static int get_u64_or_arr0(const gguf_ctx *g, const char *key, uint64_t *out) {
+    if (gguf_get_u64(g, key, out)) return 1;
+    const gguf_kv *kv = gguf_find_kv(g, key);
+    if (!kv || kv->type != GGUF_T_ARRAY || kv->arr_len == 0 || !kv->arr_data) return 0;
+    switch (kv->arr_type) {
+        case GGUF_T_INT32:  *out = (uint64_t)(uint32_t)((const int32_t  *)kv->arr_data)[0]; return 1;
+        case GGUF_T_UINT32: *out = (uint64_t)((const uint32_t *)kv->arr_data)[0]; return 1;
+        case GGUF_T_INT64:  *out = (uint64_t)((const int64_t  *)kv->arr_data)[0]; return 1;
+        case GGUF_T_UINT64: *out = ((const uint64_t *)kv->arr_data)[0]; return 1;
+        case GGUF_T_INT16:  *out = (uint64_t)(uint16_t)((const int16_t *)kv->arr_data)[0]; return 1;
+        case GGUF_T_UINT16: *out = (uint64_t)((const uint16_t *)kv->arr_data)[0]; return 1;
+        default: return 0;
+    }
+}
+
 qwen3_model *qwen3_load(const char *path) {
     gguf_ctx *g = gguf_open(path);
     if (!g) return NULL;
 
     const char *arch = gguf_get_str(g, "general.architecture");
     if (!arch || (strcmp(arch, "qwen3") != 0 && strcmp(arch, "gemma3") != 0 &&
-                  strcmp(arch, "qwen2") != 0)) {
+                  strcmp(arch, "gemma4") != 0 && strcmp(arch, "qwen2") != 0)) {
         gguf_close(g); return NULL;
     }
 
@@ -39,7 +58,8 @@ qwen3_model *qwen3_load(const char *path) {
     if (!m) { gguf_close(g); return NULL; }
     m->gguf = g;
     qwen3_config *c = &m->cfg;
-    c->arch = (strcmp(arch, "gemma3") == 0) ? SP_ARCH_GEMMA3 :
+    c->arch = (strcmp(arch, "gemma4") == 0) ? SP_ARCH_GEMMA4 :
+              (strcmp(arch, "gemma3") == 0) ? SP_ARCH_GEMMA3 :
               (strcmp(arch, "qwen2")  == 0) ? SP_ARCH_QWEN25 : SP_ARCH_QWEN3;
 
     /* metadata keys are namespaced by architecture (e.g. "qwen3.block_count" /
@@ -52,7 +72,7 @@ qwen3_model *qwen3_load(const char *path) {
     int ok = 1;
     ok &= gguf_get_u64(g, K("block_count"), &v);             c->n_layers  = (uint32_t)v;
     ok &= gguf_get_u64(g, K("embedding_length"), &v);        c->n_embd    = (uint32_t)v;
-    ok &= gguf_get_u64(g, K("feed_forward_length"), &v);     c->n_ff      = (uint32_t)v;
+    ok &= get_u64_or_arr0(g, K("feed_forward_length"), &v);  c->n_ff      = (uint32_t)v;
     ok &= gguf_get_u64(g, K("attention.head_count"), &v);    c->n_head    = (uint32_t)v;
     ok &= gguf_get_u64(g, K("attention.head_count_kv"), &v); c->n_head_kv = (uint32_t)v;
     ok &= gguf_get_u64(g, K("attention.key_length"), &v);    c->head_dim  = (uint32_t)v;
@@ -60,6 +80,63 @@ qwen3_model *qwen3_load(const char *path) {
     if (gguf_get_u64(g, K("attention.sliding_window"), &v)) c->sliding_window = (uint32_t)v;
     if (!gguf_get_f32(g, K("rope.freq_base"), &c->rope_freq_base)) c->rope_freq_base = 1e6f;
     if (!gguf_get_f32(g, K("attention.layer_norm_rms_epsilon"), &c->rms_eps)) c->rms_eps = 1e-6f;
+
+    /* ── Gemma4 deltas: per-layer SWA/global geometry + AltUp + shared-KV ──
+     * The GGUF head_count/head_count_kv/key_length keys hold the GLOBAL geometry
+     * (8/1/512); SWA geometry (g4_*) is derived so the Q/K/V projection widths
+     * QD/KVD stay constant across layer types. */
+    if (c->arch == SP_ARCH_GEMMA4) {
+        uint64_t gv;
+        /* Real Gemma4 (E2B-Q8_0, llama.cpp @5dcb711) geometry: head_count and
+         * head_count_kv are CONSTANT across layer types (8 / 1); only the per-head
+         * dim varies — global key_length=512, SWA key_length_swa=256. So the Q/K/V
+         * PROJECTION widths differ between layer types (QD_swa=2048 vs QD_global=4096;
+         * KVD_swa=256 vs KVD_global=512). This corrects the Stage-1 spec assumption
+         * that the projection widths are constant — verified bit-faithfully against
+         * the GGUF tensor dims (blk.0.attn_q=[1536,2048] vs blk.4.attn_q=[1536,4096]). */
+        const uint32_t g_hd = c->head_dim;
+        uint32_t hd_swa = 0;
+        if (gguf_get_u64(g, K("attention.key_length_swa"), &gv)) hd_swa = (uint32_t)gv;
+        if (hd_swa == 0) hd_swa = g_hd;   /* fallback: same as global */
+        c->g4_hd_swa  = hd_swa;
+        c->g4_nh_swa  = c->n_head;     /* n_head constant across layer types */
+        c->g4_nkv_swa = c->n_head_kv;  /* n_head_kv constant across layer types */
+        if (!gguf_get_f32(g, K("rope.freq_base_swa"), &c->g4_rope_base_swa)) c->g4_rope_base_swa = 1e4f;
+        if (gguf_get_u64(g, K("embedding_length_per_layer_input"), &gv)) c->g4_n_embd_per_layer = (uint32_t)gv;
+        if (!gguf_get_f32(g, K("final_logit_softcapping"), &c->g4_logit_softcap)) c->g4_logit_softcap = 0.0f;
+        /* n_kv_from_start = n_layer - shared_kv_layers */
+        if (gguf_get_u64(g, K("attention.shared_kv_layers"), &gv))
+            c->g4_n_kv_from_start = (c->n_layers > (uint32_t)gv) ? (c->n_layers - (uint32_t)gv) : c->n_layers;
+        else
+            c->g4_n_kv_from_start = c->n_layers;
+        /* swa_period from the sliding_window_pattern bool array (global where
+         * pattern[L]==false). Confirm strict periodicity (global at L%period==
+         * period-1) before trusting a scalar period; else fail loudly (the
+         * forward only models the periodic case). */
+        {
+            const gguf_kv *kv = gguf_find_kv(g, K("attention.sliding_window_pattern"));
+            uint32_t period = 0;
+            if (kv && kv->type == GGUF_T_ARRAY && kv->arr_type == GGUF_T_BOOL &&
+                kv->arr_len == c->n_layers && kv->arr_data) {
+                const uint8_t *pat = (const uint8_t *)kv->arr_data;  /* 1=SWA(true), 0=global(false) */
+                /* find first global index */
+                int first_global = -1;
+                for (uint32_t L = 0; L < c->n_layers; L++)
+                    if (!pat[L]) { first_global = (int)L; break; }
+                if (first_global >= 0) {
+                    period = (uint32_t)first_global + 1u;   /* global at L%period==period-1 */
+                    /* verify the whole array matches the periodic model */
+                    for (uint32_t L = 0; L < c->n_layers; L++) {
+                        int model_global = ((L % period) == period - 1u);
+                        int real_global  = !pat[L];
+                        if (model_global != real_global) { period = 0; break; }
+                    }
+                }
+            }
+            if (period == 0) { qwen3_free(m); return NULL; }  /* non-periodic SWA pattern: surface upstream */
+            c->g4_swa_period = period;
+        }
+    }
     #undef K
     if (!ok) { qwen3_free(m); return NULL; }
 
@@ -96,6 +173,14 @@ qwen3_model *qwen3_load(const char *path) {
             BIND(post_attn_norm, "post_attention_norm.weight");  /* sandwich norms */
             BIND(post_ffw_norm,  "post_ffw_norm.weight");
         }
+        if (c->arch == SP_ARCH_GEMMA4) {
+            BIND(post_attn_norm, "post_attention_norm.weight");  /* sandwich norms */
+            BIND(post_ffw_norm,  "post_ffw_norm.weight");
+            BIND(per_layer_inp_gate, "inp_gate.weight");         /* AltUp per-layer-input */
+            BIND(per_layer_proj,     "proj.weight");
+            BIND(per_layer_post_norm,"post_norm.weight");
+            BIND(out_scale,          "layer_output_scale.weight");
+        }
         if (c->arch == SP_ARCH_QWEN25) {
             BIND(attn_q_bias, "attn_q.bias");
             BIND(attn_k_bias, "attn_k.bias");
@@ -110,6 +195,11 @@ qwen3_model *qwen3_load(const char *path) {
             (!L->attn_q_norm || !L->attn_k_norm || !L->post_attn_norm || !L->post_ffw_norm)) {
             qwen3_free(m); return NULL;   /* gemma3 requires sandwich + QK norms */
         }
+        if (c->arch == SP_ARCH_GEMMA4 &&
+            (!L->attn_q_norm || !L->attn_k_norm || !L->post_attn_norm || !L->post_ffw_norm ||
+             !L->per_layer_inp_gate || !L->per_layer_proj || !L->per_layer_post_norm)) {
+            qwen3_free(m); return NULL;   /* gemma4 requires sandwich + QK norms + AltUp blocks */
+        }
         if (c->arch == SP_ARCH_QWEN25 &&
             (!L->attn_q_bias || !L->attn_k_bias || !L->attn_v_bias)) {
             qwen3_free(m); return NULL;   /* qwen2.5 requires QKV biases */
@@ -117,6 +207,17 @@ qwen3_model *qwen3_load(const char *path) {
     }
     /* QK-norm is present iff layer 0 carries it (uniform across layers). */
     m->cfg.has_qk_norm = (m->layers[0].attn_q_norm != NULL && m->layers[0].attn_k_norm != NULL);
+
+    /* Gemma4 model-level globals: AltUp per-layer-input + the shared rope_freqs
+     * proportional freq-factor table (global layers). */
+    if (c->arch == SP_ARCH_GEMMA4) {
+        m->per_layer_token_embd = want(g, "per_layer_token_embd.weight");
+        m->per_layer_model_proj = want(g, "per_layer_model_proj.weight");
+        m->per_layer_proj_norm  = want(g, "per_layer_proj_norm.weight");
+        m->rope_freqs           = want(g, "rope_freqs.weight");
+        if (!m->per_layer_token_embd || !m->per_layer_model_proj ||
+            !m->per_layer_proj_norm  || !m->rope_freqs) { qwen3_free(m); return NULL; }
+    }
 
     /* Packed-weight arena (roadmap §4.8), env-gated: SP_ARENA=q8|q4. Quantizes
      * the matmul weights once; the forward then lifts inline from the arena.

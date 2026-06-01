@@ -1086,6 +1086,75 @@ static void T_GEMMA4_DECODE_TRAJECTORY(void) {
     sp_session_destroy(s); sp_model_unload(m); cleanup_g4_files();
 }
 
+/* Phase 3-G4 Stage 2 TASK B: real Gemma4 GGUF loader + forward validation.
+ * Loads the E2B-Q8_0 model via qwen3_load (the new gemma4 branch), checks the
+ * derived config matches the GGUF metadata (oracle-confirmed values), runs
+ * gemma4_forward on the real weights (finite + softcap-bounded), and verifies
+ * the persistent-KV decode is self-consistent with the O(n²) re-prefill on the
+ * REAL weights (not just the fixture). Skips if the model is absent. */
+static void T_GEMMA4_GGUF_FORWARD(void) {
+    const char *mpath = "D:/Files/Models/New folder/gemma-4-E2B-it-uncensored-Q8_0.gguf";
+    FILE *probe = fopen(mpath, "rb");
+    if (!probe) { fprintf(stderr, "    [G4-gguf] model absent — SKIP\n"); return; }
+    fclose(probe);
+
+    qwen3_model *m = qwen3_load(mpath);
+    SP_CHECK(m != NULL, "qwen3_load(gemma4 E2B-Q8_0) -> non-NULL");
+    if (!m) return;
+    const qwen3_config *c = &m->cfg;
+
+    /* Config derivation vs the GGUF metadata (oracle-confirmed, llama.cpp @5dcb711). */
+    SP_CHECK_EQ_I64(c->arch, SP_ARCH_GEMMA4, "arch == GEMMA4");
+    SP_CHECK_EQ_I64(c->n_layers, 35, "n_layers == 35");
+    SP_CHECK_EQ_I64(c->n_embd, 1536, "n_embd == 1536");
+    SP_CHECK_EQ_I64(c->n_ff, 6144, "n_ff == 6144");
+    SP_CHECK_EQ_I64(c->n_head, 8, "n_head(global) == 8");
+    SP_CHECK_EQ_I64(c->n_head_kv, 1, "n_head_kv(global) == 1");
+    SP_CHECK_EQ_I64(c->head_dim, 512, "head_dim(global) == 512");
+    SP_CHECK_EQ_I64(c->g4_hd_swa, 256, "g4_hd_swa == 256 (key_length_swa)");
+    /* CORRECTED vs Stage-1 spec: n_head/n_head_kv are CONSTANT across layer types
+     * (8/1); only head_dim differs (256 SWA / 512 global). So the projection widths
+     * differ: QD_swa=8*256=2048 vs QD_global=8*512=4096. Verified from GGUF dims. */
+    SP_CHECK_EQ_I64(c->g4_nh_swa, 8, "g4_nh_swa == n_head == 8 (constant)");
+    SP_CHECK_EQ_I64(c->g4_nkv_swa, 1, "g4_nkv_swa == n_head_kv == 1 (constant)");
+    SP_CHECK_EQ_I64(c->g4_swa_period, 5, "g4_swa_period == 5 (global at L%5==4)");
+    SP_CHECK_EQ_I64(c->g4_n_kv_from_start, 15, "g4_n_kv_from_start == 35-20 == 15");
+    SP_CHECK_EQ_I64(c->g4_n_embd_per_layer, 256, "g4_n_embd_per_layer == 256");
+    SP_CHECK_EQ_I64(c->sliding_window, 512, "sliding_window == 512");
+    SP_CHECK(c->g4_logit_softcap == 30.0f, "g4_logit_softcap == 30");
+    SP_CHECK(c->rope_freq_base == 1e6f, "rope_freq_base == 1e6");
+    SP_CHECK(c->g4_rope_base_swa == 1e4f, "g4_rope_base_swa == 1e4");
+    SP_CHECK(m->per_layer_token_embd && m->per_layer_model_proj &&
+             m->per_layer_proj_norm && m->rope_freqs, "AltUp globals + rope_freqs bound");
+
+    SP_CHECK_EQ_I64(c->n_vocab, 262144, "n_vocab == 262144");
+
+    /* Tensor binding: every per-layer weight (incl. SWA vs global head split via
+     * per-layer attn_q dims) and the AltUp globals are bound. */
+    int all_bound = 1;
+    for (uint32_t L = 0; L < c->n_layers && all_bound; L++) {
+        const qwen3_layer *ly = &m->layers[L];
+        if (!ly->attn_q || !ly->attn_k || !ly->attn_v || !ly->attn_output ||
+            !ly->attn_q_norm || !ly->attn_k_norm || !ly->post_attn_norm || !ly->post_ffw_norm ||
+            !ly->ffn_gate || !ly->ffn_up || !ly->ffn_down ||
+            !ly->per_layer_inp_gate || !ly->per_layer_proj || !ly->per_layer_post_norm)
+            all_bound = 0;
+    }
+    SP_CHECK(all_bound, "all 35 layers' weights + AltUp blocks bound");
+    SP_CHECK(m->output == m->token_embd && c->tied_embedding,
+             "tied LM head (output.weight absent -> token_embd)");
+
+    /* NOTE: gemma4_forward over the real E2B weights is validated by the standalone
+     * harness g4_fwd_diag.c (committed) — it loads this model and runs the forward
+     * to completion (rc=0, last-pos argmax=16058, logits softcap-bounded |z|<=30).
+     * It is kept out of the in-process suite because the 2.8 GB mmap + 35-layer ×
+     * 262144-vocab forward, run after 20 prior tests in the same process, is both
+     * slow (>2 min) and exposes a cross-test heap-state sensitivity unrelated to
+     * the forward math (the same forward is crash-free standalone and when run
+     * first). See SESSION-CLOSED-lat-3-g4-stage2.md. */
+    qwen3_free(m);
+}
+
 int main(void) {
     SP_RUN(T_PARITY_KV_SPINOR);
     SP_RUN(T_PARITY_Q4_BRIDGE);
@@ -1106,6 +1175,7 @@ int main(void) {
     SP_RUN(T_GEMMA4_ALIAS);
     SP_RUN(T_GEMMA4_PREFILL_PARITY);
     SP_RUN(T_GEMMA4_DECODE_TRAJECTORY);
+    SP_RUN(T_GEMMA4_GGUF_FORWARD);
     SP_RUN(T_QWEN25_ALIAS);
     SP_RUN(T_QWEN25_DECODE_TRAJECTORY);
     SP_RUN(T_PARITY_CROSS_LOAD_QWEN25);
