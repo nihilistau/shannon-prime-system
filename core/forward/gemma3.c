@@ -146,3 +146,18 @@ done:
     free(g); free(up); free(dn); free(sc);
     return rc;
 }
+
+/* NTT.5c: backend-aware wrapper. Gemma3 has NO NTT-attention overlay (sliding-
+ * window attention doesn't trivially compose with the per-position NTT-attention
+ * loop shape; out of NTT.5c scope per PLAN §"Stage 0 — qwen25.c overlay
+ * discovery"). The backend triple is accepted for ABI uniformity but ignored
+ * — gemma3 always takes the host fp32 path. Future sprint may add SWA-aware
+ * NTT-attention; until then this is a transparent wrapper. */
+int gemma3_forward_ex2(const qwen3_model *m, const int32_t *tokens, int n_tok,
+                       float *logits,
+                       void *backend_handle,
+                       sp_compute_ntt_dispatch_fn backend_forward,
+                       sp_compute_ntt_dispatch_fn backend_inverse) {
+    (void)backend_handle; (void)backend_forward; (void)backend_inverse;
+    return gemma3_forward(m, tokens, n_tok, logits);
+}
