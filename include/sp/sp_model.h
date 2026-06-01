@@ -57,7 +57,8 @@ typedef enum {
     SP_ARCH_ID_LLAMA3 = 1, SP_ARCH_ID_QWEN3 = 2, SP_ARCH_ID_GEMMA3 = 3,
     SP_ARCH_ID_DEEPSEEK_V4 = 4,
     /* 5 = SP_ARCH_ID_QWEN35 reserved (Phase 3-SSM) */
-    SP_ARCH_ID_QWEN25 = 6
+    SP_ARCH_ID_QWEN25 = 6,
+    SP_ARCH_ID_GEMMA4 = 7
 } sp_arch_id;
 
 /* §7 tokenizer type_id. */
@@ -169,6 +170,7 @@ struct qwen3_model;
 struct qwen3_model *sp_model_to_qwen3(const sp_model *m);
 struct qwen3_model *sp_model_to_gemma3(const sp_model *m);
 struct qwen3_model *sp_model_to_qwen25(const sp_model *m);
+struct qwen3_model *sp_model_to_gemma4(const sp_model *m);
 
 /* Hoist the runnable qwen3_model into the sp_model handle (built once, shared
  * across sessions). store_qm takes ownership: sp_model_unload calls free_fn(qm)
