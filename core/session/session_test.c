@@ -1030,6 +1030,62 @@ static void T_GEMMA4_PREFILL_PARITY(void) {
     sp_model_unload(m); cleanup_g4_files();
 }
 
+static void T_GEMMA4_DECODE_TRAJECTORY(void) {
+    /* Phase 3-G4 Stage 2: session Gemma4 greedy decode trajectory (persistent KV)
+     * == gemma4_forward O(n²) re-prefill reference, bit-exact. Exercises per-layer
+     * SWA/global geometry, weightless V-norm, rope_freqs, AltUp injection, shared-KV
+     * reuse against the persistent cache, per-layer out_scale, and logit softcap. */
+    sp_gemma4_fixture_info info; sp_model *m = NULL;
+    SP_CHECK(load_g4_fixture(&info, &m) == 0, "Gemma4 fixture load");
+    if (!m) { cleanup_g4_files(); return; }
+    const uint32_t V = info.n_vocab;
+
+    /* The fixture max_context is 256; keep the trajectory inside it. */
+    const uint32_t G4_NGEN = 40u;
+
+    qwen3_model *ref = sp_model_to_gemma4(m);
+    SP_CHECK(ref != NULL, "sp_model_to_gemma4 reference");
+
+    int32_t *ref_seq = (int32_t *)malloc((size_t)(NTOK + G4_NGEN) * sizeof(int32_t));
+    SP_CHECK(ref_seq != NULL, "alloc ref seq");
+    if (ref_seq) memcpy(ref_seq, TOKS, (size_t)NTOK * sizeof(int32_t));
+    float *ref_lg = (float *)malloc((size_t)(NTOK + G4_NGEN) * V * sizeof(float));
+    SP_CHECK(ref_lg != NULL, "alloc ref logits");
+
+    if (ref && ref_lg && ref_seq) {
+        SP_CHECK(gemma4_forward(ref, ref_seq, (int)NTOK, ref_lg) == 0, "ref prefill");
+        ref_seq[NTOK] = argmax_f(ref_lg + (size_t)(NTOK - 1u) * V, V);
+        for (uint32_t k = 1; k < G4_NGEN; k++) {
+            SP_CHECK(gemma4_forward(ref, ref_seq, (int)(NTOK + k), ref_lg) == 0, "ref step");
+            ref_seq[NTOK + k] = argmax_f(ref_lg + (size_t)(NTOK + k - 1u) * V, V);
+        }
+    }
+
+    sp_session *s = NULL; sp_session_config cfg; memset(&cfg, 0, sizeof cfg); cfg.deterministic = 1;
+    SP_CHECK_EQ_I64(sp_session_create(m, &cfg, NULL, &s), SP_OK, "create");
+    float *lg = (float *)malloc((size_t)V * sizeof(float));
+    SP_CHECK_EQ_I64(sp_prefill_chunk(s, TOKS, NTOK, lg, V), SP_OK, "prefill");
+
+    int t = argmax_f(lg, V), matched = 1; uint32_t first_div = G4_NGEN;
+    if (ref && ref_lg && ref_seq && lg) {
+        for (uint32_t k = 0; k < G4_NGEN; k++) {
+            if (t != ref_seq[NTOK + k]) { matched = 0; first_div = k; break; }
+            if (k + 1 < G4_NGEN) {
+                if (sp_decode_step(s, t, lg, V) != SP_OK) { matched = 0; first_div = k; break; }
+                t = argmax_f(lg, V);
+            }
+        }
+    }
+    SP_CHECK(matched, "Gemma4 session greedy trajectory == gemma4_forward O(n²) over 40 steps");
+    if (!matched) fprintf(stderr, "    [G4-traj] first divergence at step %u\n", first_div);
+    size_t pos = 0; sp_session_position(s, &pos);
+    SP_CHECK_EQ_I64(pos, NTOK + (G4_NGEN - 1u), "position == prompt + 39 decode steps");
+
+    free(lg); free(ref_lg); free(ref_seq);
+    if (ref) qwen3_free(ref);
+    sp_session_destroy(s); sp_model_unload(m); cleanup_g4_files();
+}
+
 int main(void) {
     SP_RUN(T_PARITY_KV_SPINOR);
     SP_RUN(T_PARITY_Q4_BRIDGE);
@@ -1049,6 +1105,7 @@ int main(void) {
     SP_RUN(T_PARITY_CROSS_LOAD_GEMMA3);
     SP_RUN(T_GEMMA4_ALIAS);
     SP_RUN(T_GEMMA4_PREFILL_PARITY);
+    SP_RUN(T_GEMMA4_DECODE_TRAJECTORY);
     SP_RUN(T_QWEN25_ALIAS);
     SP_RUN(T_QWEN25_DECODE_TRAJECTORY);
     SP_RUN(T_PARITY_CROSS_LOAD_QWEN25);

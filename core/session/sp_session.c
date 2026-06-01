@@ -352,6 +352,15 @@ static float gelu_tanh(float x) {
     return 0.5f * x * (1.0f + tanhf(k * (x + 0.044715f * x * x * x)));
 }
 
+/* weightless RMSNorm over a length-d vector, in place (gemma4 V-norm; sum of
+ * squares in double, the reference precision — matches gemma4.c::g4_rmsnorm_noweight). */
+static void g4_rmsnorm_noweight(float *v, int d, float eps) {
+    double ss = 0.0;
+    for (int i = 0; i < d; i++) ss += (double)v[i] * (double)v[i];
+    float inv = 1.0f / sqrtf((float)(ss / (double)d) + eps);
+    for (int i = 0; i < d; i++) v[i] *= inv;
+}
+
 /* Gemma3 persistent-KV step: sandwich norms, GeGLU FFN, dual RoPE, SWA via sp_attn_head. */
 static int kv_step_gemma3(sp_session *s, int32_t tok, int pos, float *out_logits) {
     const qwen3_model *m = s->qm;
@@ -539,6 +548,156 @@ static int kv_step_qwen25(sp_session *s, int32_t tok, int pos, float *out_logits
     return 0;
 }
 
+/* Gemma4 persistent-KV step: per-layer SWA/global geometry, weightless V-norm,
+ * rope_freqs on global layers, attention scale 1.0, AltUp per-layer-input
+ * injection, per-layer out_scale, logit softcap, shared-KV reuse against the
+ * persistent cache. Mirrors gemma4_forward's math exactly, one token at `pos`.
+ *
+ * Persistent KV: owner layers [0,kvfs) write K/V[pos] into their own cache slot
+ * (s->kc/s->vc indexed by L). Shared layers (L>=kvfs) read the owner's cached
+ * K/V (shared SWA -> owner kvfs-2, shared global -> kvfs-1) and skip their own
+ * K/V projection — same shared-KV map as the O(n^2) reference. */
+static int kv_step_gemma4(sp_session *s, int32_t tok, int pos, float *out_logits) {
+    const qwen3_model *m = s->qm;
+    const qwen3_config *c = &m->cfg;
+    const int E = (int)c->n_embd, FF = (int)c->n_ff, V = (int)c->n_vocab;
+    const int NL = (int)c->n_layers;
+    const float eps = c->rms_eps;
+    const float embscale = sqrtf((float)E);
+    const int   PL     = (int)c->g4_n_embd_per_layer;
+    const int   kvfs   = (int)c->g4_n_kv_from_start ? (int)c->g4_n_kv_from_start : NL;
+    const int   period = (int)c->g4_swa_period ? (int)c->g4_swa_period : 6;
+    const float softcap = c->g4_logit_softcap;
+    const int   g_nh = (int)c->n_head,    g_nkv = (int)c->n_head_kv,  g_hd = (int)c->head_dim;
+    const int   s_nh = (int)c->g4_nh_swa, s_nkv = (int)c->g4_nkv_swa, s_hd = (int)c->g4_hd_swa;
+    const float g_base = c->rope_freq_base, s_base = c->g4_rope_base_swa;
+    const int   SW = (int)c->sliding_window;
+    const int   QD  = g_nh * g_hd;     /* == s_nh*s_hd (constant proj width) */
+    const int   KVD = g_nkv * g_hd;    /* == s_nkv*s_hd (constant proj width) */
+    const int   P = (int)s->hist_cap;
+    float *x = s->sx, *nx = s->snx, *q = s->sq, *knew = s->sknew, *vnew = s->svnew;
+    float *ao = s->sao, *ap = s->sap, *gg = s->sgg, *up = s->sup, *dn = s->sdn, *sc = s->ssc;
+
+    /* AltUp per-step scratch (the persistent KV path doesn't reuse the
+     * decode scratch fields for these; they are step-local). */
+    float *ipl   = PL ? (float *)malloc((size_t)NL * PL * sizeof(float)) : NULL;
+    float *pgate = PL ? (float *)malloc((size_t)PL * sizeof(float)) : NULL;
+    float *pproj = PL ? (float *)malloc((size_t)E  * sizeof(float)) : NULL;
+    float *ple   = PL ? (float *)malloc((size_t)NL * PL * sizeof(float)) : NULL;
+    if (PL && (!ipl || !pgate || !pproj || !ple)) { free(ipl); free(pgate); free(pproj); free(ple); return 1; }
+
+    if (sp_embed_row(m, tok, E, x)) { free(ipl); free(pgate); free(pproj); free(ple); return 1; }
+    for (int i = 0; i < E; i++) x[i] *= embscale;
+
+    /* AltUp precompute for this single token (project_per_layer_inputs):
+     * ipl[L,:] = ( rmsnorm_{proj_norm}((per_layer_model_proj·x)·(1/√E))
+     *             + (per_layer_token_embd row(tok)·√PL) ) · (1/√2). */
+    if (PL) {
+        if (sp_matmul(m, m->per_layer_model_proj, x, 1, E, NL * PL, ipl)) { free(ipl); free(pgate); free(pproj); free(ple); return 1; }
+        const float proj_scale = 1.0f / sqrtf((float)E);
+        const float in_scale   = 1.0f / sqrtf(2.0f);
+        const float ple_scale  = sqrtf((float)PL);
+        const float *pn = sp_as_f32(m, m->per_layer_proj_norm);
+        if (sp_weight_row(m, m->per_layer_token_embd, tok, NL * PL, ple)) { free(ipl); free(pgate); free(pproj); free(ple); return 1; }
+        for (int L = 0; L < NL; L++) {
+            float *row = ipl + (size_t)L * PL;
+            double ss = 0.0;
+            for (int i = 0; i < PL; i++) { row[i] *= proj_scale; ss += (double)row[i] * row[i]; }
+            float inv = 1.0f / sqrtf((float)(ss / (double)PL) + eps);
+            const float *pleL = ple + (size_t)L * PL;
+            for (int i = 0; i < PL; i++)
+                row[i] = (row[i] * inv * pn[i] + pleL[i] * ple_scale) * in_scale;
+        }
+    }
+
+    for (int L = 0; L < NL; L++) {
+        const qwen3_layer *ly = &m->layers[L];
+        const int   global = ((L % period) == period - 1);
+        const int   nh  = global ? g_nh  : s_nh;
+        const int   nkv = global ? g_nkv : s_nkv;
+        const int   hd  = global ? g_hd  : s_hd;
+        const int   grp = nh / nkv;
+        const float rbase = global ? g_base : s_base;
+        const float *ff = global ? sp_as_f32(m, m->rope_freqs) : NULL;
+        const int   win = global ? -1 : SW;
+        const float ascale = 1.0f;   /* Gemma4: self.scaling = 1.0 */
+
+        sp_rmsnorm(x, sp_as_f32(m, ly->attn_norm), E, eps, nx);
+        if (sp_matmul(m, ly->attn_q, nx, 1, E, QD, q)) { free(ipl); free(pgate); free(pproj); free(ple); return 1; }
+        const float *qn = sp_as_f32(m, ly->attn_q_norm);
+        for (int h = 0; h < nh; h++) {
+            float *qh = q + (size_t)h * hd;
+            sp_rmsnorm_head(qh, qn, hd, eps);
+            sp_rope_neox_freqs(qh, hd, pos, rbase, ff);
+        }
+
+        /* KV: owner layers compute + store K/V[pos]; shared layers reuse owner. */
+        const float *KC, *VC;
+        int kv_layer;
+        if (L < kvfs) {
+            kv_layer = L;
+            if (sp_matmul(m, ly->attn_k, nx, 1, E, KVD, knew)) { free(ipl); free(pgate); free(pproj); free(ple); return 1; }
+            if (sp_matmul(m, ly->attn_v, nx, 1, E, KVD, vnew)) { free(ipl); free(pgate); free(pproj); free(ple); return 1; }
+            const float *kn = sp_as_f32(m, ly->attn_k_norm);
+            for (int h = 0; h < nkv; h++) {
+                float *kh = knew + (size_t)h * hd;
+                sp_rmsnorm_head(kh, kn, hd, eps);
+                sp_rope_neox_freqs(kh, hd, pos, rbase, ff);
+                g4_rmsnorm_noweight(vnew + (size_t)h * hd, hd, eps);
+            }
+            float *kcl = s->kc + (size_t)kv_layer * P * KVD, *vcl = s->vc + (size_t)kv_layer * P * KVD;
+            memcpy(kcl + (size_t)pos * KVD, knew, (size_t)KVD * sizeof(float));
+            memcpy(vcl + (size_t)pos * KVD, vnew, (size_t)KVD * sizeof(float));
+            KC = kcl; VC = vcl;
+        } else {
+            kv_layer = kvfs - (global ? 1 : 2);   /* shared SWA -> kvfs-2, shared global -> kvfs-1 */
+            KC = s->kc + (size_t)kv_layer * P * KVD;
+            VC = s->vc + (size_t)kv_layer * P * KVD;
+        }
+
+        for (int h = 0; h < nh; h++)
+            sp_attn_head(q + (size_t)h * hd, KC, VC, pos, KVD,
+                         h / grp, hd, ascale, win, sc, ao + (size_t)h * hd);
+
+        if (sp_matmul(m, ly->attn_output, ao, 1, QD, E, ap)) { free(ipl); free(pgate); free(pproj); free(ple); return 1; }
+        sp_rmsnorm(ap, sp_as_f32(m, ly->post_attn_norm), E, eps, nx);
+        for (int i = 0; i < E; i++) x[i] += nx[i];
+
+        sp_rmsnorm(x, sp_as_f32(m, ly->ffn_norm), E, eps, nx);
+        if (sp_matmul(m, ly->ffn_gate, nx, 1, E, FF, gg)) { free(ipl); free(pgate); free(pproj); free(ple); return 1; }
+        if (sp_matmul(m, ly->ffn_up,   nx, 1, E, FF, up)) { free(ipl); free(pgate); free(pproj); free(ple); return 1; }
+        for (int i = 0; i < FF; i++) gg[i] = gelu_tanh(gg[i]) * up[i];
+        if (sp_matmul(m, ly->ffn_down, gg, 1, FF, E, dn)) { free(ipl); free(pgate); free(pproj); free(ple); return 1; }
+        sp_rmsnorm(dn, sp_as_f32(m, ly->post_ffw_norm), E, eps, nx);
+        for (int i = 0; i < E; i++) x[i] += nx[i];
+
+        /* AltUp per-layer-input injection */
+        if (PL) {
+            if (sp_matmul(m, ly->per_layer_inp_gate, x, 1, E, PL, pgate)) { free(ipl); free(pgate); free(pproj); free(ple); return 1; }
+            const float *iplL = ipl + (size_t)L * PL;
+            for (int i = 0; i < PL; i++) pgate[i] = gelu_tanh(pgate[i]) * iplL[i];
+            if (sp_matmul(m, ly->per_layer_proj, pgate, 1, PL, E, pproj)) { free(ipl); free(pgate); free(pproj); free(ple); return 1; }
+            sp_rmsnorm(pproj, sp_as_f32(m, ly->per_layer_post_norm), E, eps, nx);
+            for (int i = 0; i < E; i++) x[i] += nx[i];
+        }
+
+        /* per-layer output scale (scalar) */
+        if (ly->out_scale) {
+            const float *os = sp_as_f32(m, ly->out_scale);
+            if (os) { float sv = os[0]; for (int i = 0; i < E; i++) x[i] *= sv; }
+        }
+    }
+
+    if (out_logits) {
+        sp_rmsnorm(x, sp_as_f32(m, m->output_norm), E, eps, nx);
+        if (sp_matmul(m, m->output, nx, 1, E, V, out_logits)) { free(ipl); free(pgate); free(pproj); free(ple); return 1; }
+        if (softcap > 0.0f)
+            for (int i = 0; i < V; i++) out_logits[i] = tanhf(out_logits[i] / softcap) * softcap;
+    }
+    free(ipl); free(pgate); free(pproj); free(ple);
+    return 0;
+}
+
 sp_status sp_decode_step(sp_session *s, int32_t token, float *logits, size_t logits_capacity) {
     if (!s || !logits) { sp_set_error("sp_decode_step: null arg"); return SP_EBADARG; }
     if (logits_capacity < s->n_vocab) { sp_set_error("sp_decode_step: logits_capacity < vocab_size"); return SP_EBADARG; }
@@ -550,6 +709,7 @@ sp_status sp_decode_step(sp_session *s, int32_t token, float *logits, size_t log
     const sp_arch_t _arch = s->qm->cfg.arch;
     #define STEP(tok, pos, lo) \
         (_arch == SP_ARCH_GEMMA3 ? kv_step_gemma3(s, tok, pos, lo) : \
+         _arch == SP_ARCH_GEMMA4 ? kv_step_gemma4(s, tok, pos, lo) : \
          _arch == SP_ARCH_QWEN25 ? kv_step_qwen25(s, tok, pos, lo) : \
                                    kv_step(s, tok, pos, lo))
     /* lazily fill KV for any prior positions not yet cached (e.g. a re-forward prefill) */
