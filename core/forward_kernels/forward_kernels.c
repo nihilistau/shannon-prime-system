@@ -40,6 +40,22 @@ void sp_rope_neox(float *v, int d, int p, float base) {
     }
 }
 
+/* Gemma4 global-layer proportional RoPE: theta_i = p * base^(-2i/d) / ff[i].
+ * ff==NULL is identical to sp_rope_neox. freq_factors semantics to be validated
+ * against the ggml rope_ext oracle when gemma4_forward is wired (Stage 2). */
+void sp_rope_neox_freqs(float *v, int d, int p, float base, const float *ff) {
+    if (!ff) { sp_rope_neox(v, d, p, base); return; }
+    int half = d / 2;
+    for (int i = 0; i < half; i++) {
+        float freq  = powf(base, -2.0f * (float)i / (float)d) / ff[i];
+        float theta = (float)p * freq;
+        float c = cosf(theta), s = sinf(theta);
+        float a = v[i], b = v[i + half];
+        v[i]        = a * c - b * s;
+        v[i + half] = a * s + b * c;
+    }
+}
+
 void sp_attn_head(const float *qh, const float *KC, const float *VC,
                   int pos, int KVD, int kvh, int HD, float ascale, int win,
                   float *sc, float *out) {

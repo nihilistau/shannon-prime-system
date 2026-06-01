@@ -31,6 +31,11 @@ void sp_rmsnorm_head(float *v, const float *w, int d, float eps);
  * at sequence position `p` with frequency base `base`. */
 void sp_rope_neox(float *v, int d, int p, float base);
 
+/* NEOX RoPE with optional per-pair frequency factors (Gemma4 global-layer
+ * "proportional" RoPE; ggml rope_ext freq_factors). `ff` is a length-(d/2) table;
+ * theta_i = p * base^(-2i/d) / ff[i]. `ff == NULL` is identical to sp_rope_neox. */
+void sp_rope_neox_freqs(float *v, int d, int p, float base, const float *ff);
+
 /* One GQA query head: causal (or windowed, win>=0) scaled-dot-product softmax
  * attention over the cached K/V. KC/VC are position-major caches of width
  * KVD = n_kv_heads*head_dim; `kvh` is the kv head this query maps to; `ascale` the

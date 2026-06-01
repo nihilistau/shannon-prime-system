@@ -21,7 +21,7 @@ extern "C" {
 /* Model architecture. Selects the forward pass + which optional config fields and
  * per-layer tensors are populated. Default 0 = Qwen3 (calloc-zeroed configs and
  * existing callers get the right value with no churn). */
-typedef enum { SP_ARCH_QWEN3 = 0, SP_ARCH_GEMMA3 = 1, SP_ARCH_QWEN25 = 2 } sp_arch_t;
+typedef enum { SP_ARCH_QWEN3 = 0, SP_ARCH_GEMMA3 = 1, SP_ARCH_QWEN25 = 2, SP_ARCH_GEMMA4 = 3 } sp_arch_t;
 
 typedef struct {
     sp_arch_t arch;           /* SP_ARCH_QWEN3 (default) | SP_ARCH_GEMMA3 */
@@ -38,6 +38,19 @@ typedef struct {
     float    rms_eps;         /* {arch}.attention.layer_norm_rms_epsilon */
     int      has_qk_norm;     /* per-head Q/K RMSNorm present            */
     int      tied_embedding;  /* output.weight absent -> reuse token_embd*/
+    /* ── Gemma4 (SP_ARCH_GEMMA4) extras; zero on all other archs. The main
+     * n_head/n_head_kv/head_dim/rope_freq_base/sliding_window above hold the
+     * GLOBAL-layer geometry; SWA-layer geometry + the per-layer-input (AltUp)
+     * shape live here. A layer L is GLOBAL iff (L % g4_swa_period) ==
+     * g4_swa_period-1, else SWA. See PPT-LAT-Roadmap §3-G4 Stage 1 spec. */
+    uint32_t g4_hd_swa;          /* SWA head_dim (256)            */
+    uint32_t g4_nh_swa;          /* SWA n_head (8)                */
+    uint32_t g4_nkv_swa;         /* SWA n_head_kv (2)             */
+    float    g4_rope_base_swa;   /* SWA RoPE base (1e4)           */
+    uint32_t g4_n_embd_per_layer;/* per-layer-input width (256); 0 = no AltUp path */
+    uint32_t g4_n_kv_from_start; /* layers [0,this) own KV; the rest reuse (shared-KV) */
+    float    g4_logit_softcap;   /* final-logit softcap (30); 0 = none */
+    uint32_t g4_swa_period;      /* SWA/global period (6); global when L%period==period-1 */
 } qwen3_config;
 
 typedef struct {
@@ -57,6 +70,11 @@ typedef struct {
     const gguf_tensor *attn_q_bias;  /* [n_head*head_dim] qwen25; NULL otherwise */
     const gguf_tensor *attn_k_bias;  /* [n_head_kv*head_dim] qwen25; NULL otherwise */
     const gguf_tensor *attn_v_bias;  /* [n_head_kv*head_dim] qwen25; NULL otherwise */
+    /* ── Gemma4 per-layer-input (AltUp) block; NULL on other archs ── */
+    const gguf_tensor *per_layer_inp_gate;  /* [n_embd, n_embd_per_layer] (GGUF inp_gate) */
+    const gguf_tensor *per_layer_proj;       /* [n_embd_per_layer, n_embd] (GGUF proj)    */
+    const gguf_tensor *per_layer_post_norm;  /* [n_embd] (GGUF post_norm)                 */
+    const gguf_tensor *out_scale;            /* [1] (GGUF layer_output_scale)             */
 } qwen3_layer;
 
 struct sp_arena;   /* sp_engine/arena.h — packed-weight arena (Phase 1a) */
@@ -81,6 +99,13 @@ typedef struct qwen3_model {
      * this owned synthetic gguf_tensor array instead of a GGUF mapping. NULL for
      * GGUF-loaded models. Freed by qwen3_free. */
     gguf_tensor        *synth_tensors;
+    /* ── Gemma4 model-global tensors (AltUp per-layer-input + global RoPE freqs);
+     * NULL on other archs. rope_freqs is the single shared [head_dim/2] table the
+     * global layers use for proportional NEOX RoPE. ── */
+    const gguf_tensor  *per_layer_token_embd; /* [n_embd_per_layer*n_layers, n_vocab] */
+    const gguf_tensor  *per_layer_model_proj; /* [n_embd, n_embd_per_layer*n_layers]  */
+    const gguf_tensor  *per_layer_proj_norm;  /* [n_embd_per_layer]                   */
+    const gguf_tensor  *rope_freqs;           /* [head_dim/2] global-layer freq factors */
 } qwen3_model;
 
 /* Open the GGUF, read the qwen3 config, and bind every weight. Returns NULL on
@@ -110,6 +135,15 @@ int qwen3_forward(const qwen3_model *m, const int32_t *tokens, int n_tokens,
  * post-ffw on the residual branch), GeGLU FFN, local/global sliding-window attn
  * with dual RoPE base, tied LM head. Correctness gate M_GEMMA3_CPU. */
 int gemma3_forward(const qwen3_model *m, const int32_t *tokens, int n_tokens,
+                   float *logits);
+
+/* Gemma4 f32 reference forward pass (prefill, causal). Same logits layout/return
+ * as qwen3_forward. Requires arch == SP_ARCH_GEMMA4. Deltas vs Gemma3: attention
+ * scale = 1.0 (not 1/sqrt(head_dim)); per-layer head geometry (SWA vs global) with
+ * proportional RoPE freq-factors on global layers; weightless V-RMSNorm; shared-KV
+ * reuse on the trailing layers; AltUp per-layer-input injection; per-layer output
+ * scale; final-logit softcap. Correctness gate M_GEMMA4. */
+int gemma4_forward(const qwen3_model *m, const int32_t *tokens, int n_tokens,
                    float *logits);
 
 /* Qwen2.5 f32 reference forward pass (prefill, causal). Same logits layout/return
@@ -169,6 +203,12 @@ int qwen3_forward_ex2 (const qwen3_model *m, const int32_t *tokens, int n_tokens
                        sp_compute_ntt_dispatch_fn backend_inverse);
 
 int gemma3_forward_ex2(const qwen3_model *m, const int32_t *tokens, int n_tokens,
+                       float *logits,
+                       void *backend_handle,
+                       sp_compute_ntt_dispatch_fn backend_forward,
+                       sp_compute_ntt_dispatch_fn backend_inverse);
+
+int gemma4_forward_ex2(const qwen3_model *m, const int32_t *tokens, int n_tokens,
                        float *logits,
                        void *backend_handle,
                        sp_compute_ntt_dispatch_fn backend_forward,

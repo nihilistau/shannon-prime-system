@@ -95,6 +95,20 @@ typedef struct {
     uint32_t n_ff;                /* feed-forward width; 0 -> bridge derives from ffn_gate shape */
     float    rms_eps;             /* RMSNorm epsilon; 0.0 -> bridge defaults 1e-6 + load warning  */
     uint32_t preferred_precision; /* sp_precision; 0 -> SP_PRECISION_UNSPECIFIED (session falls back) */
+
+    /* ── appended Phase 3-G4 (Gemma4; reserved arch_struct tail; 0 = unspecified) ──
+     * For arch_id == GEMMA4 the base head_dim/n_heads/n_kv_heads/rope_freq_base/
+     * swa_window hold the GLOBAL-layer geometry; these carry the SWA-layer geometry
+     * and the per-layer-input (AltUp) + shared-KV + softcap shape. All zero on
+     * non-Gemma4 models. sizeof(sp_arch_info) MUST stay <= 256. */
+    uint32_t g4_hd_swa;           /* SWA head_dim (256)   */
+    uint32_t g4_nh_swa;           /* SWA n_head (8)       */
+    uint32_t g4_nkv_swa;          /* SWA n_head_kv (2)    */
+    float    g4_rope_base_swa;    /* SWA RoPE base (1e4)  */
+    uint32_t g4_n_embd_per_layer; /* per-layer-input width (256); 0 = no AltUp path */
+    uint32_t g4_n_kv_from_start;  /* layers [0,this) own KV; rest reuse (shared-KV)  */
+    float    g4_logit_softcap;    /* final-logit softcap (30); 0 = none              */
+    uint32_t g4_swa_period;       /* SWA/global period (6); global when L%period==period-1 */
 } sp_arch_info;
 
 /* Populate *out from the loaded model's header arch_struct. Caller-stack-allocated.
