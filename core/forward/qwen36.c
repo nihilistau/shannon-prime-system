@@ -16,6 +16,8 @@
 #include "sp/forward_dispatch.h"   /* sp_matmul / sp_embed_row / sp_as_f32 / sp_kernels_read_env */
 #include "sp/forward_kernels.h"    /* sp_rmsnorm / sp_rmsnorm_head */
 #include "sp/weight_dtype.h"       /* sp_dequant_row (rank-3 expert slices) */
+#include "sp/arena.h"              /* sp_arena_find / sp_arena_tensor (.sp-model path) */
+#include "sp/frobenius_lift.h"     /* sp_frob_packed_dequant_row (arena expert-slice) */
 
 #include <stdlib.h>
 #include <string.h>
@@ -58,6 +60,24 @@ static size_t q36_rb(uint32_t type, int n) {
  * row o of expert e is the `in`-vector at element ((e*out)+o)*in. f32 reference dot. */
 static int expert_mm(const qwen3_model *m, const gguf_tensor *W, int e,
                      const float *X, int in, int out, float *Y) {
+    /* .sp-model path: no GGUF — read expert e's slice from the packed arena tensor
+     * (rank-3 packed as (rows*n_expert) rows; expert e = rows [e*out, (e+1)*out)). */
+    if (m->arena) {
+        const sp_arena_tensor *at = sp_arena_find(m->arena, W->name);
+        if (at) {
+            float *wrow = (float *)malloc((size_t)in * sizeof(float));
+            if (!wrow) return 1;
+            for (int o = 0; o < out; o++) {
+                if (sp_frob_packed_dequant_row(&at->pt, e * out + o, wrow)) { free(wrow); return 1; }
+                float acc = 0.0f;
+                for (int i = 0; i < in; i++) acc += wrow[i] * X[i];
+                Y[o] = acc;
+            }
+            free(wrow);
+            return 0;
+        }
+    }
+    /* GGUF-direct path */
     const uint8_t *base = (const uint8_t *)gguf_tensor_data(m->gguf, W);
     size_t rb = q36_rb(W->type, in);
     if (!base || rb == 0) return 1;
@@ -97,8 +117,15 @@ static int moe_ffn(const qwen3_model *m, const qwen3_layer *L, const qwen3_confi
     for (int t = 0; t < n_tok; t++) {
         const float *x = nx + (size_t)t * E;
         float *yo = out + (size_t)t * E;
-        /* router: f32 softmax over all NE experts */
-        if (sp_matmul(m, L->ffn_gate_inp, x, 1, E, NE, lg)) goto done;
+        /* router: f32 softmax over all NE experts. ffn_gate_inp is F32 [E,NE] — read via
+         * sp_as_f32 (works GGUF-direct AND .sp-model owned-f32; not arena/sp_matmul). */
+        const float *gi = sp_as_f32(m, L->ffn_gate_inp);
+        if (!gi) goto done;
+        for (int o = 0; o < NE; o++) {
+            const float *wo = gi + (size_t)o * E;
+            float a = 0.0f; for (int i = 0; i < E; i++) a += x[i] * wo[i];
+            lg[o] = a;
+        }
         float mx = lg[0];
         for (int i = 1; i < NE; i++) if (lg[i] > mx) mx = lg[i];
         double se = 0.0;
@@ -129,8 +156,10 @@ static int moe_ffn(const qwen3_model *m, const qwen3_layer *L, const qwen3_confi
         if (sp_matmul(m, L->ffn_up_shexp,   x, 1, E, FS, u)) goto done;
         for (int i = 0; i < FS; i++) hh[i] = silu_f(g[i]) * u[i];
         if (sp_matmul(m, L->ffn_down_shexp, hh, 1, FS, E, sh)) goto done;
+        const float *gs = sp_as_f32(m, L->ffn_gate_inp_shexp);   /* F32 [E] shared-expert gate */
+        if (!gs) goto done;
         float sg = 0.0f;
-        if (sp_matmul(m, L->ffn_gate_inp_shexp, x, 1, E, 1, &sg)) goto done;
+        for (int i = 0; i < E; i++) sg += x[i] * gs[i];
         sg = sigmoid_f(sg);
         for (int i = 0; i < E; i++) yo[i] += sg * sh[i];
     }

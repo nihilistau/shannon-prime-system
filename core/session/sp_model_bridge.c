@@ -779,3 +779,175 @@ fail4:
     free(ats); free(nsrc); free(nbuf); free(layers); free(synth);
     return NULL;
 }
+
+/* qwen35moe (Qwen3.6) bridge: const sp_model* -> runnable q36 qwen3_model.
+ * Per-layer bifurcation (full-attn iff (L+1)%interval==0, else GDN); MoE FFN on every
+ * layer. Q-packed (arena): GDN qkv/gate/alpha/beta/out OR attn q/k/v/output; ffn
+ * {gate,up,down}_exps (rank-3) + {gate,up,down}_shexp. Owned-f32 ("norm" copy, served
+ * by sp_as_f32): attn_norm, post_attn_norm, ssm_norm/conv1d/a/dt, attn_q/k_norm, AND the
+ * F32 router ffn_gate_inp + shared-gate ffn_gate_inp_shexp (the qwen36 forward reads the
+ * router via sp_as_f32, not sp_matmul, since there is no GGUF on this path). Rank-3 expert
+ * synth dims (n_dims=3) preserved so the forward + arena slice expert e. */
+struct qwen3_model *sp_model_to_qwen36(const sp_model *sm) {
+    gguf_tensor       *synth  = NULL;
+    qwen3_layer       *layers = NULL;
+    sp_arena_tensor   *ats    = NULL;
+    const gguf_tensor **nsrc  = NULL;
+    float            **nbuf   = NULL;
+    sp_arena          *arena  = NULL;
+    qwen3_model       *qm     = NULL;
+    int si = 0, ari = 0, ni = 0, embd_syn = 0, onorm_syn = 0, out_syn = 0;
+    char nm[96];
+
+    if (!sm) { sp_set_error("sp_model_to_qwen36: null handle"); return NULL; }
+    sp_arch_info ai;
+    if (sp_model_arch(sm, &ai) != SP_OK) { sp_set_error("sp_model_to_qwen36: arch query failed"); return NULL; }
+    if (ai.arch_id != (uint32_t)SP_ARCH_ID_QWEN36) { sp_set_error("sp_model_to_qwen36: model is not qwen35moe"); return NULL; }
+    const uint32_t NL = ai.n_layers;
+    if (NL == 0) { sp_set_error("sp_model_to_qwen36: zero layers"); return NULL; }
+    const uint32_t interval = ai.q36_full_attn_interval ? ai.q36_full_attn_interval : 4u;
+
+    const int has_output_w = (sp_model_find_tensor(sm, "output.weight") != NULL) ? 1 : 0;
+
+    /* generous upper bounds (GDN layer: 11 arena + 6 layer-norms + 2 moe-f32; full-attn:
+     * 10 arena + 4 + 2). Over-allocate; unused calloc entries are harmless. */
+    const int NSYN   = 3 + has_output_w + 20 * (int)NL;
+    const int NARENA = 2 + has_output_w + 12 * (int)NL;
+    const int NNORM  = 2 + 9 * (int)NL;
+    synth  = (gguf_tensor *)calloc((size_t)NSYN, sizeof(gguf_tensor));
+    layers = (qwen3_layer *)calloc((size_t)NL, sizeof(qwen3_layer));
+    ats    = (sp_arena_tensor *)calloc((size_t)NARENA, sizeof(sp_arena_tensor));
+    nsrc   = (const gguf_tensor **)calloc((size_t)NNORM, sizeof(*nsrc));
+    nbuf   = (float **)calloc((size_t)NNORM, sizeof(*nbuf));
+    if (!synth || !layers || !ats || !nsrc || !nbuf) { sp_set_error("sp_model_to_qwen36: out of memory"); goto fail6; }
+
+    #define SYNTH_NAME(idx, str) do { \
+        snprintf(synth[(idx)].name, sizeof synth[(idx)].name, "%s", (str)); \
+        const sp_tensor_entry *e_ = sp_model_find_tensor(sm, (str)); \
+        if (e_) { synth[(idx)].n_dims = e_->n_dims; \
+            for (uint32_t d_ = 0; d_ < e_->n_dims && d_ < 8u; d_++) synth[(idx)].dims[d_] = e_->dims[d_]; } \
+    } while (0)
+    #define ARENA(wname) do { \
+        if (build_packed(sm, (wname), &ats[ari].pt)) { \
+            char eb_[128]; snprintf(eb_, sizeof eb_, "sp_model_to_qwen36: bad weight %s", (wname)); \
+            sp_set_error(eb_); goto fail6; } \
+        snprintf(ats[ari].name, sizeof ats[ari].name, "%s", (wname)); ari++; \
+    } while (0)
+
+    embd_syn = si; SYNTH_NAME(si, "token_embd.weight"); si++; ARENA("token_embd.weight");
+    out_syn = embd_syn;
+    if (has_output_w) { out_syn = si; SYNTH_NAME(si, "output.weight"); si++; ARENA("output.weight"); }
+
+    for (uint32_t L = 0; L < NL; L++) {
+        qwen3_layer *ly = &layers[L];
+        int full_attn = (((L + 1u) % interval) == 0u);
+        ly->q36_is_recurrent = !full_attn;
+        #define MM(field, suffix) do { \
+            snprintf(nm, sizeof nm, "blk.%u." suffix, L); \
+            SYNTH_NAME(si, nm); ly->field = &synth[si]; si++; ARENA(nm); \
+        } while (0)
+        #define NORM(field, suffix) do { \
+            snprintf(nm, sizeof nm, "blk.%u." suffix, L); \
+            SYNTH_NAME(si, nm); ly->field = &synth[si]; \
+            if (copy_norm(sm, nm, &nbuf[ni])) { sp_set_error("sp_model_to_qwen36: bad f32 " suffix); goto fail6; } \
+            nsrc[ni] = &synth[si]; si++; ni++; \
+        } while (0)
+
+        NORM(attn_norm,      "attn_norm.weight");
+        NORM(post_attn_norm, "post_attention_norm.weight");
+        if (full_attn) {
+            MM  (attn_q,      "attn_q.weight");
+            MM  (attn_k,      "attn_k.weight");
+            MM  (attn_v,      "attn_v.weight");
+            MM  (attn_output, "attn_output.weight");
+            NORM(attn_q_norm, "attn_q_norm.weight");
+            NORM(attn_k_norm, "attn_k_norm.weight");
+        } else {
+            MM  (gdn_qkv,     "attn_qkv.weight");
+            MM  (gdn_gate,    "attn_gate.weight");
+            MM  (gdn_alpha,   "ssm_alpha.weight");
+            MM  (gdn_beta,    "ssm_beta.weight");
+            MM  (gdn_out,     "ssm_out.weight");
+            NORM(gdn_norm,    "ssm_norm.weight");
+            NORM(gdn_conv1d,  "ssm_conv1d.weight");
+            NORM(gdn_a,       "ssm_a");
+            NORM(gdn_dt_bias, "ssm_dt.bias");
+        }
+        /* MoE FFN — every layer. Router + shared-gate are F32 (owned, read via sp_as_f32). */
+        NORM(ffn_gate_inp,       "ffn_gate_inp.weight");
+        NORM(ffn_gate_inp_shexp, "ffn_gate_inp_shexp.weight");
+        MM  (ffn_gate_exps,      "ffn_gate_exps.weight");
+        MM  (ffn_up_exps,        "ffn_up_exps.weight");
+        MM  (ffn_down_exps,      "ffn_down_exps.weight");
+        MM  (ffn_gate_shexp,     "ffn_gate_shexp.weight");
+        MM  (ffn_up_shexp,       "ffn_up_shexp.weight");
+        MM  (ffn_down_shexp,     "ffn_down_shexp.weight");
+        #undef MM
+        #undef NORM
+    }
+
+    onorm_syn = si; SYNTH_NAME(si, "output_norm.weight"); si++;
+    if (copy_norm(sm, "output_norm.weight", &nbuf[ni])) { sp_set_error("sp_model_to_qwen36: bad output_norm"); goto fail6; }
+    nsrc[ni] = &synth[onorm_syn]; ni++;
+    #undef SYNTH_NAME
+    #undef ARENA
+
+    {
+        int arena_prec = (ari > 0 && ats[0].pt.rows > 0 && ats[0].pt.row_prec[0] == 4u) ? 4 : 8;
+        arena = sp_arena_from_packed(ats, ari, arena_prec);
+    }
+    if (!arena) { sp_set_error("sp_model_to_qwen36: arena adoption failed"); goto fail6; }
+    free(ats); ats = NULL; ari = 0;
+
+    qm = (qwen3_model *)calloc(1, sizeof(*qm));
+    if (!qm) { sp_set_error("sp_model_to_qwen36: out of memory (model)"); sp_arena_free(arena); arena = NULL; goto fail6; }
+
+    qwen3_config *c = &qm->cfg;
+    c->arch           = SP_ARCH_QWEN36;
+    c->n_layers       = NL;
+    c->n_embd         = ai.hidden_dim;
+    c->n_head         = ai.n_heads;
+    c->n_head_kv      = ai.n_kv_heads;
+    c->head_dim       = ai.head_dim;
+    c->n_vocab        = ai.vocab_size;
+    c->context_length = ai.max_context;
+    c->rope_freq_base = ai.rope_freq_base;
+    c->rms_eps        = (ai.rms_eps != 0.0f) ? ai.rms_eps : 1e-6f;
+    c->has_qk_norm    = 1;
+    c->tied_embedding = has_output_w ? 0 : 1;
+    c->n_ff           = ai.n_ff;
+    c->q36_full_attn_interval  = interval;
+    c->q36_n_expert            = ai.q36_n_expert;
+    c->q36_n_expert_used       = ai.q36_n_expert_used;
+    c->q36_n_ff_exp            = ai.q36_n_ff_exp;
+    c->q36_n_ff_shexp          = ai.q36_n_ff_shexp;
+    c->q36_expert_weights_scale= ai.q36_expert_weights_scale != 0.0f ? ai.q36_expert_weights_scale : 1.0f;
+    c->q36_gdn_conv_k          = ai.q36_gdn_conv_k;
+    c->q36_gdn_state           = ai.q36_gdn_state;
+    c->q36_gdn_n_k_heads       = ai.q36_gdn_n_k_heads;
+    c->q36_gdn_n_v_heads       = ai.q36_gdn_n_v_heads;
+    c->q36_gdn_inner           = ai.q36_gdn_inner;
+    for (int s = 0; s < 4; s++) c->q36_rope_sections[s] = ai.q36_rope_sections[s];
+    c->q36_rope_dim            = ai.q36_rope_dim ? ai.q36_rope_dim : 64u;
+    c->q36_rope_base           = ai.q36_rope_base != 0.0f ? ai.q36_rope_base : ai.rope_freq_base;
+    c->q36_nextn_predict_layers= ai.q36_nextn_predict_layers;
+
+    qm->gguf          = NULL;
+    qm->layers        = layers;
+    qm->synth_tensors = synth;
+    qm->arena         = arena;
+    qm->released      = 1;
+    qm->norm_src      = nsrc;
+    qm->norm_buf      = nbuf;
+    qm->n_norm        = ni;
+    qm->token_embd    = &synth[embd_syn];
+    qm->output_norm   = &synth[onorm_syn];
+    qm->output        = has_output_w ? &synth[out_syn] : qm->token_embd;
+    return qm;
+
+fail6:
+    if (ats) { for (int i = 0; i < ari; i++) sp_frob_packed_free(&ats[i].pt); }
+    for (int i = 0; i < ni; i++) free(nbuf[i]);
+    free(ats); free(nsrc); free(nbuf); free(layers); free(synth);
+    return NULL;
+}
