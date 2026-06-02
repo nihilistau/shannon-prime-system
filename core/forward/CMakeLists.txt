@@ -23,3 +23,15 @@ sp_add_module(forward
     TEST      forward_test.c
     TEST_NAME T_FORWARD
     DEPENDS   sp_forward_dispatch sp_forward_kernels sp_poly_ring sp_kste sp_vht2)
+
+# M_QWEN36 — Qwen3.6-35B-A3B (qwen35moe) forward top-1 correctness gate (GGUF-direct).
+# SLOW / model-gated: skips (exit 0) when the 19.7 GB model is absent. Asserts the
+# greedy top-1 sequence is bit-exact to the llama.cpp oracle (5444 8 198).
+if(NOT DEFINED SP_SYSTEM_BUILD_TESTS OR SP_SYSTEM_BUILD_TESTS)
+    add_executable(test_qwen36_gate qwen36_gate.c)
+    target_link_libraries(test_qwen36_gate PRIVATE sp_forward sp_model)
+    target_include_directories(test_qwen36_gate PRIVATE ${SP_INCLUDE_DIR})
+    target_compile_options(test_qwen36_gate PRIVATE ${SP_C_FLAGS})
+    add_test(NAME M_QWEN36 COMMAND test_qwen36_gate)
+    set_tests_properties(M_QWEN36 PROPERTIES LABELS "SLOW" TIMEOUT 3600)
+endif()
