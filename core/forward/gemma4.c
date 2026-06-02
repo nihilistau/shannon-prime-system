@@ -77,6 +77,17 @@ int gemma4_forward(const qwen3_model *m, const int32_t *tokens, int n_tok, float
      * assumed constant widths — corrected after GGUF dim inspection.) */
     const int   QD_g = g_nh * g_hd, QD_s = s_nh * s_hd, QD_max = QD_g > QD_s ? QD_g : QD_s;
     const int   KVD_g = g_nkv * g_hd, KVD_s = s_nkv * s_hd, KVD_max = KVD_g > KVD_s ? KVD_g : KVD_s;
+    /* Per-layer FFN width (Gemma4 E-series is MatFormer/elastic: the FFN doubles in
+     * the back half — E2B layers 0-14 n_ff=6144, layers 15-34 n_ff=12288). Each
+     * layer's width = its bound ffn_gate out-dim (== llama.cpp hparams.n_ff(il));
+     * fall back to c->n_ff when tensor dims are unavailable (synthetic fixture).
+     * g/up buffers are sized to the per-layer max. */
+    int FF_max = FF;
+    for (int L = 0; L < NL; L++) {
+        const gguf_tensor *fg = m->layers[L].ffn_gate;
+        int ffl = (fg && fg->n_dims >= 2 && fg->dims[1] > 0) ? (int)fg->dims[1] : FF;
+        if (ffl > FF_max) FF_max = ffl;
+    }
 
     sp_kernels_read_env();
     int rc = 1;
@@ -86,8 +97,8 @@ int gemma4_forward(const qwen3_model *m, const int32_t *tokens, int n_tok, float
     float  *q   = (float *)malloc((size_t)n_tok * QD_max * sizeof(float));
     float  *ao  = (float *)malloc((size_t)n_tok * QD_max * sizeof(float));
     float  *ap  = (float *)malloc((size_t)n_tok * E   * sizeof(float));
-    float  *g   = (float *)malloc((size_t)n_tok * FF  * sizeof(float));
-    float  *up  = (float *)malloc((size_t)n_tok * FF  * sizeof(float));
+    float  *g   = (float *)malloc((size_t)n_tok * FF_max * sizeof(float));
+    float  *up  = (float *)malloc((size_t)n_tok * FF_max * sizeof(float));
     float  *dn  = (float *)malloc((size_t)n_tok * E   * sizeof(float));
     float  *sc  = (float *)malloc((size_t)n_tok       * sizeof(float));
     float **Kst = (float **)calloc((size_t)NL, sizeof(float *)); /* per-owner K (shared idx stay NULL) */
@@ -132,6 +143,8 @@ int gemma4_forward(const qwen3_model *m, const int32_t *tokens, int n_tok, float
 
     for (int L = 0; L < NL; L++) {
         const qwen3_layer *ly = &m->layers[L];
+        const int   FF_L = (ly->ffn_gate && ly->ffn_gate->n_dims >= 2 && ly->ffn_gate->dims[1] > 0)
+                           ? (int)ly->ffn_gate->dims[1] : FF;   /* per-layer FFN width */
         const int   global = ((L % period) == period - 1);
         const int   nh  = global ? g_nh  : s_nh;
         const int   nkv = global ? g_nkv : s_nkv;
@@ -191,13 +204,13 @@ int gemma4_forward(const qwen3_model *m, const int32_t *tokens, int n_tok, float
             for (int i = 0; i < E; i++) xt[i] += pt[i];
         }
 
-        /* ── FFN (GeGLU) + post_ffw_norm residual ── */
+        /* ── FFN (GeGLU, per-layer width FF_L) + post_ffw_norm residual ── */
         for (int t = 0; t < n_tok; t++)
             sp_rmsnorm(x + (size_t)t * E, sp_as_f32(m, ly->ffn_norm), E, eps, nx + (size_t)t * E);
-        if (sp_matmul(m, ly->ffn_gate, nx, n_tok, E, FF, g)) goto done;
-        if (sp_matmul(m, ly->ffn_up,   nx, n_tok, E, FF, up)) goto done;
-        for (size_t i = 0; i < (size_t)n_tok * FF; i++) g[i] = g4_gelu(g[i]) * up[i];
-        if (sp_matmul(m, ly->ffn_down, g, n_tok, FF, E, dn)) goto done;
+        if (sp_matmul(m, ly->ffn_gate, nx, n_tok, E, FF_L, g)) goto done;
+        if (sp_matmul(m, ly->ffn_up,   nx, n_tok, E, FF_L, up)) goto done;
+        for (size_t i = 0; i < (size_t)n_tok * FF_L; i++) g[i] = g4_gelu(g[i]) * up[i];
+        if (sp_matmul(m, ly->ffn_down, g, n_tok, FF_L, E, dn)) goto done;
         for (int t = 0; t < n_tok; t++) {
             sp_rmsnorm(dn + (size_t)t * E, sp_as_f32(m, ly->post_ffw_norm), E, eps, nx + (size_t)t * E);
             float *xt = x + (size_t)t * E; const float *pt = nx + (size_t)t * E;

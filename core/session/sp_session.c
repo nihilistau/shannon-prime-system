@@ -244,8 +244,17 @@ static int ensure_decode_bufs(sp_session *s) {
     s->svnew = (float *)malloc(KVD * sizeof(float));
     s->sao = (float *)malloc(QD * sizeof(float));
     s->sap = (float *)malloc((size_t)c->n_embd * sizeof(float));
-    s->sgg = (float *)malloc((size_t)c->n_ff * sizeof(float));
-    s->sup = (float *)malloc((size_t)c->n_ff * sizeof(float));
+    /* FFN scratch sized to the per-layer MAX width: Gemma4 E-series is elastic
+     * (n_ff doubles in the back half), so c->n_ff (layer-0) under-sizes it. */
+    {
+        uint32_t ff_max = c->n_ff;
+        for (uint32_t L = 0; L < c->n_layers; L++) {
+            const gguf_tensor *fg = s->qm->layers[L].ffn_gate;
+            if (fg && fg->n_dims >= 2 && (uint32_t)fg->dims[1] > ff_max) ff_max = (uint32_t)fg->dims[1];
+        }
+        s->sgg = (float *)malloc((size_t)ff_max * sizeof(float));
+        s->sup = (float *)malloc((size_t)ff_max * sizeof(float));
+    }
     s->sdn = (float *)malloc((size_t)c->n_embd * sizeof(float));
     s->ssc = (float *)malloc(s->hist_cap * sizeof(float));
     if (!s->sx || !s->snx || !s->sq || !s->sknew || !s->svnew ||
@@ -671,10 +680,12 @@ static int kv_step_gemma4(sp_session *s, int32_t tok, int pos, float *out_logits
         for (int i = 0; i < E; i++) x[i] += nx[i];
 
         sp_rmsnorm(x, sp_as_f32(m, ly->ffn_norm), E, eps, nx);
-        if (sp_matmul(m, ly->ffn_gate, nx, 1, E, FF, gg)) { free(ipl); free(pgate); free(pproj); free(ple); return 1; }
-        if (sp_matmul(m, ly->ffn_up,   nx, 1, E, FF, up)) { free(ipl); free(pgate); free(pproj); free(ple); return 1; }
-        for (int i = 0; i < FF; i++) gg[i] = gelu_tanh(gg[i]) * up[i];
-        if (sp_matmul(m, ly->ffn_down, gg, 1, FF, E, dn)) { free(ipl); free(pgate); free(pproj); free(ple); return 1; }
+        const int FF_L = (ly->ffn_gate && ly->ffn_gate->n_dims >= 2 && ly->ffn_gate->dims[1] > 0)
+                         ? (int)ly->ffn_gate->dims[1] : FF;   /* per-layer FFN width (Gemma4 elastic) */
+        if (sp_matmul(m, ly->ffn_gate, nx, 1, E, FF_L, gg)) { free(ipl); free(pgate); free(pproj); free(ple); return 1; }
+        if (sp_matmul(m, ly->ffn_up,   nx, 1, E, FF_L, up)) { free(ipl); free(pgate); free(pproj); free(ple); return 1; }
+        for (int i = 0; i < FF_L; i++) gg[i] = gelu_tanh(gg[i]) * up[i];
+        if (sp_matmul(m, ly->ffn_down, gg, 1, FF_L, E, dn)) { free(ipl); free(pgate); free(pproj); free(ple); return 1; }
         sp_rmsnorm(dn, sp_as_f32(m, ly->post_ffw_norm), E, eps, nx);
         for (int i = 0; i < E; i++) x[i] += nx[i];
 
