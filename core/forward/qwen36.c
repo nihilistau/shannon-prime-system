@@ -108,6 +108,7 @@ int qwen36_forward(const qwen3_model *m, const int32_t *tokens, int n_tok, float
                     cs[(size_t)t * convC + ch] = silu_f(acc);
                 }
             }
+            if (dbg) dbg_fp("conv_output_silu", (int)il, cs + (size_t)(n_tok - 1) * convC, convC);
             /* split + L2-norm q,k per head (v unnormed). layout in cs per token:
              *   q: [0, Kdim)  -> Hk heads x Sd ; k: [Kdim, 2Kdim) ; v: [2Kdim, convC) */
             for (int t = 0; t < n_tok; t++) {
@@ -129,7 +130,7 @@ int qwen36_forward(const qwen3_model *m, const int32_t *tokens, int n_tok, float
                     const float *kh = cs + (size_t)t * convC + Kdim + (size_t)hk * Sd;    /* k (normed) */
                     const float *vh = cs + (size_t)t * convC + 2 * Kdim + (size_t)h * Sd; /* v */
                     float gh = expf(aA[h] * softplus_f(alp[(size_t)t * Hv + h] + dB[h])); /* decay */
-                    float bh = bet[(size_t)t * Hv + h];
+                    float bh = sigmoid_f(bet[(size_t)t * Hv + h]);   /* beta = sigmoid(ssm_beta.x) */
                     /* S *= gh */
                     for (int i = 0; i < Sd * Sd; i++) St[i] *= gh;
                     /* sk[j] = sum_i S[i,j]*k[i] ; d[j] = bh*(v[j]-sk[j]) */
