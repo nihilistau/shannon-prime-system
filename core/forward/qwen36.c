@@ -273,9 +273,74 @@ int qwen36_forward(const qwen3_model *m, const int32_t *tokens, int n_tok, float
             if (sp_matmul(m, L->gdn_out, fno, n_tok, Vdim, E, blk)) goto done;
             if (dbg) dbg_fp("linear_attn_out", (int)il, blk + (size_t)(n_tok - 1) * E, E);
         } else {
-            /* ── full-attention block (Stage 2b: STUB pass-through) ── */
-            memset(blk, 0, (size_t)n_tok * E * sizeof(float));
-            if (dbg) dbg_fp("attn_output(stub)", (int)il, blk + (size_t)(n_tok - 1) * E, E);
+            /* ── gated full-attention + IMRoPE block ──
+             * wq outputs [query|gate] per head (stride 2*HD); Q/K RMSNorm over HD;
+             * RoPE (NEOX on first n_rot dims; IMRoPE reduces to NEOX for text — all
+             * mrope position components equal the token position); GQA causal attn;
+             * output *= sigmoid(gate); wo. */
+            const int NH = (int)c->n_head, NKV = (int)c->n_head_kv, HD = (int)c->head_dim;
+            const int QD = NH * HD, KVD = NKV * HD, group = NH / NKV;
+            const int nrot = (int)c->q36_rope_dim;
+            const float rbase = c->q36_rope_base;
+            const float ascale = 1.0f / sqrtf((float)HD);
+            const int QD2 = NH * HD * 2;                 /* == convC; reuse qkv for qf */
+            float *qf = qkv;
+            float *qq = (float *)malloc((size_t)n_tok * QD * sizeof(float));
+            float *gt = (float *)malloc((size_t)n_tok * QD * sizeof(float));
+            float *kk = (float *)malloc((size_t)n_tok * KVD * sizeof(float));
+            float *vv = (float *)malloc((size_t)n_tok * KVD * sizeof(float));
+            float *sc = (float *)malloc((size_t)n_tok * sizeof(float));
+            if (!qq || !gt || !kk || !vv || !sc) { free(qq); free(gt); free(kk); free(vv); free(sc); goto done; }
+            int af = (sp_matmul(m, L->attn_q, nx, n_tok, E, QD2, qf) ||
+                      sp_matmul(m, L->attn_k, nx, n_tok, E, KVD, kk) ||
+                      sp_matmul(m, L->attn_v, nx, n_tok, E, KVD, vv));
+            const float *qnw = sp_as_f32(m, L->attn_q_norm);
+            const float *knw = sp_as_f32(m, L->attn_k_norm);
+            for (int t = 0; t < n_tok && !af; t++) {
+                for (int h = 0; h < NH; h++) {
+                    const float *src = qf + (size_t)t * QD2 + (size_t)h * HD * 2;
+                    float *qh = qq + (size_t)t * QD + (size_t)h * HD;
+                    float *gh = gt + (size_t)t * QD + (size_t)h * HD;
+                    memcpy(qh, src,      (size_t)HD * sizeof(float));   /* query half */
+                    memcpy(gh, src + HD, (size_t)HD * sizeof(float));   /* gate half  */
+                    sp_rmsnorm_head(qh, qnw, HD, eps);
+                    sp_rope_neox(qh, nrot, t, rbase);
+                }
+                for (int h = 0; h < NKV; h++) {
+                    float *kh = kk + (size_t)t * KVD + (size_t)h * HD;
+                    sp_rmsnorm_head(kh, knw, HD, eps);
+                    sp_rope_neox(kh, nrot, t, rbase);
+                }
+            }
+            for (int t = 0; t < n_tok && !af; t++) {
+                for (int h = 0; h < NH; h++) {
+                    int kvh = h / group;
+                    const float *qh = qq + (size_t)t * QD + (size_t)h * HD;
+                    float maxs = -INFINITY;
+                    for (int s = 0; s <= t; s++) {
+                        const float *kh = kk + (size_t)s * KVD + (size_t)kvh * HD;
+                        float acc = 0.0f;
+                        for (int i = 0; i < HD; i++) acc += qh[i] * kh[i];
+                        float d = acc * ascale; sc[s] = d; if (d > maxs) maxs = d;
+                    }
+                    float sum = 0.0f;
+                    for (int s = 0; s <= t; s++) { sc[s] = expf(sc[s] - maxs); sum += sc[s]; }
+                    float inv = 1.0f / sum;
+                    const float *gh = gt + (size_t)t * QD + (size_t)h * HD;
+                    float *aout = od + (size_t)t * QD + (size_t)h * HD;   /* reuse od as attn concat */
+                    for (int i = 0; i < HD; i++) aout[i] = 0.0f;
+                    for (int s = 0; s <= t; s++) {
+                        float w = sc[s] * inv;
+                        const float *vh = vv + (size_t)s * KVD + (size_t)kvh * HD;
+                        for (int i = 0; i < HD; i++) aout[i] += w * vh[i];
+                    }
+                    for (int i = 0; i < HD; i++) aout[i] *= sigmoid_f(gh[i]);   /* output gate */
+                }
+            }
+            if (!af) af = sp_matmul(m, L->attn_output, od, n_tok, QD, E, blk);
+            free(qq); free(gt); free(kk); free(vv); free(sc);
+            if (af) goto done;
+            if (dbg) dbg_fp("attn_output", (int)il, blk + (size_t)(n_tok - 1) * E, E);
         }
 
         /* attn residual */
