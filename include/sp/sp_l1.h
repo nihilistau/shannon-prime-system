@@ -109,6 +109,26 @@ typedef struct {
     uint32_t g4_n_kv_from_start;  /* layers [0,this) own KV; rest reuse (shared-KV)  */
     float    g4_logit_softcap;    /* final-logit softcap (30); 0 = none              */
     uint32_t g4_swa_period;       /* SWA/global period (6); global when L%period==period-1 */
+
+    /* ── appended Phase 3-MoE+GDN (qwen35moe / Qwen3.6; reserved tail; 0 = unspecified) ──
+     * For arch_id == QWEN36 the base head_dim/n_heads/n_kv_heads hold the FULL-ATTN
+     * geometry; these carry the GDN (gated delta-net) geometry + MoE params + IMRoPE
+     * sections. All zero on non-qwen35moe models. sizeof(sp_arch_info) MUST stay <= 256. */
+    uint32_t q36_full_attn_interval; /* full-attn iff (L+1)%this==0 (4)  */
+    uint32_t q36_n_expert;           /* routed experts (256)             */
+    uint32_t q36_n_expert_used;      /* top-k (8)                        */
+    uint32_t q36_n_ff_exp;           /* per-expert FFN dim (512)         */
+    uint32_t q36_n_ff_shexp;         /* shared-expert FFN dim (512)      */
+    float    q36_expert_weights_scale;/* scale on renormed top-k weights (1.0) */
+    uint32_t q36_gdn_conv_k;         /* causal conv kernel (4)           */
+    uint32_t q36_gdn_state;          /* GDN head_dim S (128)             */
+    uint32_t q36_gdn_n_k_heads;      /* k/q heads H_k (16)               */
+    uint32_t q36_gdn_n_v_heads;      /* v heads H_v / dt_rank (32)       */
+    uint32_t q36_gdn_inner;          /* d_inner (4096)                   */
+    int32_t  q36_rope_sections[4];   /* IMRoPE sections [11,11,10,0]     */
+    uint32_t q36_rope_dim;           /* rope.dimension_count (64)        */
+    float    q36_rope_base;          /* rope.freq_base (1e7)             */
+    uint32_t q36_nextn_predict_layers;/* trailing NextN/MTP blocks (0)   */
 } sp_arch_info;
 
 /* Populate *out from the loaded model's header arch_struct. Caller-stack-allocated.
