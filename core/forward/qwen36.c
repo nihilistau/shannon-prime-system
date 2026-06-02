@@ -15,6 +15,7 @@
 #include "sp/model.h"
 #include "sp/forward_dispatch.h"   /* sp_matmul / sp_embed_row / sp_as_f32 / sp_kernels_read_env */
 #include "sp/forward_kernels.h"    /* sp_rmsnorm / sp_rmsnorm_head */
+#include "sp/weight_dtype.h"       /* sp_dequant_row (rank-3 expert slices) */
 
 #include <stdlib.h>
 #include <string.h>
@@ -41,6 +42,104 @@ static void dbg_fp(const char *name, int il, const float *col, int n) {
     fflush(stderr);
 }
 
+/* bytes for `n` contiguous weight elements (F32/F16/Q8_0/Q4_K/Q6_K). */
+static size_t q36_rb(uint32_t type, int n) {
+    switch (type) {
+        case 0:  return (size_t)n * 4;          /* F32  */
+        case 1:  return (size_t)n * 2;          /* F16  */
+        case 8:  return (size_t)(n / 32) * 34;  /* Q8_0 */
+        case 12: return (size_t)(n / 256) * 144;/* Q4_K */
+        case 14: return (size_t)(n / 256) * 210;/* Q6_K */
+        default: return 0;
+    }
+}
+
+/* single-token matmul with expert slice `e` of a rank-3 tensor [in, out, n_expert]:
+ * row o of expert e is the `in`-vector at element ((e*out)+o)*in. f32 reference dot. */
+static int expert_mm(const qwen3_model *m, const gguf_tensor *W, int e,
+                     const float *X, int in, int out, float *Y) {
+    const uint8_t *base = (const uint8_t *)gguf_tensor_data(m->gguf, W);
+    size_t rb = q36_rb(W->type, in);
+    if (!base || rb == 0) return 1;
+    float *wrow = (float *)malloc((size_t)in * sizeof(float));
+    if (!wrow) return 1;
+    for (int o = 0; o < out; o++) {
+        if (sp_dequant_row(base + ((size_t)e * out + o) * rb, W->type, in, wrow)) { free(wrow); return 1; }
+        float acc = 0.0f;
+        for (int i = 0; i < in; i++) acc += wrow[i] * X[i];
+        Y[o] = acc;
+    }
+    free(wrow);
+    return 0;
+}
+
+/* MoE FFN: f32 softmax/top-k/renorm router (NEVER quantized — top-k is a discrete
+ * cliff) + Z_q/f32 routed experts (SwiGLU) + sigmoid-gated shared expert. */
+static int moe_ffn(const qwen3_model *m, const qwen3_layer *L, const qwen3_config *c,
+                   const float *nx, int n_tok, float *out) {
+    const int E = (int)c->n_embd;
+    const int NE = (int)c->q36_n_expert, NU = (int)c->q36_n_expert_used;
+    const int FF = (int)c->q36_n_ff_exp, FS = (int)c->q36_n_ff_shexp;
+    const int FM = FF > FS ? FF : FS;
+    const float wscale = c->q36_expert_weights_scale;
+    int rc = 1;
+    float *lg = (float *)malloc((size_t)NE * sizeof(float));
+    float *g  = (float *)malloc((size_t)FM * sizeof(float));
+    float *u  = (float *)malloc((size_t)FM * sizeof(float));
+    float *hh = (float *)malloc((size_t)FM * sizeof(float));
+    float *de = (float *)malloc((size_t)E  * sizeof(float));
+    float *sh = (float *)malloc((size_t)E  * sizeof(float));
+    int   *idx = (int *)malloc((size_t)NU * sizeof(int));
+    float *wt  = (float *)malloc((size_t)NU * sizeof(float));
+    char  *used = (char *)malloc((size_t)NE);
+    if (!lg || !g || !u || !hh || !de || !sh || !idx || !wt || !used) goto done;
+
+    for (int t = 0; t < n_tok; t++) {
+        const float *x = nx + (size_t)t * E;
+        float *yo = out + (size_t)t * E;
+        /* router: f32 softmax over all NE experts */
+        if (sp_matmul(m, L->ffn_gate_inp, x, 1, E, NE, lg)) goto done;
+        float mx = lg[0];
+        for (int i = 1; i < NE; i++) if (lg[i] > mx) mx = lg[i];
+        double se = 0.0;
+        for (int i = 0; i < NE; i++) { lg[i] = expf(lg[i] - mx); se += lg[i]; }
+        for (int i = 0; i < NE; i++) lg[i] = (float)(lg[i] / se);
+        /* top-NU by prob, then renormalize the chosen weights and scale */
+        memset(used, 0, (size_t)NE);
+        float wsum = 0.0f;
+        for (int k = 0; k < NU; k++) {
+            int best = -1; float bv = -1.0f;
+            for (int i = 0; i < NE; i++) if (!used[i] && lg[i] > bv) { bv = lg[i]; best = i; }
+            used[best] = 1; idx[k] = best; wt[k] = bv; wsum += bv;
+        }
+        for (int k = 0; k < NU; k++) wt[k] = (wt[k] / wsum) * wscale;
+        /* routed experts (SwiGLU), accumulate weighted */
+        memset(yo, 0, (size_t)E * sizeof(float));
+        for (int k = 0; k < NU; k++) {
+            int e = idx[k];
+            if (expert_mm(m, L->ffn_gate_exps, e, x, E, FF, g)) goto done;
+            if (expert_mm(m, L->ffn_up_exps,   e, x, E, FF, u)) goto done;
+            for (int i = 0; i < FF; i++) hh[i] = silu_f(g[i]) * u[i];
+            if (expert_mm(m, L->ffn_down_exps, e, hh, FF, E, de)) goto done;
+            float w = wt[k];
+            for (int i = 0; i < E; i++) yo[i] += w * de[i];
+        }
+        /* shared expert (always on), sigmoid-gated */
+        if (sp_matmul(m, L->ffn_gate_shexp, x, 1, E, FS, g)) goto done;
+        if (sp_matmul(m, L->ffn_up_shexp,   x, 1, E, FS, u)) goto done;
+        for (int i = 0; i < FS; i++) hh[i] = silu_f(g[i]) * u[i];
+        if (sp_matmul(m, L->ffn_down_shexp, hh, 1, FS, E, sh)) goto done;
+        float sg = 0.0f;
+        if (sp_matmul(m, L->ffn_gate_inp_shexp, x, 1, E, 1, &sg)) goto done;
+        sg = sigmoid_f(sg);
+        for (int i = 0; i < E; i++) yo[i] += sg * sh[i];
+    }
+    rc = 0;
+done:
+    free(lg); free(g); free(u); free(hh); free(de); free(sh); free(idx); free(wt); free(used);
+    return rc;
+}
+
 int qwen36_forward(const qwen3_model *m, const int32_t *tokens, int n_tok, float *logits) {
     const qwen3_config *c = &m->cfg;
     const int E   = (int)c->n_embd;          /* 2048 */
@@ -61,6 +160,7 @@ int qwen36_forward(const qwen3_model *m, const int32_t *tokens, int n_tok, float
     float *x   = (float *)malloc((size_t)n_tok * E * sizeof(float));   /* residual stream */
     float *nx  = (float *)malloc((size_t)n_tok * E * sizeof(float));   /* normed scratch */
     float *blk = (float *)malloc((size_t)n_tok * E * sizeof(float));   /* block output [E] */
+    float *moe = (float *)malloc((size_t)n_tok * E * sizeof(float));   /* MoE FFN output [E] */
     /* GDN scratch */
     float *qkv = (float *)malloc((size_t)n_tok * convC * sizeof(float));
     float *zg  = (float *)malloc((size_t)n_tok * Vdim * sizeof(float));
@@ -72,7 +172,7 @@ int qwen36_forward(const qwen3_model *m, const int32_t *tokens, int n_tok, float
     float *St  = (float *)malloc((size_t)Sd * Sd * sizeof(float));         /* per-head state */
     float *skv = (float *)malloc((size_t)Sd * sizeof(float));
     float *dlt = (float *)malloc((size_t)Sd * sizeof(float));
-    if (!x || !nx || !blk || !qkv || !zg || !cs || !bet || !alp || !od || !fno || !St || !skv || !dlt)
+    if (!x || !nx || !blk || !moe || !qkv || !zg || !cs || !bet || !alp || !od || !fno || !St || !skv || !dlt)
         goto done;
 
     sp_kernels_read_env();
@@ -181,8 +281,12 @@ int qwen36_forward(const qwen3_model *m, const int32_t *tokens, int n_tok, float
         /* attn residual */
         for (int i = 0; i < n_tok * E; i++) x[i] += blk[i];
 
-        /* post-attn norm -> MoE FFN (Stage 2c: STUB, adds 0) -> ffn residual */
-        /* (no-op this revision; residual stream carries attn output only) */
+        /* post-attn norm -> MoE FFN -> ffn residual */
+        for (int t = 0; t < n_tok; t++)
+            sp_rmsnorm(x + (size_t)t * E, sp_as_f32(m, L->post_attn_norm), E, eps, nx + (size_t)t * E);
+        if (moe_ffn(m, L, c, nx, n_tok, moe)) goto done;
+        if (dbg) dbg_fp("ffn_out", (int)il, moe + (size_t)(n_tok - 1) * E, E);
+        for (int i = 0; i < n_tok * E; i++) x[i] += moe[i];
         if (dbg) dbg_fp("l_out", (int)il, x + (size_t)(n_tok - 1) * E, E);
     }
 
@@ -193,7 +297,7 @@ int qwen36_forward(const qwen3_model *m, const int32_t *tokens, int n_tok, float
     rc = 0;
 
 done:
-    free(x); free(nx); free(blk); free(qkv); free(zg); free(cs); free(bet);
+    free(x); free(nx); free(blk); free(moe); free(qkv); free(zg); free(cs); free(bet);
     free(alp); free(od); free(fno); free(St); free(skv); free(dlt);
     return rc;
 }
