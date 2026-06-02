@@ -172,6 +172,7 @@ struct qwen3_model *sp_model_to_qwen3(const sp_model *m);
 struct qwen3_model *sp_model_to_gemma3(const sp_model *m);
 struct qwen3_model *sp_model_to_qwen25(const sp_model *m);
 struct qwen3_model *sp_model_to_gemma4(const sp_model *m);
+struct qwen3_model *sp_model_to_qwen36(const sp_model *m);   /* qwen35moe: GDN + MoE hybrid */
 
 /* Hoist the runnable qwen3_model into the sp_model handle (built once, shared
  * across sessions). store_qm takes ownership: sp_model_unload calls free_fn(qm)
