@@ -41,12 +41,15 @@ void qwen3_q4_stats(long *promoted, long *rows) {
     if (rows)     *rows     = g_q4_rows;
 }
 
-/* bytes occupied by `n` contiguous elements of a ggml weight row (F32/F16/Q8_0). */
+/* bytes occupied by `n` contiguous elements of a ggml weight row
+ * (F32/F16/Q8_0 + the Q4_K/Q6_K k-quants used by qwen35moe Q4_K_M). */
 static size_t row_bytes(uint32_t type, int n) {
     switch (type) {
         case GGML_T_F32:  return (size_t)n * 4;
         case GGML_T_F16:  return (size_t)n * 2;
         case GGML_T_Q8_0: return (size_t)(n / 32) * 34;
+        case GGML_T_Q4_K: return (size_t)(n / 256) * 144;
+        case GGML_T_Q6_K: return (size_t)(n / 256) * 210;
         default:          return 0;
     }
 }
