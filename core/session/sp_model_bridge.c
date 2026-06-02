@@ -169,7 +169,15 @@ struct qwen3_model *sp_model_to_gemma3(const sp_model *sm) {
     nbuf   = (float **)calloc((size_t)NNORM, sizeof(*nbuf));
     if (!synth || !layers || !ats || !nsrc || !nbuf) { sp_set_error("sp_model_to_gemma3: out of memory"); goto fail; }
 
-    #define SYNTH_NAME(idx, str) snprintf(synth[(idx)].name, sizeof synth[(idx)].name, "%s", (str))
+    /* Set the synth tensor's name AND copy its dims from the .sp-model entry, so
+     * gemma4_forward can recover per-layer geometry (per-layer n_ff via
+     * ffn_gate->dims[1] — Gemma4 elastic FFN). Harmless for the other arches. */
+    #define SYNTH_NAME(idx, str) do { \
+        snprintf(synth[(idx)].name, sizeof synth[(idx)].name, "%s", (str)); \
+        const sp_tensor_entry *e_ = sp_model_find_tensor(sm, (str)); \
+        if (e_) { synth[(idx)].n_dims = e_->n_dims; \
+            for (uint32_t d_ = 0; d_ < e_->n_dims && d_ < 8u; d_++) synth[(idx)].dims[d_] = e_->dims[d_]; } \
+    } while (0)
     #define ARENA(wname) do { \
         if (build_packed(sm, (wname), &ats[ari].pt)) { \
             char eb_[128]; snprintf(eb_, sizeof eb_, "sp_model_to_gemma3: bad weight %s", (wname)); \
@@ -316,7 +324,15 @@ struct qwen3_model *sp_model_to_qwen3(const sp_model *sm) {
     nbuf   = (float **)calloc((size_t)NNORM, sizeof(*nbuf));
     if (!synth || !layers || !ats || !nsrc || !nbuf) { sp_set_error("sp_model_to_qwen3: out of memory"); goto fail; }
 
-    #define SYNTH_NAME(idx, str) snprintf(synth[(idx)].name, sizeof synth[(idx)].name, "%s", (str))
+    /* Set the synth tensor's name AND copy its dims from the .sp-model entry, so
+     * gemma4_forward can recover per-layer geometry (per-layer n_ff via
+     * ffn_gate->dims[1] — Gemma4 elastic FFN). Harmless for the other arches. */
+    #define SYNTH_NAME(idx, str) do { \
+        snprintf(synth[(idx)].name, sizeof synth[(idx)].name, "%s", (str)); \
+        const sp_tensor_entry *e_ = sp_model_find_tensor(sm, (str)); \
+        if (e_) { synth[(idx)].n_dims = e_->n_dims; \
+            for (uint32_t d_ = 0; d_ < e_->n_dims && d_ < 8u; d_++) synth[(idx)].dims[d_] = e_->dims[d_]; } \
+    } while (0)
     #define ARENA(wname) do { \
         if (build_packed(sm, (wname), &ats[ari].pt)) { \
             char eb_[128]; snprintf(eb_, sizeof eb_, "sp_model_to_qwen3: bad weight %s", (wname)); \
@@ -468,7 +484,15 @@ struct qwen3_model *sp_model_to_qwen25(const sp_model *sm) {
     nbuf   = (float **)calloc((size_t)NNORM, sizeof(*nbuf));
     if (!synth || !layers || !ats || !nsrc || !nbuf) { sp_set_error("sp_model_to_qwen25: out of memory"); goto fail25; }
 
-    #define SYNTH_NAME(idx, str) snprintf(synth[(idx)].name, sizeof synth[(idx)].name, "%s", (str))
+    /* Set the synth tensor's name AND copy its dims from the .sp-model entry, so
+     * gemma4_forward can recover per-layer geometry (per-layer n_ff via
+     * ffn_gate->dims[1] — Gemma4 elastic FFN). Harmless for the other arches. */
+    #define SYNTH_NAME(idx, str) do { \
+        snprintf(synth[(idx)].name, sizeof synth[(idx)].name, "%s", (str)); \
+        const sp_tensor_entry *e_ = sp_model_find_tensor(sm, (str)); \
+        if (e_) { synth[(idx)].n_dims = e_->n_dims; \
+            for (uint32_t d_ = 0; d_ < e_->n_dims && d_ < 8u; d_++) synth[(idx)].dims[d_] = e_->dims[d_]; } \
+    } while (0)
     #define ARENA(wname) do { \
         if (build_packed(sm, (wname), &ats[ari].pt)) { \
             char eb_[128]; snprintf(eb_, sizeof eb_, "sp_model_to_qwen25: bad weight %s", (wname)); \
@@ -617,7 +641,15 @@ struct qwen3_model *sp_model_to_gemma4(const sp_model *sm) {
     nbuf   = (float **)calloc((size_t)NNORM, sizeof(*nbuf));
     if (!synth || !layers || !ats || !nsrc || !nbuf) { sp_set_error("sp_model_to_gemma4: out of memory"); goto fail4; }
 
-    #define SYNTH_NAME(idx, str) snprintf(synth[(idx)].name, sizeof synth[(idx)].name, "%s", (str))
+    /* Set the synth tensor's name AND copy its dims from the .sp-model entry, so
+     * gemma4_forward can recover per-layer geometry (per-layer n_ff via
+     * ffn_gate->dims[1] — Gemma4 elastic FFN). Harmless for the other arches. */
+    #define SYNTH_NAME(idx, str) do { \
+        snprintf(synth[(idx)].name, sizeof synth[(idx)].name, "%s", (str)); \
+        const sp_tensor_entry *e_ = sp_model_find_tensor(sm, (str)); \
+        if (e_) { synth[(idx)].n_dims = e_->n_dims; \
+            for (uint32_t d_ = 0; d_ < e_->n_dims && d_ < 8u; d_++) synth[(idx)].dims[d_] = e_->dims[d_]; } \
+    } while (0)
     #define ARENA(wname) do { \
         if (build_packed(sm, (wname), &ats[ari].pt)) { \
             char eb_[128]; snprintf(eb_, sizeof eb_, "sp_model_to_gemma4: bad weight %s", (wname)); \
