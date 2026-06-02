@@ -52,6 +52,15 @@ uint16_t sp_f32_to_f16(float f) {
     return h;
 }
 
+/* ggml get_scale_min_k4: unpack the 6-bit scale/min from the packed scales[12]. */
+static void get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *m) {
+    if (j < 4) { *d = q[j] & 63; *m = q[j + 4] & 63; }
+    else {
+        *d = (uint8_t)((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4));
+        *m = (uint8_t)((q[j + 4] >>  4) | ((q[j - 0] >> 6) << 4));
+    }
+}
+
 int sp_dequant_row(const void *src, uint32_t type, int n, float *dst) {
     if (n < 0) return 1;
     switch (type) {
@@ -77,7 +86,61 @@ int sp_dequant_row(const void *src, uint32_t type, int n, float *dst) {
             }
             return 0;
         }
+        case SP_WDT_Q4_K: {
+            /* block_q4_K = { f16 d; f16 dmin; u8 scales[12]; u8 qs[128]; } = 144 B / 256 elems */
+            if (n % 256 != 0) return 1;
+            const uint8_t *p = (const uint8_t *)src;
+            int nb = n / 256;
+            for (int b = 0; b < nb; b++) {
+                uint16_t dh, mh; memcpy(&dh, p, 2); memcpy(&mh, p + 2, 2);
+                float d = sp_f16_to_f32(dh), dmin = sp_f16_to_f32(mh);
+                const uint8_t *scales = p + 4;
+                const uint8_t *q = p + 16;
+                float *y = dst + (size_t)b * 256;
+                int is = 0;
+                for (int j = 0; j < 256; j += 64) {
+                    uint8_t sc, mm;
+                    get_scale_min_k4(is + 0, scales, &sc, &mm); float d1 = d * sc, m1 = dmin * mm;
+                    get_scale_min_k4(is + 1, scales, &sc, &mm); float d2 = d * sc, m2 = dmin * mm;
+                    for (int l = 0; l < 32; l++) y[l]      = d1 * (float)(q[l] & 0xF) - m1;
+                    for (int l = 0; l < 32; l++) y[l + 32] = d2 * (float)(q[l] >>  4) - m2;
+                    y += 64; q += 32; is += 2;
+                }
+                p += 144;
+            }
+            return 0;
+        }
+        case SP_WDT_Q6_K: {
+            /* block_q6_K = { u8 ql[128]; u8 qh[64]; i8 scales[16]; f16 d; } = 210 B / 256 elems */
+            if (n % 256 != 0) return 1;
+            const uint8_t *p = (const uint8_t *)src;
+            int nb = n / 256;
+            for (int b = 0; b < nb; b++) {
+                const uint8_t *ql = p;
+                const uint8_t *qh = p + 128;
+                const int8_t  *sc = (const int8_t *)(p + 192);
+                uint16_t dh; memcpy(&dh, p + 208, 2);
+                float d = sp_f16_to_f32(dh);
+                float *y = dst + (size_t)b * 256;
+                for (int n2 = 0; n2 < 256; n2 += 128) {
+                    for (int l = 0; l < 32; l++) {
+                        int is = l / 16;
+                        int8_t q1 = (int8_t)((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                        int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                        int8_t q3 = (int8_t)((ql[l +  0] >>  4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                        int8_t q4 = (int8_t)((ql[l + 32] >>  4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                        y[l +  0] = d * sc[is + 0] * q1;
+                        y[l + 32] = d * sc[is + 2] * q2;
+                        y[l + 64] = d * sc[is + 4] * q3;
+                        y[l + 96] = d * sc[is + 6] * q4;
+                    }
+                    ql += 64; qh += 32; sc += 8; y += 128;
+                }
+                p += 210;
+            }
+            return 0;
+        }
         default:
-            return 1;  /* unsupported (k-quants etc.) -- added when the model layer needs them */
+            return 1;  /* unsupported quant type */
     }
 }
