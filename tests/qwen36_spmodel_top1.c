@@ -13,8 +13,12 @@ int main(int argc, char **argv) {
     int np = argc > 3 ? atoi(argv[3]) : 3;
     sp_model *m = NULL;
     if (sp_model_load(argv[1], argv[2], &m) != SP_OK) { printf("sp_model_load FAIL\n"); return 1; }
+    { sp_arch_info ai; if (sp_model_arch(m, &ai) == SP_OK)
+        printf("arch_id=%u interval=%u n_expert=%u/%u n_ff_exp=%u gdn_state=%u/%u/%u\n",
+               ai.arch_id, ai.q36_full_attn_interval, ai.q36_n_expert, ai.q36_n_expert_used,
+               ai.q36_n_ff_exp, ai.q36_gdn_state, ai.q36_gdn_n_k_heads, ai.q36_gdn_n_v_heads); }
     qwen3_model *qm = sp_model_to_qwen36(m);
-    if (!qm) { printf("sp_model_to_qwen36 FAIL\n"); return 1; }
+    if (!qm) { printf("sp_model_to_qwen36 FAIL: %s\n", sp_last_error()); return 1; }
     const int V = (int)qm->cfg.n_vocab;
     printf("loaded: arch=%d NL=%u n_expert=%u/%u n_ff_exp=%u gdn_state=%u interval=%u V=%d\n",
            qm->cfg.arch, qm->cfg.n_layers, qm->cfg.q36_n_expert, qm->cfg.q36_n_expert_used,

@@ -40,7 +40,8 @@ static int build_packed_q8(const sp_model *sm, const char *name, sp_frob_packed_
     memset(out, 0, sizeof *out);
     const sp_tensor_entry *e = sp_model_find_tensor(sm, name);
     if (!e || e->dtype_id != (uint32_t)SP_DT_OK_Q8 || e->n_dims < 2) return 1;
-    uint64_t cols = e->dims[0], rows = e->dims[1];
+    /* rank-3 expert tensors [cols, rows, n_expert] pack as (rows*n_expert) rows. */
+    uint64_t cols = e->dims[0], rows = e->dims[1] * (e->n_dims >= 3 ? e->dims[2] : 1u);
     if (rows == 0 || cols == 0 || e->size_bytes != rows * cols) return 1;
     const uint8_t *codes = (const uint8_t *)sp_model_tensor_data(sm, e);
     if (!codes) return 1;
@@ -75,7 +76,8 @@ static int build_packed_q4(const sp_model *sm, const char *name, sp_frob_packed_
     memset(out, 0, sizeof *out);
     const sp_tensor_entry *e = sp_model_find_tensor(sm, name);
     if (!e || e->dtype_id != (uint32_t)SP_DT_OK_Q4 || e->n_dims < 2) return 1;
-    uint64_t cols = e->dims[0], rows = e->dims[1];
+    /* rank-3 expert tensors [cols, rows, n_expert] pack as (rows*n_expert) rows. */
+    uint64_t cols = e->dims[0], rows = e->dims[1] * (e->n_dims >= 3 ? e->dims[2] : 1u);
     if (rows == 0 || cols == 0) return 1;
     uint64_t nib_cols = (cols + 1u) / 2u;
     if (e->size_bytes != rows * nib_cols) return 1;
