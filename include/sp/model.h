@@ -21,7 +21,8 @@ extern "C" {
 /* Model architecture. Selects the forward pass + which optional config fields and
  * per-layer tensors are populated. Default 0 = Qwen3 (calloc-zeroed configs and
  * existing callers get the right value with no churn). */
-typedef enum { SP_ARCH_QWEN3 = 0, SP_ARCH_GEMMA3 = 1, SP_ARCH_QWEN25 = 2, SP_ARCH_GEMMA4 = 3 } sp_arch_t;
+typedef enum { SP_ARCH_QWEN3 = 0, SP_ARCH_GEMMA3 = 1, SP_ARCH_QWEN25 = 2, SP_ARCH_GEMMA4 = 3,
+               SP_ARCH_QWEN36 = 4 /* qwen35moe: Gated DeltaNet + MoE hybrid */ } sp_arch_t;
 
 typedef struct {
     sp_arch_t arch;           /* SP_ARCH_QWEN3 (default) | SP_ARCH_GEMMA3 */
@@ -51,6 +52,29 @@ typedef struct {
     uint32_t g4_n_kv_from_start; /* layers [0,this) own KV; the rest reuse (shared-KV) */
     float    g4_logit_softcap;   /* final-logit softcap (30); 0 = none */
     uint32_t g4_swa_period;      /* SWA/global period (6); global when L%period==period-1 */
+    /* ── Qwen3.6 / qwen35moe (SP_ARCH_QWEN36) extras; zero on other archs. A
+     * Gated DeltaNet (Qwen3-Next family) + MoE hybrid. A layer L is FULL-ATTENTION
+     * iff (L+1) % q36_full_attn_interval == 0, else a GDN linear-attention layer.
+     * MoE FFN (routed + shared expert) is on EVERY layer. The base n_head/n_head_kv/
+     * head_dim above hold the FULL-ATTENTION geometry (16/2/256). See
+     * papers/SPEC-qwen35moe-GDN.md. ── */
+    uint32_t q36_full_attn_interval; /* full-attn iff (L+1)%this==0 (4) */
+    uint32_t q36_n_expert;           /* routed experts (256)            */
+    uint32_t q36_n_expert_used;      /* top-k routing (8)               */
+    uint32_t q36_n_ff_exp;           /* per-expert FFN dim (512)        */
+    uint32_t q36_n_ff_shexp;         /* shared-expert FFN dim (512)     */
+    float    q36_expert_weights_scale;/* scale on renormed top-k weights (1.0) */
+    /* GDN (gated delta-net) geometry */
+    uint32_t q36_gdn_conv_k;     /* causal conv kernel (4)              */
+    uint32_t q36_gdn_state;      /* GDN head_dim S (128)               */
+    uint32_t q36_gdn_n_k_heads;  /* k/q heads H_k (16)                 */
+    uint32_t q36_gdn_n_v_heads;  /* v heads H_v / dt_rank (32)         */
+    uint32_t q36_gdn_inner;      /* d_inner = H_v*head_v_dim (4096)    */
+    /* IMRoPE (multi-section) for full-attn layers */
+    int32_t  q36_rope_sections[4];/* [11,11,10,0]                       */
+    uint32_t q36_rope_dim;        /* rope.dimension_count (64)          */
+    float    q36_rope_base;       /* rope.freq_base (1e7)               */
+    uint32_t q36_nextn_predict_layers; /* trailing NextN/MTP blocks loaded-not-run (1) */
 } qwen3_config;
 
 typedef struct {
@@ -75,6 +99,32 @@ typedef struct {
     const gguf_tensor *per_layer_proj;       /* [n_embd_per_layer, n_embd] (GGUF proj)    */
     const gguf_tensor *per_layer_post_norm;  /* [n_embd] (GGUF post_norm)                 */
     const gguf_tensor *out_scale;            /* [1] (GGUF layer_output_scale)             */
+    /* ── Qwen3.6 / qwen35moe (SP_ARCH_QWEN36); NULL/0 on other archs ──
+     * q36_is_recurrent selects the block type: 1 = GDN linear-attn (uses the
+     * gdn_* + attn_qkv/attn_gate tensors), 0 = full-attn (uses attn_q/k/v/output
+     * + attn_q_norm/k_norm above; attn_q is the fused [query|gate] projection).
+     * post_attn_norm above holds attn_post_norm. MoE FFN tensors are bound on
+     * EVERY q36 layer. Expert tensors are rank-3 [.., .., n_expert]. */
+    int q36_is_recurrent;
+    /* GDN linear-attention tensors (q36_is_recurrent==1) */
+    const gguf_tensor *gdn_qkv;       /* attn_qkv  [n_embd, key_dim*2+value_dim]   */
+    const gguf_tensor *gdn_gate;      /* attn_gate [n_embd, value_dim] (z proj)    */
+    const gguf_tensor *gdn_conv1d;    /* ssm_conv1d [conv_k, conv_channels]        */
+    const gguf_tensor *gdn_dt_bias;   /* ssm_dt bias [dt_rank]                     */
+    const gguf_tensor *gdn_a;         /* ssm_a [dt_rank] (A_log; gate = a*softplus)*/
+    const gguf_tensor *gdn_alpha;     /* ssm_alpha [n_embd, dt_rank]               */
+    const gguf_tensor *gdn_beta;      /* ssm_beta  [n_embd, dt_rank]               */
+    const gguf_tensor *gdn_norm;      /* ssm_norm  [head_v_dim] gated output norm  */
+    const gguf_tensor *gdn_out;       /* ssm_out   [value_dim, n_embd]             */
+    /* MoE FFN tensors (every q36 layer) */
+    const gguf_tensor *ffn_gate_inp;  /* router [n_embd, n_expert]                 */
+    const gguf_tensor *ffn_gate_exps; /* [n_embd, n_ff_exp, n_expert] rank-3       */
+    const gguf_tensor *ffn_up_exps;   /* [n_embd, n_ff_exp, n_expert] rank-3       */
+    const gguf_tensor *ffn_down_exps; /* [n_ff_exp, n_embd, n_expert] rank-3       */
+    const gguf_tensor *ffn_gate_inp_shexp; /* shared-expert gate [n_embd]          */
+    const gguf_tensor *ffn_gate_shexp;/* [n_embd, n_ff_shexp]                      */
+    const gguf_tensor *ffn_up_shexp;  /* [n_embd, n_ff_shexp]                      */
+    const gguf_tensor *ffn_down_shexp;/* [n_ff_shexp, n_embd]                      */
 } qwen3_layer;
 
 struct sp_arena;   /* sp_engine/arena.h — packed-weight arena (Phase 1a) */
@@ -151,6 +201,19 @@ int gemma4_forward(const qwen3_model *m, const int32_t *tokens, int n_tokens,
  * vs Qwen3: no embedding scale, no QK norms, QKV biases added after projection,
  * SwiGLU FFN, no sandwich norms, no sliding-window attention. */
 int qwen25_forward(const qwen3_model *m, const int32_t *tokens, int n_tokens,
+                   float *logits);
+
+/* Qwen3.6 / qwen35moe f32 reference forward pass (prefill, causal). Same logits
+ * layout/return as qwen3_forward. Requires arch == SP_ARCH_QWEN36. A Gated DeltaNet
+ * (Qwen3-Next family) + MoE hybrid: per-layer bifurcation — full-attn iff
+ * (L+1)%q36_full_attn_interval==0 (gated attn + IMRoPE), else a GDN linear-attention
+ * block (conv1d + L2-norm q/k + gated delta-rule recurrence + gated output norm);
+ * MoE FFN (f32 softmax/top-k router + Z_q routed experts + sigmoid-gated shared
+ * expert) on every layer; tied LM head, no logit softcap. The trailing
+ * q36_nextn_predict_layers NextN/MTP blocks are loaded but NOT executed here (the
+ * Phase 4-MTP self-draft head). Router/gates are f32 (top-k is a discrete cliff;
+ * only expert weight matmuls are Z_q). See papers/SPEC-qwen35moe-GDN.md. Gate M_QWEN36. */
+int qwen36_forward(const qwen3_model *m, const int32_t *tokens, int n_tokens,
                    float *logits);
 
 /* As qwen3_forward, but if `kv_trees` is non-NULL it additionally KSTE-encodes
