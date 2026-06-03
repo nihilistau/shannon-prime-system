@@ -11,7 +11,7 @@ backend — CPU AVX2/AVX-512, CUDA PTX, Vulkan, Hexagon HVX — registers
 against this library's L1 ABI; the scalar reference forward defined here
 is the bit-exact correctness anchor each backend gates against.
 
-License: AGPL-3.0-or-later. See `LICENSE`. Commercial licensing available.
+License: MIT. See `LICENSE`.
 
 ---
 
@@ -560,5 +560,4 @@ symmetric sprints under the same hook.
 
 ## 6. License
 
-AGPL-3.0-or-later. See `LICENSE`. Commercial licensing available — contact
-the copyright holder.
+MIT. See `LICENSE`.
