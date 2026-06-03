@@ -159,6 +159,9 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
     sp_pr_ctx *pr = NULL; sp_pr_bluestein_ctx *pr_b = NULL; int overlay_active = 0;
     int32_t *qi = NULL, *ki = NULL;
     uint32_t *kres = NULL; int fusion_on = 0; size_t krw = 0;  /* SP_NTT_KV keystore */
+    uint32_t *kres_pre = NULL;     /* fusion x fuse: full-P residue prefill buffer */
+    uint32_t *ring2k_res = NULL;   /* fusion x mock Ring-2: residue K byte store */
+    uint32_t *stgKres = NULL;      /* fusion x backend: residue K dedupe staging */
 
     /* ── ARM configuration (engine-faithful gating) ── */
     const int ring2_on = (g_ring2 && g_recall_b > 0 && !use_blocks && !g_recall_decode_only);
@@ -217,9 +220,11 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
     }
     if (ring2_on && !r2be_on) {
         size_t kvn = (size_t)c->n_layers * P * KVD;
-        ring2k = (float *)malloc(kvn * sizeof(float));
+        if (!fusion_on) { ring2k = (float *)malloc(kvn * sizeof(float)); if (!ring2k) goto done; }
+        else { ring2k_res = (uint32_t *)malloc((size_t)c->n_layers * P * NKV * krw * sizeof(uint32_t));
+               if (!ring2k_res) goto done; }
         ring2v = (float *)malloc(kvn * sizeof(float));
-        if (!ring2k || !ring2v) goto done;
+        if (!ring2v) goto done;
         fprintf(stderr, "    [ring2] mock RAM spill ON: Ring-1 holds only sink+W=%d slots\n",
                 g_recall_sink + r1W);
     } else if (r2be_on) {
@@ -235,8 +240,12 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
             r2be_owned = 1;
         }
         stg_hooked = (r2be.alloc_aligned != NULL);
-        stgK = stg_hooked ? (float *)r2be.alloc_aligned(r2be.handle, (size_t)P * KVD * sizeof(float))
-                          : (float *)malloc((size_t)P * KVD * sizeof(float));
+        if (!fusion_on)
+            stgK = stg_hooked ? (float *)r2be.alloc_aligned(r2be.handle, (size_t)P * KVD * sizeof(float))
+                              : (float *)malloc((size_t)P * KVD * sizeof(float));
+        else
+            stgKres = stg_hooked ? (uint32_t *)r2be.alloc_aligned(r2be.handle, (size_t)P * NKV * krw * sizeof(uint32_t))
+                                 : (uint32_t *)malloc((size_t)P * NKV * krw * sizeof(uint32_t));
         stgV = stg_hooked ? (float *)r2be.alloc_aligned(r2be.handle, (size_t)P * KVD * sizeof(float))
                           : (float *)malloc((size_t)P * KVD * sizeof(float));
         stg_stamp = (int *)malloc((size_t)P * sizeof(int));
@@ -250,12 +259,14 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
             rb_dst   = (void **)malloc((size_t)2 * P * sizeof(void *));
             if (!rb_which || !rb_off || !rb_dst) goto done;
         }
-        if (!stgK || !stgV || !stg_stamp || !stg_slot || !stg_pos || !ri_all || !m_all) goto done;
+        if ((!stgK && !stgKres) || !stgV || !stg_stamp || !stg_slot || !stg_pos || !ri_all || !m_all) goto done;
         for (int i = 0; i < P; i++) stg_stamp[i] = -1;
         if (fuse) {
-            kpre = (float *)malloc((size_t)c->n_layers * P * KVD * sizeof(float));
+            if (!fusion_on) { kpre = (float *)malloc((size_t)c->n_layers * P * KVD * sizeof(float)); if (!kpre) goto done; }
+            else { kres_pre = (uint32_t *)malloc((size_t)c->n_layers * P * NKV * krw * sizeof(uint32_t));
+                   if (!kres_pre) goto done; }
             vpre = (float *)malloc((size_t)c->n_layers * P * KVD * sizeof(float));
-            if (!kpre || !vpre) goto done;
+            if (!vpre) goto done;
             fprintf(stderr, "    [fuse] compact-and-spill: dense full-P prefill buffer (%.1f MB), freed at the boundary\n",
                     2.0 * c->n_layers * P * KVD * sizeof(float) / 1e6);
         }
@@ -272,8 +283,10 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
             pr_b = sp_pr_bluestein_init((uint32_t)HD);
         }
         overlay_active = g_ntt_attn && (pr || pr_b);
-        fusion_on = g_ntt_kv && pr != NULL && !use_blocks &&
-                    g_recall_b == 0 && !ring2_on;          /* stage-1: plain path */
+        /* stage-2: fusion composes with the ARM rings — the K stream is residue
+         * blocks end-to-end (Ring-1 slots, mock store, backend spill/fetch, fuse
+         * buffer). V stays f32 (never scored; fp is plumbing). */
+        fusion_on = g_ntt_kv && pr != NULL && !use_blocks;
         if (overlay_active || fusion_on) {
             qi = (int32_t *)malloc((size_t)HD * sizeof(int32_t));
             ki = (int32_t *)malloc((size_t)HD * sizeof(int32_t));
@@ -281,7 +294,7 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
         }
         if (fusion_on) {
             krw = sp_pr_kstore_words(pr);                  /* 2N u32 per stored head */
-            kres = (uint32_t *)malloc((size_t)c->n_layers * P * NKV * krw * sizeof(uint32_t));
+            kres = (uint32_t *)malloc((size_t)c->n_layers * r1cap * NKV * krw * sizeof(uint32_t));
             if (!kres) goto done;
             fprintf(stderr, "    [ntt-kv] FUSION ON: K cached natively as dual-prime residue blocks "
                     "(%zu u32/head, write-once transform; scores = residue dot + Garner, exact)\n", krw);
@@ -298,26 +311,36 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
              * the recent window into the (sink+W) cache, FREE the full-P buffer. */
             int W = r1W, sink = g_recall_sink;
             int wlo = n_prompt - W; if (wlo < sink) wlo = sink;
+            const size_t kblk = fusion_on ? (size_t)NKV * krw * sizeof(uint32_t)
+                                          : (size_t)KVD * sizeof(float);
             for (uint32_t L = 0; L < c->n_layers; L++) {
-                const float *kpL = kpre + (size_t)L * P * KVD, *vpL = vpre + (size_t)L * P * KVD;
+                const float *kpL = kpre ? kpre + (size_t)L * P * KVD : NULL;
+                const uint32_t *krL = kres_pre ? kres_pre + (size_t)L * P * NKV * krw : NULL;
+                const float *vpL = vpre + (size_t)L * P * KVD;
                 for (int s = 0; s < n_prompt; s++) {
-                    uint64_t boff = (uint64_t)((size_t)L * P + s) * (uint64_t)((size_t)KVD * sizeof(float));
-                    if (r2be.write_block(r2be.handle, 0, boff, kpL + (size_t)s * KVD, (size_t)KVD * sizeof(float)) ||
-                        r2be.write_block(r2be.handle, 1, boff, vpL + (size_t)s * KVD, (size_t)KVD * sizeof(float))) goto done;
+                    uint64_t bK = (uint64_t)((size_t)L * P + s) * (uint64_t)kblk;
+                    uint64_t bV = (uint64_t)((size_t)L * P + s) * (uint64_t)((size_t)KVD * sizeof(float));
+                    const void *ksrc = fusion_on ? (const void *)(krL + (size_t)s * NKV * krw)
+                                                 : (const void *)(kpL + (size_t)s * KVD);
+                    if (r2be.write_block(r2be.handle, 0, bK, ksrc, kblk) ||
+                        r2be.write_block(r2be.handle, 1, bV, vpL + (size_t)s * KVD, (size_t)KVD * sizeof(float))) goto done;
                 }
-                float *kcL = kc + (size_t)L * r1cap * KVD, *vcL = vc + (size_t)L * r1cap * KVD;
-                for (int s = 0; s < sink && s < n_prompt; s++) {
-                    int sl = sp_arm_r1slot(s, 1, sink, W);
-                    memcpy(kcL + (size_t)sl * KVD, kpL + (size_t)s * KVD, (size_t)KVD * sizeof(float));
-                    memcpy(vcL + (size_t)sl * KVD, vpL + (size_t)s * KVD, (size_t)KVD * sizeof(float));
-                }
-                for (int s = wlo; s < n_prompt; s++) {
-                    int sl = sp_arm_r1slot(s, 1, sink, W);
-                    memcpy(kcL + (size_t)sl * KVD, kpL + (size_t)s * KVD, (size_t)KVD * sizeof(float));
-                    memcpy(vcL + (size_t)sl * KVD, vpL + (size_t)s * KVD, (size_t)KVD * sizeof(float));
+                float *vcL = vc + (size_t)L * r1cap * KVD;
+                float *kcL = kc + (size_t)L * r1cap * KVD;
+                uint32_t *krcL = fusion_on ? kres + (size_t)L * r1cap * NKV * krw : NULL;
+                for (int pass = 0; pass < 2; pass++) {
+                    int lo = pass ? wlo : 0, hi = pass ? n_prompt : (sink < n_prompt ? sink : n_prompt);
+                    for (int s = lo; s < hi; s++) {
+                        int sl = sp_arm_r1slot(s, 1, sink, W);
+                        if (fusion_on)
+                            memcpy(krcL + (size_t)sl * NKV * krw, krL + (size_t)s * NKV * krw, kblk);
+                        else
+                            memcpy(kcL + (size_t)sl * KVD, kpL + (size_t)s * KVD, (size_t)KVD * sizeof(float));
+                        memcpy(vcL + (size_t)sl * KVD, vpL + (size_t)s * KVD, (size_t)KVD * sizeof(float));
+                    }
                 }
             }
-            free(kpre); free(vpre); kpre = NULL; vpre = NULL;
+            free(kpre); free(vpre); free(kres_pre); kpre = NULL; vpre = NULL; kres_pre = NULL;
             fprintf(stderr, "    [fuse] boundary @ pos=%d: spilled %d tok/layer to Ring-2, freed the prefill buffer\n",
                     n_prompt, n_prompt);
         }
@@ -359,9 +382,16 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
                 KC = kdec; VC = vdec;
             } else if (fuse && pos < n_prompt) {
                 /* FUSE dense prefill: full-P buffer, no window write, no spill. */
-                memcpy(kpre + ((size_t)L * P + pos) * KVD, knew, (size_t)KVD * sizeof(float));
+                if (fusion_on)
+                    for (int h = 0; h < NKV; h++) {
+                        const float *kh = knew + (size_t)h * HD;
+                        for (int i = 0; i < HD; i++) ki[i] = (int32_t)lrintf(kh[i] * (float)SP_NTT_ATTN_SCALE);
+                        sp_pr_kstore_encode(pr, ki, kres_pre + (((size_t)L * P + pos) * NKV + h) * krw);
+                    }
+                else
+                    memcpy(kpre + ((size_t)L * P + pos) * KVD, knew, (size_t)KVD * sizeof(float));
                 memcpy(vpre + ((size_t)L * P + pos) * KVD, vnew, (size_t)KVD * sizeof(float));
-                KC = kpre + (size_t)L * P * KVD;
+                KC = kpre ? kpre + (size_t)L * P * KVD : NULL;
                 VC = vpre + (size_t)L * P * KVD;
             } else {
                 if (g_kv_spinor)   /* SP_KV_SPINOR_REF: f32 cache with the lossy round-trip */
@@ -372,21 +402,35 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
                 KC = kc + (size_t)L * r1cap * KVD;
                 VC = vc + (size_t)L * r1cap * KVD;
                 /* NTT FUSION write path: the position-finalized K head is quantized
-                 * and forward-transformed ONCE; the residue block is the stored unit. */
+                 * and forward-transformed ONCE; the residue block is the stored unit
+                 * (ring slot when offloading — identical to (L*P+pos) when r1cap==P). */
                 if (fusion_on)
                     for (int h = 0; h < NKV; h++) {
                         const float *kh = knew + (size_t)h * HD;
                         for (int i = 0; i < HD; i++) ki[i] = (int32_t)lrintf(kh[i] * (float)SP_NTT_ATTN_SCALE);
-                        sp_pr_kstore_encode(pr, ki, kres + (((size_t)L * P + pos) * NKV + h) * krw);
+                        sp_pr_kstore_encode(pr, ki, kres + (((size_t)L * r1cap + wslot) * NKV + h) * krw);
                     }
             }
             /* Ring-2 spill of the new position (skipped during the fuse dense prefill). */
             if (r2be_on && !(fuse && pos < n_prompt)) {
-                uint64_t boff = (uint64_t)((size_t)L * P + pos) * (uint64_t)((size_t)KVD * sizeof(float));
-                if (r2be.write_block(r2be.handle, 0, boff, knew, (size_t)KVD * sizeof(float)) ||
-                    r2be.write_block(r2be.handle, 1, boff, vnew, (size_t)KVD * sizeof(float))) goto done;
+                const size_t kblk = fusion_on ? (size_t)NKV * krw * sizeof(uint32_t)
+                                              : (size_t)KVD * sizeof(float);
+                uint64_t bK = (uint64_t)((size_t)L * P + pos) * (uint64_t)kblk;
+                uint64_t bV = (uint64_t)((size_t)L * P + pos) * (uint64_t)((size_t)KVD * sizeof(float));
+                const void *ksrc = fusion_on
+                    ? (const void *)(kres + (((size_t)L * r1cap +
+                          (size_t)sp_arm_r1slot(pos, ring2_on, g_recall_sink, r1W)) * NKV) * krw)
+                    : (const void *)knew;
+                if (r2be.write_block(r2be.handle, 0, bK, ksrc, kblk) ||
+                    r2be.write_block(r2be.handle, 1, bV, vnew, (size_t)KVD * sizeof(float))) goto done;
             } else if (ring2_on && !r2be_on) {
-                memcpy(ring2k + ((size_t)L * P + pos) * KVD, knew, (size_t)KVD * sizeof(float));
+                if (fusion_on)
+                    memcpy(ring2k_res + ((size_t)L * P + pos) * NKV * krw,
+                           kres + (((size_t)L * r1cap +
+                               (size_t)sp_arm_r1slot(pos, ring2_on, g_recall_sink, r1W)) * NKV) * krw,
+                           (size_t)NKV * krw * sizeof(uint32_t));
+                else
+                    memcpy(ring2k + ((size_t)L * P + pos) * KVD, knew, (size_t)KVD * sizeof(float));
                 memcpy(ring2v + ((size_t)L * P + pos) * KVD, vnew, (size_t)KVD * sizeof(float));
             }
 
@@ -397,10 +441,16 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
                 /* dense exact prefill over the full-P buffer (absolute slots) */
                 for (int h = 0; h < NH; h++) {
                     int kvh = h / group; const float *qh = q + (size_t)h * HD;
-                    if (overlay_active) for (int i = 0; i < HD; i++) qi[i] = (int32_t)lrintf(qh[i] * (float)SP_NTT_ATTN_SCALE);
+                    if (overlay_active || fusion_on) for (int i = 0; i < HD; i++) qi[i] = (int32_t)lrintf(qh[i] * (float)SP_NTT_ATTN_SCALE);
+                    if (fusion_on) sp_pr_query_begin(pr, qi);
                     float maxs = -INFINITY;
                     for (int s = 0; s <= pos; s++) {
-                        float d = kv_pair_score(qh, KC + (size_t)s * KVD + (size_t)kvh * HD, HD, ascale, pr, pr_b, qi, ki);
+                        float d;
+                        if (fusion_on) {
+                            int64_t ip = sp_pr_score_kstore(pr, kres_pre + (((size_t)L * P + s) * NKV + kvh) * krw);
+                            d = (float)((double)ip / (SP_NTT_ATTN_SCALE * SP_NTT_ATTN_SCALE)) * ascale;
+                        } else
+                            d = kv_pair_score(qh, KC + (size_t)s * KVD + (size_t)kvh * HD, HD, ascale, pr, pr_b, qi, ki);
                         sc[s] = d; if (d > maxs) maxs = d;
                     }
                     float sum = 0.0f;
@@ -429,32 +479,58 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
                         }
                     }
                 }
+                {
+                const size_t kblk = fusion_on ? (size_t)NKV * krw * sizeof(uint32_t)
+                                              : (size_t)KVD * sizeof(float);
+                const size_t vblk = (size_t)KVD * sizeof(float);
                 if (nstage > 0 && r2be.read_batch) {
+                    /* per-stream batches: K and V block sizes differ under fusion */
                     for (int i = 0; i < nstage; i++) {
-                        uint64_t boff = (uint64_t)((size_t)L * P + stg_pos[i]) * (uint64_t)((size_t)KVD * sizeof(float));
-                        rb_which[2 * i] = 0;     rb_off[2 * i] = boff;     rb_dst[2 * i] = stgK + (size_t)i * KVD;
-                        rb_which[2 * i + 1] = 1; rb_off[2 * i + 1] = boff; rb_dst[2 * i + 1] = stgV + (size_t)i * KVD;
+                        rb_which[i] = 0;
+                        rb_off[i]   = (uint64_t)((size_t)L * P + stg_pos[i]) * (uint64_t)kblk;
+                        rb_dst[i]   = fusion_on ? (void *)(stgKres + (size_t)i * NKV * krw)
+                                                : (void *)(stgK + (size_t)i * KVD);
                     }
-                    if (r2be.read_batch(r2be.handle, rb_which, rb_off, rb_dst,
-                                        (size_t)KVD * sizeof(float), 2 * nstage)) goto done;
+                    if (r2be.read_batch(r2be.handle, rb_which, rb_off, rb_dst, kblk, nstage)) goto done;
+                    for (int i = 0; i < nstage; i++) {
+                        rb_which[i] = 1;
+                        rb_off[i]   = (uint64_t)((size_t)L * P + stg_pos[i]) * (uint64_t)vblk;
+                        rb_dst[i]   = stgV + (size_t)i * KVD;
+                    }
+                    if (r2be.read_batch(r2be.handle, rb_which, rb_off, rb_dst, vblk, nstage)) goto done;
                 } else {
                     for (int i = 0; i < nstage; i++) {
-                        uint64_t boff = (uint64_t)((size_t)L * P + stg_pos[i]) * (uint64_t)((size_t)KVD * sizeof(float));
-                        if (r2be.read_block(r2be.handle, 0, boff, stgK + (size_t)i * KVD, (size_t)KVD * sizeof(float)) ||
-                            r2be.read_block(r2be.handle, 1, boff, stgV + (size_t)i * KVD, (size_t)KVD * sizeof(float))) goto done;
+                        uint64_t bK = (uint64_t)((size_t)L * P + stg_pos[i]) * (uint64_t)kblk;
+                        uint64_t bV = (uint64_t)((size_t)L * P + stg_pos[i]) * (uint64_t)vblk;
+                        void *kdst = fusion_on ? (void *)(stgKres + (size_t)i * NKV * krw)
+                                               : (void *)(stgK + (size_t)i * KVD);
+                        if (r2be.read_block(r2be.handle, 0, bK, kdst, kblk) ||
+                            r2be.read_block(r2be.handle, 1, bV, stgV + (size_t)i * KVD, vblk)) goto done;
                     }
+                }
                 }
                 for (int h = 0; h < NH; h++) {
                     int kvh = h / group; const float *qh = q + (size_t)h * HD;
                     const int *rih = ri_all + (size_t)h * P; int mm = m_all[h];
-                    if (overlay_active) for (int i = 0; i < HD; i++) qi[i] = (int32_t)lrintf(qh[i] * (float)SP_NTT_ATTN_SCALE);
+                    if (overlay_active || fusion_on) for (int i = 0; i < HD; i++) qi[i] = (int32_t)lrintf(qh[i] * (float)SP_NTT_ATTN_SCALE);
+                    if (fusion_on) sp_pr_query_begin(pr, qi);
                     float maxs = -INFINITY;
                     for (int jj = 0; jj < mm; jj++) {
                         int s = rih[jj];
-                        const float *kbase = (s < winlo && s >= g_recall_sink)
-                            ? stgK + (size_t)stg_slot[s] * KVD
-                            : KC + (size_t)sp_arm_r1slot(s, ring2_on, g_recall_sink, r1W) * KVD;
-                        float d = kv_pair_score(qh, kbase + (size_t)kvh * HD, HD, ascale, pr, pr_b, qi, ki);
+                        float d;
+                        if (fusion_on) {
+                            const uint32_t *kblk = (s < winlo && s >= g_recall_sink)
+                                ? stgKres + (size_t)stg_slot[s] * NKV * krw
+                                : kres + ((size_t)L * r1cap +
+                                      (size_t)sp_arm_r1slot(s, ring2_on, g_recall_sink, r1W)) * NKV * krw;
+                            int64_t ip = sp_pr_score_kstore(pr, kblk + (size_t)kvh * krw);
+                            d = (float)((double)ip / (SP_NTT_ATTN_SCALE * SP_NTT_ATTN_SCALE)) * ascale;
+                        } else {
+                            const float *kbase = (s < winlo && s >= g_recall_sink)
+                                ? stgK + (size_t)stg_slot[s] * KVD
+                                : KC + (size_t)sp_arm_r1slot(s, ring2_on, g_recall_sink, r1W) * KVD;
+                            d = kv_pair_score(qh, kbase + (size_t)kvh * HD, HD, ascale, pr, pr_b, qi, ki);
+                        }
                         sc[jj] = d; if (d > maxs) maxs = d;
                     }
                     float sum = 0.0f;
@@ -476,14 +552,25 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
                     int kvh = h / group; const float *qh = q + (size_t)h * HD;
                     int mm = sp_arm_select(recallR, g_recall_r, HD, qh, projk, (size_t)L, P,
                                            NKV, kvh, eB, g_recall_w, g_recall_sink, pos, cand, ri);
-                    if (overlay_active) for (int i = 0; i < HD; i++) qi[i] = (int32_t)lrintf(qh[i] * (float)SP_NTT_ATTN_SCALE);
+                    if (overlay_active || fusion_on) for (int i = 0; i < HD; i++) qi[i] = (int32_t)lrintf(qh[i] * (float)SP_NTT_ATTN_SCALE);
+                    if (fusion_on) sp_pr_query_begin(pr, qi);
                     float maxs = -INFINITY;
                     for (int jj = 0; jj < mm; jj++) {
                         int s = ri[jj];
-                        const float *kbase = (ring2_on && s < winlo && s >= g_recall_sink)
-                            ? ring2k + ((size_t)L * P + s) * KVD
-                            : KC + (size_t)sp_arm_r1slot(s, ring2_on, g_recall_sink, r1W) * KVD;
-                        float d = kv_pair_score(qh, kbase + (size_t)kvh * HD, HD, ascale, pr, pr_b, qi, ki);
+                        float d;
+                        if (fusion_on) {
+                            const uint32_t *kblk = (ring2_on && s < winlo && s >= g_recall_sink)
+                                ? ring2k_res + ((size_t)L * P + s) * NKV * krw
+                                : kres + ((size_t)L * r1cap +
+                                      (size_t)sp_arm_r1slot(s, ring2_on, g_recall_sink, r1W)) * NKV * krw;
+                            int64_t ip = sp_pr_score_kstore(pr, kblk + (size_t)kvh * krw);
+                            d = (float)((double)ip / (SP_NTT_ATTN_SCALE * SP_NTT_ATTN_SCALE)) * ascale;
+                        } else {
+                            const float *kbase = (ring2_on && s < winlo && s >= g_recall_sink)
+                                ? ring2k + ((size_t)L * P + s) * KVD
+                                : KC + (size_t)sp_arm_r1slot(s, ring2_on, g_recall_sink, r1W) * KVD;
+                            d = kv_pair_score(qh, kbase + (size_t)kvh * HD, HD, ascale, pr, pr_b, qi, ki);
+                        }
                         sc[jj] = d; if (d > maxs) maxs = d;
                     }
                     float sum = 0.0f;
@@ -509,7 +596,7 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
                     sp_pr_query_begin(pr, qi);
                     float maxs = -INFINITY;
                     for (int s = 0; s <= pos; s++) {
-                        int64_t ip = sp_pr_score_kstore(pr, kres + (((size_t)L * P + s) * NKV + kvh) * krw);
+                        int64_t ip = sp_pr_score_kstore(pr, kres + (((size_t)L * r1cap + s) * NKV + kvh) * krw);
                         float d = (float)((double)ip / (SP_NTT_ATTN_SCALE * SP_NTT_ATTN_SCALE)) * ascale;
                         sc[s] = d; if (d > maxs) maxs = d;
                     }
@@ -600,6 +687,8 @@ done:
     free(stg_stamp); free(stg_slot); free(stg_pos);
     free(ri_all); free(m_all); free(rb_which); free(rb_off); free(rb_dst);
     if (r2be_owned && r2be.handle && r2be.close) r2be.close(r2be.handle);
+    free(kres_pre); free(ring2k_res);
+    if (stgKres) { if (stg_hooked) r2be.free_aligned(r2be.handle, stgKres); else free(stgKres); }
     free(qi); free(ki); free(kres); sp_pr_free(pr); sp_pr_bluestein_free(pr_b);
     return rc;
 }
