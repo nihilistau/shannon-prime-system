@@ -52,7 +52,7 @@ set(SP_MODULES
     sp_channel      # TS.MAP -- GF(2) memory-channel oracle (hedge-read timing; perf overlay only, never a correctness dependency)
     dominance       # later — dominance order / signature dominance
     sieve           # later — Friedman sieve
-    arm)            # later — Algebraic Resonance Memory
+    arm)            # C2.1 -- ARM two-ring KV memory: frozen ±1 recall router + Ring-1 sink/window map + Ring-2 abstract backend (promoted from the engine production impl)
 
 foreach(_m IN LISTS SP_MODULES)
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/core/${_m}/CMakeLists.txt)
