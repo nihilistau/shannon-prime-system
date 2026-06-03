@@ -22,7 +22,7 @@ sp_add_module(forward
     SOURCES   forward.c gemma3.c gemma4.c qwen25.c qwen36.c generate.c
     TEST      forward_test.c
     TEST_NAME T_FORWARD
-    DEPENDS   sp_forward_dispatch sp_forward_kernels sp_poly_ring sp_kste sp_vht2)
+    DEPENDS   sp_forward_dispatch sp_forward_kernels sp_poly_ring sp_kste sp_vht2 sp_arm)
 
 # M_QWEN36 — Qwen3.6-35B-A3B (qwen35moe) forward top-1 correctness gate (GGUF-direct).
 # SLOW / model-gated: skips (exit 0) when the 19.7 GB model is absent. Asserts the

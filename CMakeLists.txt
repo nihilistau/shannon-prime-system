@@ -47,12 +47,12 @@ set(SP_MODULES
     arena           # L1 -- packed-weight arena (named sp_frob_packed_tensor set); listed after its 1E frobenius codec dependency
     model           # L1 -- Qwen3/Gemma3 model representation + GGUF load/free/release lifecycle (on arena + gguf)
     forward_dispatch # L1 -- model-coupled weight-access kernels (matmul/embed/norm-accessor) on forward_kernels + arena
+    arm             # C2.1 -- ARM two-ring KV memory: ±1 recall router + Ring-1 sink/window map + Ring-2 abstract backend (forward depends on it; listed before forward)
     forward         # L1 -- Qwen3 forward orchestration: prefill + persistent-KV decode (on forward_dispatch + the overlay codecs poly_ring/kste/vht2)
     session         # L1 -- sp_session ABI (create/prefill/decode) + sp_model_to_qwen3 bridge (on io_format + forward + model + arena + frobenius)
     sp_channel      # TS.MAP -- GF(2) memory-channel oracle (hedge-read timing; perf overlay only, never a correctness dependency)
     dominance       # later — dominance order / signature dominance
-    sieve           # later — Friedman sieve
-    arm)            # C2.1 -- ARM two-ring KV memory: frozen ±1 recall router + Ring-1 sink/window map + Ring-2 abstract backend (promoted from the engine production impl)
+    sieve)          # later — Friedman sieve
 
 foreach(_m IN LISTS SP_MODULES)
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/core/${_m}/CMakeLists.txt)
