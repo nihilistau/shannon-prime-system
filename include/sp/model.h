@@ -304,6 +304,15 @@ int qwen3_generate(const qwen3_model *m, int32_t *seq, int n_prompt, int n_gen,
 int qwen3_generate_kv(const qwen3_model *m, int32_t *seq, int n_prompt, int n_gen,
                       int eos_id);
 
+/* Teacher-forced autoregressive perplexity over the DECODE path (G2): exercises
+ * the recall router + ARM two-ring (SP_RECALL_* / SP_RING2*) exactly as
+ * production decode (shares the generate_kv decode body). toks[0,n_toks) is the
+ * corpus slice; positions [n_warm, n_toks-1) are scored (predict toks[pos+1]
+ * from logits at pos). On success returns 0 and sets *ppl = exp(mean NLL)
+ * (+ *n_scored if non-NULL). */
+int qwen3_ppl_decode(const qwen3_model *m, int32_t *toks, int n_toks, int n_warm,
+                     double *ppl, long *n_scored);
+
 /* Q4 calibration stats from the most recent forward on the Q4 weight path
  * (SP_ENGINE_FROB=3 or 4): how many weight rows the mixed-precision calibration
  * promoted to Q8, out of the total rows seen. Both 0 otherwise. (E_CPU_7.) */

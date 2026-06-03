@@ -151,10 +151,28 @@ int sp_arm_ring2_stdio_open(const char *dir, sp_arm_ring2_backend *out) {
         st->f[w] = fopen(path, "w+b");                     /* fresh store per open */
         if (!st->f[w]) { stdio_close(st); return 1; }
     }
-    out->handle      = st;
-    out->write_block = stdio_write_block;
-    out->read_block  = stdio_read_block;
-    out->read_batch  = NULL;                               /* serial reference */
-    out->close       = stdio_close;
+    out->handle        = st;
+    out->write_block   = stdio_write_block;
+    out->read_block    = stdio_read_block;
+    out->read_batch    = NULL;                             /* serial reference */
+    out->alloc_aligned = NULL;                             /* malloc is fine here */
+    out->free_aligned  = NULL;
+    out->close         = stdio_close;
     return 0;
+}
+
+/* ── platform-backend registration (the L1 hook) ──────────────────────────── */
+
+static sp_arm_ring2_backend g_registered;
+static int g_registered_on = 0;
+
+void sp_arm_ring2_register(const sp_arm_ring2_backend *be) {
+    if (be) { g_registered = *be; g_registered_on = 1; }
+    else    { g_registered_on = 0; }
+}
+
+int sp_arm_ring2_registered(sp_arm_ring2_backend *out) {
+    if (!g_registered_on || !out) return 0;
+    *out = g_registered;
+    return 1;
 }

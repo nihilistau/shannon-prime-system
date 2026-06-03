@@ -79,17 +79,23 @@ int sp_arm_r1slot(int s, int offloading, int sink, int w);
 /* Block store for the spilled K/V history. which: 0 = K stream, 1 = V stream.
  * Offsets are byte offsets within the stream; len is the block size the store
  * was opened with. All fns return 0 on success, non-zero on error.
- * read_batch is OPTIONAL (NULL => callers loop read_block); high-throughput
- * backends (Optane IOCP) provide it to amortize queue depth. */
+ * OPTIONAL members (NULL => caller falls back):
+ *   read_batch     — batched reads (Optane IOCP queue-depth amortization);
+ *                    NULL => callers loop read_block.
+ *   alloc_aligned / free_aligned — landing-buffer allocator for backends with
+ *                    direct-I/O alignment requirements (NO_BUFFERING sector
+ *                    alignment); NULL => callers use malloc/free. */
 typedef struct {
     void *handle;
-    int  (*write_block)(void *handle, int which, uint64_t off,
-                        const void *src, size_t len);
-    int  (*read_block)(void *handle, int which, uint64_t off,
-                       void *dst, size_t len);
-    int  (*read_batch)(void *handle, const int *which, const uint64_t *off,
-                       void *const *dst, size_t len, int n);   /* optional */
-    void (*close)(void *handle);
+    int   (*write_block)(void *handle, int which, uint64_t off,
+                         const void *src, size_t len);
+    int   (*read_block)(void *handle, int which, uint64_t off,
+                        void *dst, size_t len);
+    int   (*read_batch)(void *handle, const int *which, const uint64_t *off,
+                        void *const *dst, size_t len, int n);   /* optional */
+    void *(*alloc_aligned)(void *handle, size_t bytes);          /* optional */
+    void  (*free_aligned)(void *handle, void *p);                /* optional */
+    void  (*close)(void *handle);
 } sp_arm_ring2_backend;
 
 /* Portable stdio reference backend (fopen/seek/read/write; two files
@@ -97,6 +103,19 @@ typedef struct {
  * implementation — correctness twin of the engine's Optane store, not its
  * performance twin. Returns 0 and fills *out on success. */
 int sp_arm_ring2_stdio_open(const char *dir, sp_arm_ring2_backend *out);
+
+/* ── platform-backend registration (the L1 hook) ─────────────────────────────
+ * A platform store (engine Optane NO_BUFFERING+IOCP, a QUIC peer, ...) wraps
+ * itself in sp_arm_ring2_backend and registers ONCE at startup; the canonical
+ * decode then uses the registered backend instead of opening the stdio
+ * reference. Ownership stays with the registrant: the decode treats a
+ * registered backend as BORROWED (never calls close on it); the registrant
+ * unregisters (be=NULL) before tearing the store down. Registration is
+ * startup-time, not thread-safe against concurrent decodes. */
+void sp_arm_ring2_register(const sp_arm_ring2_backend *be);
+
+/* Copy the registered backend into *out and return 1; return 0 if none. */
+int  sp_arm_ring2_registered(sp_arm_ring2_backend *out);
 
 #ifdef __cplusplus
 }
