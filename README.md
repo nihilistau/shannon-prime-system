@@ -11,6 +11,12 @@ backend — CPU AVX2/AVX-512, CUDA PTX, Vulkan, Hexagon HVX — registers
 against this library's L1 ABI; the scalar reference forward defined here
 is the bit-exact correctness anchor each backend gates against.
 
+The project's public, receipts-first results (the two-ring long-context
+memory envelope, the reducing loader, the quantization story) live at
+**[Position Is Arithmetic](https://github.com/nihilistau/Position_Is_Arithmetic)**
+(live site: https://nihilistau.github.io/Position_Is_Arithmetic/). The
+developer umbrella is [shannon-prime-lattice](https://github.com/nihilistau/shannon-prime-lattice).
+
 License: MIT. See `LICENSE`.
 
 ---
@@ -48,7 +54,7 @@ zero — the "unspecified" sentinel).
 
 ## 2. Current status
 
-Honest snapshot, 2026-05-31. This main reflects the standalone repo state.
+Honest snapshot, 2026-06-03. This main reflects the standalone repo state.
 The engine-submoduled copy of math-core (under
 `shannon-prime-system-engine/lib/shannon-prime-system/`) carries the most
 recent sprint output including the WIRE-HEX §6 forward-backend hook —
@@ -59,7 +65,7 @@ sync wave.
 |-----------|--------|
 | `core/forward_kernels` — `sp_dot_f32`, `sp_rmsnorm`, `sp_rope_neox`, `sp_attn_head` | **shipped** (scalar reference) |
 | `core/forward_dispatch` — `sp_matmul`, `sp_embed_row`, `sp_as_f32` | **shipped** |
-| `core/forward` — Qwen3 / Gemma3 prefill + persistent-KV decode | **shipped** |
+| `core/forward` — Qwen3 / Gemma3 / Gemma4 / Qwen3.6-35B-A3B MoE (Gated DeltaNet) prefill + persistent-KV decode | **shipped** |
 | `core/session` — `sp_session_create`, `sp_prefill_chunk`, `sp_decode_step`, clone/rewind, KV-mode flags | **shipped** |
 | `core/io_format` — `.sp-model` v0 loader (`sp_model_load`/`sp_model_unload`, `sp_model_arch`) | **shipped** |
 | `core/io_hash` — CRC-32 / SHA-256 / XXH64 | **shipped** |
@@ -72,7 +78,7 @@ sync wave.
 | `core/arena` — packed-weight arena | **shipped** |
 | `core/vht2` — Spinor 63-byte block + Möbius reorder + CRC-8 | **shipped** |
 | `core/kste` — encoder + Tier-0/Tier-1 dominance | **shipped** |
-| `core/model` — Qwen3 / Qwen2.5 / Gemma3 model representation + GGUF load/free | **shipped** |
+| `core/model` — Qwen3 / Qwen2.5 / Gemma3 / Gemma4 / Qwen3.6-35B-A3B MoE representation + GGUF load/free | **shipped** |
 | `core/ok_arith` — `O_K = Z[(1+√-163)/2]` integer arithmetic | **shipped** |
 | `core/arm` — Algebraic Resonance Memory (HRR binding in R_q) | **in progress** |
 | `core/sieve` — Friedman-Kruskal dominance sieve | **in progress** |
