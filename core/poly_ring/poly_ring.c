@@ -193,15 +193,8 @@ void sp_pr_query_begin(sp_pr_ctx *ctx, const int32_t *q) {
 
 int64_t sp_pr_score_kstore(sp_pr_ctx *ctx, const uint32_t *kres) {
     const uint32_t N = ctx->N;
-    const uint32_t *k1 = kres, *k2 = kres + N;
-    uint64_t acc1 = 0, acc2 = 0;
-    for (uint32_t j = 0; j < N; j++) {
-        acc1 += ((uint64_t)ctx->qf1[j] * k1[j]) % SP_NTT_Q1;
-        acc2 += ((uint64_t)ctx->qf2[j] * k2[j]) % SP_NTT_Q2;
-        /* partial sums stay < N * 2^30 <= 2^39 — no overflow, reduce once */
-    }
-    uint32_t s1 = pr_mulmod((uint32_t)(acc1 % SP_NTT_Q1), ctx->ninv1, SP_NTT_Q1);
-    uint32_t s2 = pr_mulmod((uint32_t)(acc2 % SP_NTT_Q2), ctx->ninv2, SP_NTT_Q2);
+    uint32_t s1 = pr_mulmod(sp_pr_resdot(ctx->qf1, kres,     N, SP_NTT_Q1), ctx->ninv1, SP_NTT_Q1);
+    uint32_t s2 = pr_mulmod(sp_pr_resdot(ctx->qf2, kres + N, N, SP_NTT_Q2), ctx->ninv2, SP_NTT_Q2);
     /* scalar Garner: x = s1 + q1 * ((s2 - s1) * q1^{-1} mod q2), centered */
     uint32_t s1m = s1 % SP_NTT_Q2;
     uint32_t t   = pr_mulmod((s2 + SP_NTT_Q2 - s1m) % SP_NTT_Q2, ctx->q1inv_q2, SP_NTT_Q2);

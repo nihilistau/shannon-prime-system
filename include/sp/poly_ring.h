@@ -103,6 +103,18 @@ void sp_pr_query_begin(sp_pr_ctx *ctx, const int32_t *q);
  * centered integer in (-M/2, M/2]. Bit-equal to sp_pr_inner(q,k). */
 int64_t sp_pr_score_kstore(sp_pr_ctx *ctx, const uint32_t *kres);
 
+/* ── the keystore hot loop: modular residue dot ──────────────────────────────
+ * sum_i a[i]*b[i] mod q for residues a[i], b[i] in [0, q), q < 2^30. Result in
+ * [0, q). DEFERRED-REDUCTION contract: products are < 2^60, so 15 accumulate
+ * exactly in uint64 before one reduction — the portable reference (resdot.c,
+ * its OWN archive member) reduces once per 15-element chunk. The ENGINE
+ * overrides this symbol with an AVX2 kernel (same chunking, _mm256_mul_epu32
+ * bulk) by the same always-pulled-object pattern as the sp_ dispatch shims;
+ * both implementations are EXACT (integer adds below 2^64, mod-sum
+ * associativity), gate T_PR_RESDOT. Both keystore score paths (direct +
+ * Bluestein) route through this. */
+uint32_t sp_pr_resdot(const uint32_t *a, const uint32_t *b, uint32_t n, uint32_t q);
+
 #ifdef __cplusplus
 }
 #endif

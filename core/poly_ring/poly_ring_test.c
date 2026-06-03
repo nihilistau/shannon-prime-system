@@ -766,6 +766,37 @@ static void T_PR_KSTORE_BLUE(void) {
     }
 }
 
+
+/* T_PR_RESDOT — the hot-loop contract: deferred-reduction resdot == the naive
+ * per-element %-loop, bit-exact, across lengths (incl chunk-boundary odd sizes)
+ * and full-range residues. The engine's AVX2 override must satisfy the SAME
+ * gate semantics (same integer result; chunking cannot change the value). */
+static void T_PR_RESDOT(void) {
+    static const uint32_t Ls[7] = { 1, 14, 15, 16, 127, 256, 601 };
+    static uint32_t a[601], b[601];
+    int ok = 1;
+    for (int li = 0; li < 7 && ok; li++) {
+        uint32_t n = Ls[li];
+        for (int trial = 0; trial < 8 && ok; trial++) {
+            for (uint32_t i = 0; i < n; i++) {
+                ks_rng = ks_rng * 1664525u + 1013904223u; a[i] = ks_rng % SP_NTT_Q1;
+                ks_rng = ks_rng * 1664525u + 1013904223u; b[i] = ks_rng % SP_NTT_Q1;
+            }
+            if (trial == 0) for (uint32_t i = 0; i < n; i++) { a[i] = SP_NTT_Q1 - 1u; b[i] = SP_NTT_Q1 - 1u; }
+            uint64_t want = 0;
+            for (uint32_t i = 0; i < n; i++)
+                want = (want + (uint64_t)a[i] * b[i] % SP_NTT_Q1) % SP_NTT_Q1;
+            uint32_t got = sp_pr_resdot(a, b, n, SP_NTT_Q1);
+            if ((uint64_t)got != want) {
+                fprintf(stderr, "    RESDOT MISMATCH n=%u trial=%d want=%llu got=%u\n",
+                        n, trial, (unsigned long long)want, got);
+                ok = 0;
+            }
+        }
+    }
+    SP_CHECK(ok, "resdot (deferred 15-chunk reduction) == naive modular dot, all lengths + extremes");
+}
+
 int main(void) {
     SP_RUN(T_PR_1);
     SP_RUN(T_PR_2);
@@ -777,6 +808,7 @@ int main(void) {
     SP_RUN(T_NTT5A_BLUESTEIN_MUL_BIT_EXACT);
     SP_RUN(T_NTT5B_BACKEND_FORWARD_PASSTHROUGH);
     SP_RUN(T_NTT5A_NULL_FOR_INADMISSIBLE_N);
+    SP_RUN(T_PR_RESDOT);
     SP_RUN(T_PR_KSTORE);
     SP_RUN(T_PR_KSTORE_BLUE);
     return SP_DONE();
