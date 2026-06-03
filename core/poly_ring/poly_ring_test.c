@@ -674,6 +674,61 @@ static void T_NTT5A_NULL_FOR_INADMISSIBLE_N(void) {
              "sp_pr_bluestein_init returns NULL for every inadmissible N");
 }
 
+
+/* T_PR_KSTORE — the NTT-FUSION exactness contract: scoring against a stored
+ * (write-once transformed) key block must equal sp_pr_inner to the BIT, for
+ * every supported N, across random coefficient draws at the attention scale
+ * (|coeff| ~ 2^16, the SP_NTT_ATTN_SCALE quantization range) plus adversarial
+ * extremes. A single mismatch falsifies the no-inverse coefficient-0 recovery
+ * (psi-convention or Garner error) — surface UPSTREAM, do not tune. */
+static uint32_t ks_rng = 0x9E3779B9u;
+static int32_t ks_coeff(int32_t mag) {
+    ks_rng = ks_rng * 1664525u + 1013904223u;
+    return (int32_t)(ks_rng % (uint32_t)(2 * mag + 1)) - mag;
+}
+static void T_PR_KSTORE(void) {
+    static const uint32_t Ns[3] = { 128, 256, 512 };
+    for (int ni = 0; ni < 3; ni++) {
+        const uint32_t N = Ns[ni];
+        sp_pr_ctx *ctx = sp_pr_init(N);
+        SP_CHECK(ctx != NULL, "kstore ctx init");
+        if (!ctx) continue;
+        SP_CHECK_EQ_I64((int64_t)sp_pr_kstore_words(ctx), (int64_t)(2 * N),
+                        "kstore block is 2N residues");
+        int32_t *q  = malloc(sizeof(int32_t) * N);
+        int32_t *k  = malloc(sizeof(int32_t) * N);
+        uint32_t *kr = malloc(sizeof(uint32_t) * 2 * N);
+        SP_CHECK(q && k && kr, "kstore scratch");
+        int ok = 1;
+        for (int trial = 0; trial < 32 && ok; trial++) {
+            int32_t mag = (trial < 24) ? 65536 : 2097152;   /* attention scale + extremes */
+            for (uint32_t i = 0; i < N; i++) { q[i] = ks_coeff(mag); k[i] = ks_coeff(mag); }
+            int64_t want = sp_pr_inner(ctx, q, k);
+            sp_pr_kstore_encode(ctx, k, kr);
+            sp_pr_query_begin(ctx, q);
+            int64_t got = sp_pr_score_kstore(ctx, kr);
+            if (got != want) {
+                fprintf(stderr, "    KSTORE MISMATCH N=%u trial=%d want=%lld got=%lld\n",
+                        N, trial, (long long)want, (long long)got);
+                ok = 0;
+            }
+        }
+        SP_CHECK(ok, "kstore score == sp_pr_inner BIT-EXACT (32 trials)");
+        /* one query, many keys: query_begin amortization is stateless-correct */
+        sp_pr_query_begin(ctx, q);
+        int multi_ok = 1;
+        for (int t2 = 0; t2 < 4; t2++) {
+            for (uint32_t i = 0; i < N; i++) k[i] = ks_coeff(65536);
+            sp_pr_kstore_encode(ctx, k, kr);     /* encode clobbers ctx scratch... */
+            sp_pr_query_begin(ctx, q);           /* ...so re-begin: documents the contract */
+            if (sp_pr_score_kstore(ctx, kr) != sp_pr_inner(ctx, q, k)) multi_ok = 0;
+        }
+        SP_CHECK(multi_ok, "amortized query vs fresh keys stays bit-exact");
+        free(q); free(k); free(kr);
+        sp_pr_free(ctx);
+    }
+}
+
 int main(void) {
     SP_RUN(T_PR_1);
     SP_RUN(T_PR_2);
@@ -685,5 +740,6 @@ int main(void) {
     SP_RUN(T_NTT5A_BLUESTEIN_MUL_BIT_EXACT);
     SP_RUN(T_NTT5B_BACKEND_FORWARD_PASSTHROUGH);
     SP_RUN(T_NTT5A_NULL_FOR_INADMISSIBLE_N);
+    SP_RUN(T_PR_KSTORE);
     return SP_DONE();
 }

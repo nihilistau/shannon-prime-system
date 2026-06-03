@@ -74,6 +74,35 @@ void sp_pr_attention(sp_pr_ctx *ctx, const int32_t *q,
                      const int32_t *const *keys, int n_keys,
                      double *probs_out);
 
+/* ── NTT-FUSION keystore: K stored natively in the dual-prime residue domain ──
+ *
+ * The write-once/read-many factoring of sp_pr_inner. At K-write time the
+ * involuted key k* is forward-transformed ONCE and stored as its dual-prime
+ * residue block (the same object the QUIC mesh ships — u32 residues per prime).
+ * At score time the query is transformed once per (head,step) and each stored
+ * key costs ONE residue dot per prime + a scalar Garner — no per-pair forward
+ * transform, no inverse butterflies:
+ *     c_0 = psi^0 * INTT(q^ . k^*)_0 = N^{-1} * sum_j q^_j k^*_j  (mod p),
+ * and sum_j is permutation-invariant, so the kernel's residue ordering is
+ * immaterial. EXACTNESS CONTRACT: sp_pr_score_kstore(encode(k)) must equal
+ * sp_pr_inner(q,k) to the BIT for all inputs (gate T_PR_KSTORE). */
+
+/* Stored-key block layout: [N residues mod q1][N residues mod q2] = 2N u32. */
+size_t sp_pr_kstore_words(const sp_pr_ctx *ctx);   /* == 2N */
+
+/* Write-once: involute k (k*_0=k_0, k*_j=-k_{N-j}) and forward-transform into
+ * kres_out[2N] (caller-owned; this is the residue block to cache/spill/ship). */
+void sp_pr_kstore_encode(sp_pr_ctx *ctx, const int32_t *k, uint32_t *kres_out);
+
+/* Per (head, step): forward-transform q once into the context scratch.
+ * Subsequent sp_pr_score_kstore calls score against THIS query. */
+void sp_pr_query_begin(sp_pr_ctx *ctx, const int32_t *q);
+
+/* Exact <q,k> against a stored key block (after sp_pr_query_begin): residue
+ * dot per prime, scaled by N^{-1} mod p, Garner-recombined to the signed
+ * centered integer in (-M/2, M/2]. Bit-equal to sp_pr_inner(q,k). */
+int64_t sp_pr_score_kstore(sp_pr_ctx *ctx, const uint32_t *kres);
+
 #ifdef __cplusplus
 }
 #endif

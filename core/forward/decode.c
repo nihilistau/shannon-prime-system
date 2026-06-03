@@ -35,6 +35,15 @@ static int g_ring2_store = 0;
 static const char *g_ring2_dir = 0;
 static int g_recall_decode_only = 0;
 static int g_recall_fuse = 0;
+/* SP_NTT_KV=1 — THE NTT FUSION: K is stored NATIVELY as its dual-prime residue
+ * block (write-once transform after RoPE; sp_pr_kstore_encode) and attention
+ * scores read the residues directly (query transformed once per head/step,
+ * residue dot + Garner via sp_pr_score_kstore — exact <q,k>, bit-equal to the
+ * per-pair overlay, gate T_PR_KSTORE). Stage-1 scope: the plain resident path
+ * (ARM knobs off, Spinor-block cache off) and direct-N head dims {128,256,512}
+ * (Qwen3 HD=128); inadmissible configs fall back to the baseline silently.
+ * Residue-domain Ring-1/Ring-2 spill (block == QUIC ResidueBlock) composes next. */
+static int g_ntt_kv = 0;
 
 #define KV_HEAD_MAX_BLOCKS 16
 static void kv_spinor_roundtrip(float *vec, int d) {
@@ -58,6 +67,7 @@ static void read_env_knobs(void) {
     { const char *e = getenv("SP_RING2_DIR");       g_ring2_dir = (e && e[0]) ? e : "."; }
     { const char *e = getenv("SP_RECALL_DECODE_ONLY"); g_recall_decode_only = (e && e[0] == '1'); }
     { const char *e = getenv("SP_RECALL_FUSE");        g_recall_fuse = (e && e[0] == '1'); }
+    { const char *e = getenv("SP_NTT_KV");             g_ntt_kv = (e && e[0] == '1'); }
 }
 
 /* Persistent-KV O(n) greedy decode (GEN_KV) with the ARM two-ring memory.
@@ -148,6 +158,7 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
     /* NTT decode-attention overlay (SP_ENGINE_NTT_ATTN). */
     sp_pr_ctx *pr = NULL; sp_pr_bluestein_ctx *pr_b = NULL; int overlay_active = 0;
     int32_t *qi = NULL, *ki = NULL;
+    uint32_t *kres = NULL; int fusion_on = 0; size_t krw = 0;  /* SP_NTT_KV keystore */
 
     /* ── ARM configuration (engine-faithful gating) ── */
     const int ring2_on = (g_ring2 && g_recall_b > 0 && !use_blocks && !g_recall_decode_only);
@@ -251,18 +262,31 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
         fprintf(stderr, "    [ring2] BACKEND spill ON (W=%d, sinks pinned; v1 per-layer dedupe staging%s)\n",
                 g_recall_w, r2be.read_batch ? ", batched reads" : ", serial reference reads");
     }
-    /* NTT decode overlay init — mirrors the prefill overlay (HD-dispatch). */
-    if (g_ntt_attn) {
+    /* NTT decode overlay + FUSION init — mirrors the prefill overlay HD-dispatch.
+     * overlay (g_ntt_attn): per-pair poly-ring score, direct or Bluestein.
+     * fusion (g_ntt_kv):    keystore residue cache, DIRECT-N only. */
+    if (g_ntt_attn || g_ntt_kv) {
         if (HD == 128 || HD == 256 || HD == 512) {
-            pr = sp_pr_init((uint32_t)HD); if (pr) overlay_active = 1;
-        } else if (HD >= 2 && HD <= 256 && (HD & (HD - 1)) == 0) {
-            pr_b = sp_pr_bluestein_init((uint32_t)HD); if (pr_b) overlay_active = 1;
+            pr = sp_pr_init((uint32_t)HD);
+        } else if (g_ntt_attn && HD >= 2 && HD <= 256 && (HD & (HD - 1)) == 0) {
+            pr_b = sp_pr_bluestein_init((uint32_t)HD);
         }
-        if (overlay_active) {
+        overlay_active = g_ntt_attn && (pr || pr_b);
+        fusion_on = g_ntt_kv && pr != NULL && !use_blocks &&
+                    g_recall_b == 0 && !ring2_on;          /* stage-1: plain path */
+        if (overlay_active || fusion_on) {
             qi = (int32_t *)malloc((size_t)HD * sizeof(int32_t));
             ki = (int32_t *)malloc((size_t)HD * sizeof(int32_t));
             if (!qi || !ki) goto done;
         }
+        if (fusion_on) {
+            krw = sp_pr_kstore_words(pr);                  /* 2N u32 per stored head */
+            kres = (uint32_t *)malloc((size_t)c->n_layers * P * NKV * krw * sizeof(uint32_t));
+            if (!kres) goto done;
+            fprintf(stderr, "    [ntt-kv] FUSION ON: K cached natively as dual-prime residue blocks "
+                    "(%zu u32/head, write-once transform; scores = residue dot + Garner, exact)\n", krw);
+        }
+        if (overlay_active && fusion_on) overlay_active = 0;   /* fusion branch supersedes */
     }
 
     for (int pos = 0; pos < P; pos++) {
@@ -347,6 +371,14 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
                 memcpy(vc + ((size_t)L * r1cap + wslot) * KVD, vnew, (size_t)KVD * sizeof(float));
                 KC = kc + (size_t)L * r1cap * KVD;
                 VC = vc + (size_t)L * r1cap * KVD;
+                /* NTT FUSION write path: the position-finalized K head is quantized
+                 * and forward-transformed ONCE; the residue block is the stored unit. */
+                if (fusion_on)
+                    for (int h = 0; h < NKV; h++) {
+                        const float *kh = knew + (size_t)h * HD;
+                        for (int i = 0; i < HD; i++) ki[i] = (int32_t)lrintf(kh[i] * (float)SP_NTT_ATTN_SCALE);
+                        sp_pr_kstore_encode(pr, ki, kres + (((size_t)L * P + pos) * NKV + h) * krw);
+                    }
             }
             /* Ring-2 spill of the new position (skipped during the fuse dense prefill). */
             if (r2be_on && !(fuse && pos < n_prompt)) {
@@ -467,6 +499,31 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
                         for (int i = 0; i < HD; i++) out[i] += w * vh[i];
                     }
                 }
+            } else if (fusion_on) {
+                /* NTT FUSION read path: q transformed once per head; each cached K
+                 * costs one residue dot per prime + scalar Garner — the exact
+                 * integer <q,k>, no per-pair forward, no inverse butterflies. */
+                for (int h = 0; h < NH; h++) {
+                    int kvh = h / group; const float *qh = q + (size_t)h * HD;
+                    for (int i = 0; i < HD; i++) qi[i] = (int32_t)lrintf(qh[i] * (float)SP_NTT_ATTN_SCALE);
+                    sp_pr_query_begin(pr, qi);
+                    float maxs = -INFINITY;
+                    for (int s = 0; s <= pos; s++) {
+                        int64_t ip = sp_pr_score_kstore(pr, kres + (((size_t)L * P + s) * NKV + kvh) * krw);
+                        float d = (float)((double)ip / (SP_NTT_ATTN_SCALE * SP_NTT_ATTN_SCALE)) * ascale;
+                        sc[s] = d; if (d > maxs) maxs = d;
+                    }
+                    float sum = 0.0f;
+                    for (int s = 0; s <= pos; s++) { sc[s] = expf(sc[s] - maxs); sum += sc[s]; }
+                    float inv = 1.0f / sum;
+                    float *out = ao + (size_t)h * HD;
+                    for (int i = 0; i < HD; i++) out[i] = 0.0f;
+                    for (int s = 0; s <= pos; s++) {
+                        float w = sc[s] * inv;
+                        const float *vh = VC + (size_t)s * KVD + (size_t)kvh * HD;
+                        for (int i = 0; i < HD; i++) out[i] += w * vh[i];
+                    }
+                }
             } else {
                 /* plain full-context path (ARM off) — the bit-identical baseline. */
                 for (int h = 0; h < NH; h++) {
@@ -543,7 +600,7 @@ done:
     free(stg_stamp); free(stg_slot); free(stg_pos);
     free(ri_all); free(m_all); free(rb_which); free(rb_off); free(rb_dst);
     if (r2be_owned && r2be.handle && r2be.close) r2be.close(r2be.handle);
-    free(qi); free(ki); sp_pr_free(pr); sp_pr_bluestein_free(pr_b);
+    free(qi); free(ki); free(kres); sp_pr_free(pr); sp_pr_bluestein_free(pr_b);
     return rc;
 }
 
