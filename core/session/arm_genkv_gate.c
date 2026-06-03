@@ -25,6 +25,7 @@
 #include "sp/sp_l1.h"
 #include "sp/sp_model.h"
 #include "sp/model.h"
+#include "sp/arm.h"
 #include "qwen3_fixture.h"
 
 #include <stdlib.h>
@@ -153,6 +154,72 @@ static void T_GENKV_ARM_SPARSE_RUNS(void) {
     knobs_off();
 }
 
+/* ── Stage C: registered platform backend (counting in-memory store) ────────
+ * Registers a custom backend with read_batch + the aligned-alloc hooks and
+ * proves the canonical decode (a) routes through it instead of the stdio
+ * reference, (b) stays byte-identical to baseline at identity budget, and
+ * (c) actually exercised every hook (counters > 0). This is the same seam the
+ * engine's Optane NO_BUFFERING+IOCP store registers through. */
+#define CBE_CAP (1u << 20)
+typedef struct {
+    unsigned char *mem[2];
+    long writes, reads, batches, allocs, frees;
+} counting_be;
+static counting_be g_cbe;
+
+static int cbe_write(void *h, int which, uint64_t off, const void *src, size_t len) {
+    counting_be *b = (counting_be *)h;
+    if (off + len > CBE_CAP) return 1;
+    memcpy(b->mem[which] + off, src, len); b->writes++; return 0;
+}
+static int cbe_read(void *h, int which, uint64_t off, void *dst, size_t len) {
+    counting_be *b = (counting_be *)h;
+    if (off + len > CBE_CAP) return 1;
+    memcpy(dst, b->mem[which] + off, len); b->reads++; return 0;
+}
+static int cbe_read_batch(void *h, const int *which, const uint64_t *off,
+                          void *const *dst, size_t len, int n) {
+    counting_be *b = (counting_be *)h;
+    for (int i = 0; i < n; i++)
+        if (cbe_read(h, which[i], off[i], dst[i], len)) return 1;
+    b->batches++; return 0;
+}
+static void *cbe_alloc(void *h, size_t bytes) { ((counting_be *)h)->allocs++; return malloc(bytes); }
+static void  cbe_free(void *h, void *p)       { ((counting_be *)h)->frees++;  free(p); }
+
+static void T_GENKV_REGISTERED_BACKEND(void) {
+    memset(&g_cbe, 0, sizeof(g_cbe));
+    g_cbe.mem[0] = (unsigned char *)malloc(CBE_CAP);
+    g_cbe.mem[1] = (unsigned char *)malloc(CBE_CAP);
+    SP_CHECK(g_cbe.mem[0] && g_cbe.mem[1], "counting backend buffers");
+
+    sp_arm_ring2_backend be;
+    be.handle = &g_cbe;
+    be.write_block = cbe_write; be.read_block = cbe_read; be.read_batch = cbe_read_batch;
+    be.alloc_aligned = cbe_alloc; be.free_aligned = cbe_free;
+    be.close = NULL;                      /* borrowed: decode must NOT close it */
+    sp_arm_ring2_register(&be);
+
+    knobs_off(); knobs_ring_common();
+    knob("SP_RECALL_B", "64");
+    knob("SP_RING2", "1"); knob("SP_RING2_DISK", "1");
+    int32_t got[PTOT];
+    SP_CHECK_EQ_I64(run_decode(got), PTOT, "registered-backend decode completes");
+    if (!seq_equal(g_base, got)) dump_seq("registered-be", got);
+    SP_CHECK(seq_equal(g_base, got),
+             "registered platform backend, identity budget == baseline");
+    SP_CHECK(g_cbe.writes  > 0, "registered backend received the spill writes");
+    SP_CHECK(g_cbe.batches > 0, "registered backend served reads via read_batch");
+    SP_CHECK(g_cbe.allocs == 2 && g_cbe.frees == 2,
+             "direct-I/O staging came from the backend allocator (2 alloc / 2 free)");
+    fprintf(stderr, "    [counting-be] writes=%ld reads=%ld batches=%ld allocs=%ld frees=%ld\n",
+            g_cbe.writes, g_cbe.reads, g_cbe.batches, g_cbe.allocs, g_cbe.frees);
+
+    sp_arm_ring2_register(NULL);          /* unregister: decode falls back to stdio */
+    knobs_off();
+    free(g_cbe.mem[0]); free(g_cbe.mem[1]);
+}
+
 static void T_GENKV_NTT_TOP1(void) {
     knobs_off();
     knob("SP_ENGINE_NTT_ATTN", "1");    /* HD=8 -> Bluestein poly-ring decode score */
@@ -171,6 +238,7 @@ int main(void) {
     SP_RUN(T_GENKV_ARM_BACKEND_PARITY);
     SP_RUN(T_GENKV_ARM_FUSE_PARITY);
     SP_RUN(T_GENKV_ARM_SPARSE_RUNS);
+    SP_RUN(T_GENKV_REGISTERED_BACKEND);
     SP_RUN(T_GENKV_NTT_TOP1);
     qwen3_free(g_qm);
     sp_model_unload(g_sm);

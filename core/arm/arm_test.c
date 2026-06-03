@@ -177,6 +177,23 @@ static void T_ARM_RING2_STDIO(void) {
     be.close(be.handle);
 }
 
+
+static int dummy_wr(void *h, int w, uint64_t o, const void *s, size_t l) { (void)h;(void)w;(void)o;(void)s;(void)l; return 0; }
+static int dummy_rd(void *h, int w, uint64_t o, void *d, size_t l)       { (void)h;(void)w;(void)o;(void)d;(void)l; return 0; }
+
+static void T_ARM_REGISTER(void) {
+    sp_arm_ring2_backend got;
+    SP_CHECK_EQ_I64(sp_arm_ring2_registered(&got), 0, "no backend registered initially");
+    sp_arm_ring2_backend be; memset(&be, 0, sizeof(be));
+    be.handle = (void *)0x5150; be.write_block = dummy_wr; be.read_block = dummy_rd;
+    sp_arm_ring2_register(&be);
+    SP_CHECK_EQ_I64(sp_arm_ring2_registered(&got), 1, "registered backend is visible");
+    SP_CHECK(got.handle == (void *)0x5150 && got.write_block == dummy_wr,
+             "registered backend round-trips intact");
+    sp_arm_ring2_register(NULL);
+    SP_CHECK_EQ_I64(sp_arm_ring2_registered(&got), 0, "unregister clears the hook");
+}
+
 int main(void) {
     SP_RUN(T_ARM_R_FROZEN);
     SP_RUN(T_ARM_PROJECT_EXACT);
@@ -185,5 +202,6 @@ int main(void) {
     SP_RUN(T_ARM_TOPK_SET);
     SP_RUN(T_ARM_R1SLOT);
     SP_RUN(T_ARM_RING2_STDIO);
+    SP_RUN(T_ARM_REGISTER);
     return SP_DONE();
 }

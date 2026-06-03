@@ -374,8 +374,13 @@ static float kv_pair_score(const float *qh, const float *kh, int HD, float ascal
     return acc * ascale;
 }
 
-int qwen3_generate_kv(const qwen3_model *m, int32_t *seq, int n_prompt, int n_gen,
-                      int eos_id) {
+/* Shared decode body for qwen3_generate_kv (ppl_mode=0, argmax emit) and
+ * qwen3_ppl_decode (ppl_mode=1, teacher-forced NLL of seq[pos+1] over
+ * [n_warm, P-2]). ONE forward path — the recall router + two-ring are
+ * identical in both modes. */
+static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, int n_gen,
+                            int eos_id, int ppl_mode, int n_warm,
+                            double *nll_out, long *nscored_out) {
     if (!m || !seq || n_prompt <= 0 || n_gen < 0) return -1;
     read_env_knobs();
     const qwen3_config *c = &m->cfg;
@@ -404,6 +409,8 @@ int qwen3_generate_kv(const qwen3_model *m, int32_t *seq, int n_prompt, int n_ge
     int *rb_which = NULL; uint64_t *rb_off = NULL; void **rb_dst = NULL; /* optional read_batch reqs */
     int *ri = NULL; sp_arm_sidx *cand = NULL;            /* inline-path selection scratch */
     sp_arm_ring2_backend r2be; int r2be_on = 0; r2be.handle = NULL; r2be.close = NULL;
+    int r2be_owned = 0;      /* stdio reference = owned (closed at done); registered = borrowed */
+    int stg_hooked = 0;      /* staging buffers came from the backend's aligned allocator */
     int stg_gen = 0;
     /* NTT decode-attention overlay (SP_ENGINE_NTT_ATTN). */
     sp_pr_ctx *pr = NULL; sp_pr_bluestein_ctx *pr_b = NULL; int overlay_active = 0;
@@ -472,9 +479,22 @@ int qwen3_generate_kv(const qwen3_model *m, int32_t *seq, int n_prompt, int n_ge
         fprintf(stderr, "    [ring2] mock RAM spill ON: Ring-1 holds only sink+W=%d slots\n",
                 g_recall_sink + r1W);
     } else if (r2be_on) {
-        if (sp_arm_ring2_stdio_open(g_ring2_dir, &r2be)) { r2be_on = 0; goto done; }
-        stgK = (float *)malloc((size_t)P * KVD * sizeof(float));
-        stgV = (float *)malloc((size_t)P * KVD * sizeof(float));
+        /* Stage C: a registered platform backend (engine Optane IOCP, QUIC peer)
+         * takes precedence over the stdio reference. Registered = BORROWED — the
+         * registrant owns the lifetime; we never close it. */
+        if (sp_arm_ring2_registered(&r2be)) {
+            fprintf(stderr, "    [ring2] using REGISTERED platform backend (%s reads%s)\n",
+                    r2be.read_batch ? "batched" : "serial",
+                    r2be.alloc_aligned ? ", direct-I/O aligned staging" : "");
+        } else {
+            if (sp_arm_ring2_stdio_open(g_ring2_dir, &r2be)) { r2be_on = 0; goto done; }
+            r2be_owned = 1;
+        }
+        stg_hooked = (r2be.alloc_aligned != NULL);
+        stgK = stg_hooked ? (float *)r2be.alloc_aligned(r2be.handle, (size_t)P * KVD * sizeof(float))
+                          : (float *)malloc((size_t)P * KVD * sizeof(float));
+        stgV = stg_hooked ? (float *)r2be.alloc_aligned(r2be.handle, (size_t)P * KVD * sizeof(float))
+                          : (float *)malloc((size_t)P * KVD * sizeof(float));
         stg_stamp = (int *)malloc((size_t)P * sizeof(int));
         stg_slot  = (int *)malloc((size_t)P * sizeof(int));
         stg_pos   = (int *)malloc((size_t)P * sizeof(int));
@@ -748,7 +768,25 @@ int qwen3_generate_kv(const qwen3_model *m, int32_t *seq, int n_prompt, int n_ge
             for (int i = 0; i < E; i++) x[i] += dn[i];
         }
 
-        if (pos >= n_prompt - 1 && produced < n_gen) {         /* emit next token */
+        if (ppl_mode) {
+            /* G2: teacher-forced autoregressive PPL — logits at every scored pos,
+             * accumulate -log p(seq[pos+1]) for pos in [n_warm, P-2]. The two-ring
+             * path above is exercised exactly as in production decode. */
+            if (pos + 1 < P && pos >= n_warm) {
+                sp_rmsnorm(x, sp_as_f32(m, m->output_norm), E, eps, nx);
+                if (sp_matmul(m, m->output, nx, 1, E, V, lg)) goto done;
+                int tgt = seq[pos + 1];
+                if (tgt >= 0 && tgt < V) {
+                    float maxl = lg[0];
+                    for (int j = 1; j < V; j++) if (lg[j] > maxl) maxl = lg[j];
+                    double sumexp = 0.0;
+                    for (int j = 0; j < V; j++) sumexp += exp((double)lg[j] - (double)maxl);
+                    double logp = (double)lg[tgt] - (double)maxl - log(sumexp);
+                    if (nll_out)     *nll_out += -logp;
+                    if (nscored_out) (*nscored_out)++;
+                }
+            }
+        } else if (pos >= n_prompt - 1 && produced < n_gen) {  /* emit next token */
             sp_rmsnorm(x, sp_as_f32(m, m->output_norm), E, eps, nx);
             if (sp_matmul(m, m->output, nx, 1, E, V, lg)) goto done;
             int amax = 0;
@@ -765,9 +803,38 @@ done:
     free(ao); free(ap); free(gg); free(up); free(dn); free(sc); free(lg);
     free(recallR); free(projk); free(ri); free(cand);
     free(ring2k); free(ring2v);
-    free(stgK); free(stgV); free(stg_stamp); free(stg_slot); free(stg_pos);
+    if (stg_hooked) {                  /* backend-provided direct-I/O buffers */
+        if (stgK) r2be.free_aligned(r2be.handle, stgK);
+        if (stgV) r2be.free_aligned(r2be.handle, stgV);
+    } else { free(stgK); free(stgV); }
+    free(stg_stamp); free(stg_slot); free(stg_pos);
     free(ri_all); free(m_all); free(rb_which); free(rb_off); free(rb_dst);
-    if (r2be.handle && r2be.close) r2be.close(r2be.handle);
+    if (r2be_owned && r2be.handle && r2be.close) r2be.close(r2be.handle);
     free(qi); free(ki); sp_pr_free(pr); sp_pr_bluestein_free(pr_b);
     return rc;
+}
+
+int qwen3_generate_kv(const qwen3_model *m, int32_t *seq, int n_prompt, int n_gen,
+                      int eos_id) {
+    return generate_kv_impl(m, seq, n_prompt, n_gen, eos_id, /*ppl_mode=*/0, 0, NULL, NULL);
+}
+
+/* Teacher-forced autoregressive perplexity over the DECODE path (G2): the recall
+ * router + two-ring (SP_RECALL_* / SP_RING2*) are exercised exactly as production
+ * decode. toks[0,n_toks) is the corpus slice; positions [n_warm, n_toks-1) are
+ * scored (predict toks[pos+1] from the logits at pos). Returns 0 on success and
+ * sets *ppl = exp(mean NLL) (+ *n_scored if non-NULL). Shares generate_kv_impl —
+ * one forward path, no divergence. */
+int qwen3_ppl_decode(const qwen3_model *m, int32_t *toks, int n_toks, int n_warm,
+                     double *ppl, long *n_scored) {
+    if (!m || !toks || n_toks < 4 || !ppl) return 1;
+    if (n_warm < 1) n_warm = 1;
+    if (n_warm > n_toks - 2) n_warm = n_toks - 2;
+    double nll = 0.0; long ns = 0;
+    int rc = generate_kv_impl(m, toks, n_toks, /*n_gen=*/0, /*eos=*/-1,
+                              /*ppl_mode=*/1, n_warm, &nll, &ns);
+    if (rc < 0 || ns <= 0) return 1;
+    *ppl = exp(nll / (double)ns);
+    if (n_scored) *n_scored = ns;
+    return 0;
 }
