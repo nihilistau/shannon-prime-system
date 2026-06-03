@@ -331,6 +331,11 @@ int qwen3_generate_kv(const qwen3_model *m, int32_t *seq, int n_prompt, int n_ge
     float *kdec = NULL, *vdec = NULL;             /* per-layer decode scratch (use_blocks) */
     float *x = NULL, *nx = NULL, *q = NULL, *knew = NULL, *vnew = NULL, *ao = NULL;
     float *ap = NULL, *gg = NULL, *up = NULL, *dn = NULL, *sc = NULL, *lg = NULL;
+    /* NTT decode-attention overlay (SP_ENGINE_NTT_ATTN): the exact poly-ring score
+     * (PPT step 6) fused into the persistent-KV decode path. Declared here (init'd
+     * below once HD is known) so every early `goto done` sees them NULL/0. */
+    sp_pr_ctx *pr = NULL; sp_pr_bluestein_ctx *pr_b = NULL; int overlay_active = 0;
+    int32_t *qi = NULL, *ki = NULL;
 
     if (use_blocks) {
         size_t nb = (size_t)c->n_layers * P * NKV * NBLK;
@@ -364,6 +369,23 @@ int qwen3_generate_kv(const qwen3_model *m, int32_t *seq, int n_prompt, int n_ge
     lg   = (float *)malloc((size_t)V * sizeof(float));
     if (!x || !nx || !q || !knew || !vnew || !ao || !ap || !gg || !up || !dn || !sc || !lg)
         goto done;
+
+    /* NTT decode-attention overlay init — mirrors the prefill overlay in
+     * qwen3_forward_ex2: HD-dispatch direct sp_pr for HD in {128,256,512},
+     * Bluestein for power-of-2 HD in [2,256]; HD with odd factors leaves both
+     * NULL → overlay_active=0 → the f32 dot below (the bit-identical reference). */
+    if (g_ntt_attn) {
+        if (HD == 128 || HD == 256 || HD == 512) {
+            pr = sp_pr_init((uint32_t)HD); if (pr) overlay_active = 1;
+        } else if (HD >= 2 && HD <= 256 && (HD & (HD - 1)) == 0) {
+            pr_b = sp_pr_bluestein_init((uint32_t)HD); if (pr_b) overlay_active = 1;
+        }
+        if (overlay_active) {
+            qi = (int32_t *)malloc((size_t)HD * sizeof(int32_t));
+            ki = (int32_t *)malloc((size_t)HD * sizeof(int32_t));
+            if (!qi || !ki) goto done;
+        }
+    }
 
     for (int pos = 0; pos < P; pos++) {
         int tok = seq[pos];
@@ -414,11 +436,22 @@ int qwen3_generate_kv(const qwen3_model *m, int32_t *seq, int n_prompt, int n_ge
                 int kvh = h / group;
                 const float *qh = q + (size_t)h * HD;
                 float maxs = -INFINITY;
-                for (int s = 0; s <= pos; s++) {
-                    const float *kh = KC + (size_t)s * KVD + (size_t)kvh * HD;
-                    float acc = 0.0f;
-                    for (int i = 0; i < HD; i++) acc += qh[i] * kh[i];
-                    float d = acc * ascale; sc[s] = d; if (d > maxs) maxs = d;
+                if (overlay_active) {                          /* exact poly-ring score (NTT) */
+                    for (int i = 0; i < HD; i++) qi[i] = (int32_t)lrintf(qh[i] * (float)SP_NTT_ATTN_SCALE);
+                    for (int s = 0; s <= pos; s++) {
+                        const float *kh = KC + (size_t)s * KVD + (size_t)kvh * HD;
+                        for (int i = 0; i < HD; i++) ki[i] = (int32_t)lrintf(kh[i] * (float)SP_NTT_ATTN_SCALE);
+                        int64_t ip = pr_b ? sp_pr_bluestein_inner(pr_b, qi, ki) : sp_pr_inner(pr, qi, ki);
+                        float d = (float)((double)ip / (SP_NTT_ATTN_SCALE * SP_NTT_ATTN_SCALE)) * ascale;
+                        sc[s] = d; if (d > maxs) maxs = d;
+                    }
+                } else {                                       /* f32 dot (bit-identical reference) */
+                    for (int s = 0; s <= pos; s++) {
+                        const float *kh = KC + (size_t)s * KVD + (size_t)kvh * HD;
+                        float acc = 0.0f;
+                        for (int i = 0; i < HD; i++) acc += qh[i] * kh[i];
+                        float d = acc * ascale; sc[s] = d; if (d > maxs) maxs = d;
+                    }
                 }
                 float sum = 0.0f;
                 for (int s = 0; s <= pos; s++) { sc[s] = expf(sc[s] - maxs); sum += sc[s]; }
@@ -457,5 +490,6 @@ done:
     free(kcb); free(vcb); free(kdec); free(vdec);
     free(kc); free(vc); free(x); free(nx); free(q); free(knew); free(vnew);
     free(ao); free(ap); free(gg); free(up); free(dn); free(sc); free(lg);
+    free(qi); free(ki); sp_pr_free(pr); sp_pr_bluestein_free(pr_b);
     return rc;
 }
