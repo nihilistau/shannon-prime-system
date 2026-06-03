@@ -85,6 +85,7 @@
  * ntt_crt.c internal access.
  */
 #include "sp/poly_ring_bluestein.h"
+#include "sp/poly_ring.h"     /* sp_pr_resdot — the shared keystore hot loop */
 #include "sp/ntt_crt.h"
 
 #include <assert.h>
@@ -666,14 +667,7 @@ void sp_pr_bluestein_query_begin(sp_pr_bluestein_ctx *ctx, const int32_t *q) {
 int64_t sp_pr_bluestein_score_kstore(sp_pr_bluestein_ctx *ctx, const uint32_t *kres) {
     const uint32_t M = ctx->M;
     const uint32_t q1 = ctx->p1.q, q2 = ctx->p2.q;
-    const uint64_t mu1 = ctx->p1.mu, mu2 = ctx->p2.mu;
-    uint64_t acc1 = 0, acc2 = 0;
-    for (uint32_t j = 0; j < M; j++) {
-        acc1 += pr_blue_modmul(ctx->qf1[j], kres[j],     q1, mu1);
-        acc2 += pr_blue_modmul(ctx->qf2[j], kres[M + j], q2, mu2);
-        /* partials < M * 2^30 <= 2^39 — single reduce below */
-    }
-    uint32_t s1 = (uint32_t)(acc1 % q1);
-    uint32_t s2 = (uint32_t)(acc2 % q2);
-    return pr_blue_garner(s1, s2, q1, q2, mu2, ctx->q1_inv_mod_q2);
+    uint32_t s1 = sp_pr_resdot(ctx->qf1, kres,     M, q1);
+    uint32_t s2 = sp_pr_resdot(ctx->qf2, kres + M, M, q2);
+    return pr_blue_garner(s1, s2, q1, q2, ctx->p2.mu, ctx->q1_inv_mod_q2);
 }

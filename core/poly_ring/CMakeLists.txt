@@ -13,7 +13,7 @@ endif()
 include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/sp_module.cmake)
 
 sp_add_module(poly_ring
-    SOURCES   poly_ring.c poly_ring_bluestein.c
+    SOURCES   poly_ring.c poly_ring_bluestein.c resdot.c
     TEST      poly_ring_test.c
     TEST_NAME T_PR
     DEPENDS   sp_ntt_crt)
