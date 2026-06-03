@@ -23,6 +23,8 @@ License: MIT. See `LICENSE`.
 
 ## 1. What's in here
 
+The scalar reference forward here is the **bit-exact correctness anchor** — a discrete `Z_q` forward proven **argmax bit-exact to llama.cpp** on five architecture families: Qwen3-0.6B, Qwen2.5-Coder-0.5B, Gemma3-1B, **Gemma4-E2B**, and **Qwen3.6-35B-A3B MoE (Gated DeltaNet)**. The reducing `.sp-model` codec (`OK_Q4` / `OK_Q8`, body ≤ source quant) is output-lossless (C1, top-1 == oracle). Everything below is a primitive every accelerated backend shares and gates against.
+
 | Module | Header | Purpose |
 |--------|--------|---------|
 | **L1 ABI** | `include/sp/sp_l1.h` | The frozen session + forward + arch-query surface (PPT-LAT-L1-ABI-v0). Two-function forward (`sp_prefill_chunk` / `sp_decode_step`), clone/rewind, deterministic-mode anchor. |
@@ -61,6 +63,16 @@ recent sprint output including the WIRE-HEX §6 forward-backend hook —
 that submodule's commit will land back on this repo's main in the next
 sync wave.
 
+**Headline (what the math-core now proves).** The discrete forward is bit-exact
+on **5 arch families** (through the 35B-A3B Gated-DeltaNet MoE); the reducing
+`.sp-model` codec is **output-lossless and smaller than source** (C1); the
+NTT-CRT / Frobenius / Spinor / KSTE primitives are all shipped + gated. These
+primitives feed the engine's measured envelope — the two-ring memory (910× @32k,
+7.57 µs/read off Optane) and the WIRE-CPU integer pipe (0.84 → 39.52 tok/s, 47×)
+are realized in the engine repo on top of this core. The open headline remains
+the **Spinor per-vector KV codec ratio at bit-exact** (lossy 29/31 today) — see
+`shannon-prime-lattice/papers/PPT-LAT-STATE.md`.
+
 | Component | Status |
 |-----------|--------|
 | `core/forward_kernels` — `sp_dot_f32`, `sp_rmsnorm`, `sp_rope_neox`, `sp_attn_head` | **shipped** (scalar reference) |
@@ -68,6 +80,7 @@ sync wave.
 | `core/forward` — Qwen3 / Gemma3 / Gemma4 / Qwen3.6-35B-A3B MoE (Gated DeltaNet) prefill + persistent-KV decode | **shipped** |
 | `core/session` — `sp_session_create`, `sp_prefill_chunk`, `sp_decode_step`, clone/rewind, KV-mode flags | **shipped** |
 | `core/io_format` — `.sp-model` v0 loader (`sp_model_load`/`sp_model_unload`, `sp_model_arch`) | **shipped** |
+| `core/io_format` — **reducing codec** (`OK_Q4`/`OK_Q8` body ≤ source quant) | **shipped (C1)** — output-lossless top-1 (gemma4 + qwen35moe); qwen35moe 16.3 < 19.7 GB, Qwen3-0.6B-f16 1,439 → 720 MB (50%) |
 | `core/io_hash` — CRC-32 / SHA-256 / XXH64 | **shipped** |
 | `core/weight_dtype` — F16↔F32 + per-row dequant (F32/F16/Q8_0) | **shipped** |
 | `core/gguf` — GGUF v3 mmap parser | **shipped** |
