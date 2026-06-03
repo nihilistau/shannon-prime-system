@@ -26,6 +26,7 @@
 #include "sp/poly_ring.h"          /* sp_pr_init / sp_pr_inner / sp_pr_free (NTT-attention overlay) */
 #include "sp/poly_ring_bluestein.h"/* NTT.5a Bluestein wrapper for HD ∈ {2..256} ∖ {512} (NTT.5c) */
 #include "sp/spinor_block.h"       /* sp_spinor_* + the frozen 63-byte KV block contract */
+#include "sp/arm.h"                /* ARM two-ring: ±1 recall router + r1slot + Ring-2 backend */
 
 #include <stdlib.h>
 #include <string.h>
@@ -62,6 +63,22 @@ static int g_kv_spinor = 0;
  * in-place round-trip, so the two paths must produce identical sequences. */
 static int g_kv_spinor_ref = 0;
 
+/* ── ARM two-ring knobs (C2.1, ported from the engine production impl). All OFF
+ * => the exact full-context baseline (bit-identical parity). Same env names as
+ * the engine so every existing gate/harness drives this path unchanged. */
+static int g_recall_b = 0;          /* SP_RECALL_B: recall budget (0 = off = full attention) */
+static int g_recall_r = 16;         /* SP_RECALL_R: projection rank (<= SP_ARM_R_MAX) */
+static int g_recall_w = 64;         /* SP_RECALL_W: always-keep recent window */
+static int g_recall_sink = 4;       /* SP_RECALL_SINK: pinned StreamingLLM sink anchors */
+static int g_ring2 = 0;             /* SP_RING2=1: history spills to the mock RAM Ring-2 store */
+static int g_ring2_store = 0;       /* SP_RING2_DISK=1: history spills through the Ring-2 BACKEND
+                                     * (math-core reference = portable stdio store; platform stores
+                                     * — Optane IOCP, QUIC peer — register the same interface) */
+static const char *g_ring2_dir = 0; /* SP_RING2_DIR: stdio store directory (default ".") */
+static int g_recall_decode_only = 0;/* SP_RECALL_DECODE_ONLY=1: dense exact prefill; router engages at decode */
+static int g_recall_fuse = 0;       /* SP_RECALL_FUSE=1: compact-and-spill (dense full-P prefill buffer,
+                                     * bulk-spilled + freed at the prefill->decode boundary) */
+
 /* The multi-block KV head codec lives in the math core (sp_spinor_blocks_for /
  * encode_vec / decode_vec, sp/spinor_block.h). The only local helper is the in-place
  * round-trip used by the prefill KV path (E_CPU_8) and the generate_kv f32 parity ref. */
@@ -80,6 +97,15 @@ static void read_env_knobs(void) {
     { const char *e = getenv("SP_ENGINE_NTT_ATTN"); g_ntt_attn = (e && e[0] == '1'); }
     { const char *e = getenv("SP_KV_SPINOR");       g_kv_spinor = (e && e[0] == '1'); }
     { const char *e = getenv("SP_KV_SPINOR_REF");   g_kv_spinor_ref = (e && e[0] == '1'); }
+    { const char *e = getenv("SP_RECALL_B");        g_recall_b = e ? atoi(e) : 0; if (g_recall_b < 0) g_recall_b = 0; }
+    { const char *e = getenv("SP_RECALL_R");        g_recall_r = e ? atoi(e) : 16; if (g_recall_r < 1 || g_recall_r > SP_ARM_R_MAX) g_recall_r = 16; }
+    { const char *e = getenv("SP_RECALL_W");        g_recall_w = e ? atoi(e) : 64; if (g_recall_w < 0) g_recall_w = 0; }
+    { const char *e = getenv("SP_RECALL_SINK");     g_recall_sink = e ? atoi(e) : 4; if (g_recall_sink < 0) g_recall_sink = 0; }
+    { const char *e = getenv("SP_RING2");           g_ring2 = (e && e[0] == '1'); }
+    { const char *e = getenv("SP_RING2_DISK");      g_ring2_store = (e && e[0] == '1'); }
+    { const char *e = getenv("SP_RING2_DIR");       g_ring2_dir = (e && e[0]) ? e : "."; }
+    { const char *e = getenv("SP_RECALL_DECODE_ONLY"); g_recall_decode_only = (e && e[0] == '1'); }
+    { const char *e = getenv("SP_RECALL_FUSE");        g_recall_fuse = (e && e[0] == '1'); }
 }
 
 int qwen3_forward_ex2(const qwen3_model *m, const int32_t *tokens, int n_tok,
@@ -301,13 +327,53 @@ int qwen3_forward(const qwen3_model *m, const int32_t *tokens, int n_tok, float 
     return qwen3_forward_ex2(m, tokens, n_tok, logits, NULL, NULL, NULL, NULL);
 }
 
-/* Persistent-KV O(n) greedy decode (GEN_KV). Each token is processed once: per-layer
- * K/V are computed for the single new token, stored post-RoPE into a position-indexed
- * cache, and attention reads the cached K/V for all earlier positions. Honors the same
- * gates as the prefill (SP_ENGINE_FROB, SP_KV_SPINOR — the cache stores Spinor-compressed
- * K/V when SP_KV_SPINOR=1). NTT-attention is prefill-only. Greedy argmax must match the
- * O(n^2) re-prefill generate up to the float-reassociation floor; GEN_KV gates on
- * sequence (argmax) identity, not bit-equal logits. */
+/* Persistent-KV O(n) greedy decode (GEN_KV) with the ARM two-ring memory.
+ *
+ * Each token is processed once: per-layer K/V are computed for the single new
+ * token, stored post-RoPE into a position-indexed cache, and attention reads
+ * the cached K/V for earlier positions. Honors the same gates as the prefill
+ * (SP_ENGINE_FROB, SP_KV_SPINOR) plus, decode-side, SP_ENGINE_NTT_ATTN (the
+ * exact poly-ring score) and the ARM two-ring knobs (SP_RECALL_* / SP_RING2*).
+ *
+ * ARM (ported from the engine C2.1 production impl, serial L1 reference):
+ *   - recall sidecar: each position's post-RoPE K is ±1-projected (sp/arm.h,
+ *     frozen seed) into projk; at attention, sp_arm_select picks
+ *     sinks ∪ top-(B-W-sink) ∪ recent-W (expected-O(N) quickselect).
+ *   - Ring-1: when offloading, the f32 kc/vc cache holds ONLY sinks + the
+ *     W-window (ring buffer, cap = sink+W, sp_arm_r1slot); older tokens are
+ *     structurally evicted and served from Ring-2.
+ *   - Ring-2: the spilled history. SP_RING2=1 alone = mock RAM byte store
+ *     (spill/fetch parity); SP_RING2_DISK=1 = the abstract block-store backend
+ *     (math-core reference = portable stdio under SP_RING2_DIR; the engine
+ *     registers its Optane NO_BUFFERING+IOCP store through the same interface,
+ *     a QUIC peer is the same interface over the mesh). v1 dedupe: per layer,
+ *     the UNION of all heads' recalled blocks is fetched once into staging.
+ *   - SP_RECALL_DECODE_ONLY=1: dense exact prefill (full cache, no offload),
+ *     router engages only at decode. SP_RECALL_FUSE=1 (compact-and-spill):
+ *     dense prefill in a full-P buffer; at the prefill->decode boundary the
+ *     history is bulk-spilled to Ring-2, sinks+window copied into the small
+ *     cache, and the buffer FREED.
+ *
+ * All knobs OFF => the exact full-context baseline path, bit-identical to the
+ * pre-ARM decode. Greedy argmax must match the O(n^2) re-prefill generate up
+ * to the float-reassociation floor; GEN_KV gates on sequence identity. */
+
+/* Score one (q,k) pair: the exact poly-ring inner product when the NTT decode
+ * overlay is active (qi pre-quantized per head), else the f32 dot — the same
+ * arithmetic order as the pre-ARM decode, so gate-off parity is bit-exact. */
+static float kv_pair_score(const float *qh, const float *kh, int HD, float ascale,
+                           sp_pr_ctx *pr, sp_pr_bluestein_ctx *pr_b,
+                           const int32_t *qi, int32_t *ki) {
+    if (pr || pr_b) {
+        for (int i = 0; i < HD; i++) ki[i] = (int32_t)lrintf(kh[i] * (float)SP_NTT_ATTN_SCALE);
+        int64_t ip = pr_b ? sp_pr_bluestein_inner(pr_b, qi, ki) : sp_pr_inner(pr, qi, ki);
+        return (float)((double)ip / (SP_NTT_ATTN_SCALE * SP_NTT_ATTN_SCALE)) * ascale;
+    }
+    float acc = 0.0f;
+    for (int i = 0; i < HD; i++) acc += qh[i] * kh[i];
+    return acc * ascale;
+}
+
 int qwen3_generate_kv(const qwen3_model *m, int32_t *seq, int n_prompt, int n_gen,
                       int eos_id) {
     if (!m || !seq || n_prompt <= 0 || n_gen < 0) return -1;
@@ -319,23 +385,36 @@ int qwen3_generate_kv(const qwen3_model *m, int32_t *seq, int n_prompt, int n_ge
     const float eps = c->rms_eps, base = c->rope_freq_base, ascale = 1.0f / sqrtf((float)HD);
     const int P = n_prompt + n_gen;
 
-    /* Production KV layout (Piece 2): SP_KV_SPINOR=1 stores the cache as frozen 63-byte
-     * Spinor blocks (NBLK per head) and decodes on read into per-LAYER f32 scratch.
-     * SP_KV_SPINOR_REF=1 keeps the f32 cache (parity reference). Gate off => f32 cache. */
     const int NBLK = sp_spinor_blocks_for(HD);
     const int use_blocks = g_kv_spinor && !g_kv_spinor_ref;
 
     int rc = -1, n = n_prompt, produced = 0;
+    /* All pointers NULL-first so any early `goto done` frees only NULLs. */
     sp_spinor_block_t *kcb = NULL, *vcb = NULL;   /* block KV cache (use_blocks) */
-    float *kc = NULL, *vc = NULL;                 /* f32 KV cache (ref / gate-off) */
+    float *kc = NULL, *vc = NULL;                 /* f32 KV cache (window-sized when offloading) */
+    float *kpre = NULL, *vpre = NULL;             /* SP_RECALL_FUSE full-P dense prefill buffer */
     float *kdec = NULL, *vdec = NULL;             /* per-layer decode scratch (use_blocks) */
     float *x = NULL, *nx = NULL, *q = NULL, *knew = NULL, *vnew = NULL, *ao = NULL;
     float *ap = NULL, *gg = NULL, *up = NULL, *dn = NULL, *sc = NULL, *lg = NULL;
-    /* NTT decode-attention overlay (SP_ENGINE_NTT_ATTN): the exact poly-ring score
-     * (PPT step 6) fused into the persistent-KV decode path. Declared here (init'd
-     * below once HD is known) so every early `goto done` sees them NULL/0. */
+    signed char *recallR = NULL; float *projk = NULL;    /* recall sidecar (g_recall_b>0) */
+    float *ring2k = NULL, *ring2v = NULL;                /* mock RAM Ring-2 store */
+    float *stgK = NULL, *stgV = NULL;                    /* backend dedupe staging */
+    int *stg_stamp = NULL, *stg_slot = NULL, *stg_pos = NULL;
+    int *ri_all = NULL, *m_all = NULL;                   /* per-head recall sets (backend path) */
+    int *rb_which = NULL; uint64_t *rb_off = NULL; void **rb_dst = NULL; /* optional read_batch reqs */
+    int *ri = NULL; sp_arm_sidx *cand = NULL;            /* inline-path selection scratch */
+    sp_arm_ring2_backend r2be; int r2be_on = 0; r2be.handle = NULL; r2be.close = NULL;
+    int stg_gen = 0;
+    /* NTT decode-attention overlay (SP_ENGINE_NTT_ATTN). */
     sp_pr_ctx *pr = NULL; sp_pr_bluestein_ctx *pr_b = NULL; int overlay_active = 0;
     int32_t *qi = NULL, *ki = NULL;
+
+    /* ── ARM configuration (engine-faithful gating) ── */
+    const int ring2_on = (g_ring2 && g_recall_b > 0 && !use_blocks && !g_recall_decode_only);
+    r2be_on = ring2_on && g_ring2_store;
+    const int fuse = (g_recall_fuse && r2be_on);
+    const int r1W = (g_recall_w > 0) ? g_recall_w : 1;
+    const int r1cap = ring2_on ? (g_recall_sink + r1W) : P;
 
     if (use_blocks) {
         size_t nb = (size_t)c->n_layers * P * NKV * NBLK;
@@ -351,11 +430,17 @@ int qwen3_generate_kv(const qwen3_model *m, int32_t *seq, int n_prompt, int n_ge
                 (double)((size_t)c->n_layers * P * NKV * NBLK * sizeof(sp_spinor_block_t)),
                 NBLK, (int)sizeof(sp_spinor_block_t));
     } else {
-        kc = (float *)malloc((size_t)c->n_layers * P * KVD * sizeof(float)); /* K cache */
-        vc = (float *)malloc((size_t)c->n_layers * P * KVD * sizeof(float)); /* V cache */
+        kc = (float *)malloc((size_t)c->n_layers * r1cap * KVD * sizeof(float));
+        vc = (float *)malloc((size_t)c->n_layers * r1cap * KVD * sizeof(float));
         if (!kc || !vc) goto done;
+        if (ring2_on)
+            fprintf(stderr, "    [ring1] f32 cache SHRUNK to window: %d slots/layer (sink %d + W %d) = %.1f MB vs full %.1f MB (%.0fx)\n",
+                    r1cap, g_recall_sink, r1W,
+                    2.0 * c->n_layers * r1cap * KVD * sizeof(float) / 1e6,
+                    2.0 * c->n_layers * P * KVD * sizeof(float) / 1e6,
+                    (double)P / (double)r1cap);
     }
-    x    = (float *)malloc((size_t)E * sizeof(float));   /* single-token residual */
+    x    = (float *)malloc((size_t)E * sizeof(float));
     nx   = (float *)malloc((size_t)E * sizeof(float));
     q    = (float *)malloc((size_t)QD * sizeof(float));
     knew = (float *)malloc((size_t)KVD * sizeof(float));
@@ -369,11 +454,51 @@ int qwen3_generate_kv(const qwen3_model *m, int32_t *seq, int n_prompt, int n_ge
     lg   = (float *)malloc((size_t)V * sizeof(float));
     if (!x || !nx || !q || !knew || !vnew || !ao || !ap || !gg || !up || !dn || !sc || !lg)
         goto done;
-
-    /* NTT decode-attention overlay init — mirrors the prefill overlay in
-     * qwen3_forward_ex2: HD-dispatch direct sp_pr for HD in {128,256,512},
-     * Bluestein for power-of-2 HD in [2,256]; HD with odd factors leaves both
-     * NULL → overlay_active=0 → the f32 dot below (the bit-identical reference). */
+    if (g_recall_b > 0) {
+        recallR = (signed char *)malloc((size_t)g_recall_r * HD);
+        projk   = (float *)malloc((size_t)c->n_layers * P * NKV * (size_t)g_recall_r * sizeof(float));
+        ri      = (int *)malloc((size_t)P * sizeof(int));
+        cand    = (sp_arm_sidx *)malloc((size_t)P * sizeof(sp_arm_sidx));
+        if (!recallR || !projk || !ri || !cand) goto done;
+        sp_arm_build_R(recallR, g_recall_r, HD);   /* frozen ±1 matrix, deterministic */
+        fprintf(stderr, "    [recall] sidecar ON: r=%d B=%d W=%d sink=%d (post-RoPE ±1 projection router + sinks)\n",
+                g_recall_r, g_recall_b, g_recall_w, g_recall_sink);
+    }
+    if (ring2_on && !r2be_on) {
+        size_t kvn = (size_t)c->n_layers * P * KVD;
+        ring2k = (float *)malloc(kvn * sizeof(float));
+        ring2v = (float *)malloc(kvn * sizeof(float));
+        if (!ring2k || !ring2v) goto done;
+        fprintf(stderr, "    [ring2] mock RAM spill ON: Ring-1 holds only sink+W=%d slots\n",
+                g_recall_sink + r1W);
+    } else if (r2be_on) {
+        if (sp_arm_ring2_stdio_open(g_ring2_dir, &r2be)) { r2be_on = 0; goto done; }
+        stgK = (float *)malloc((size_t)P * KVD * sizeof(float));
+        stgV = (float *)malloc((size_t)P * KVD * sizeof(float));
+        stg_stamp = (int *)malloc((size_t)P * sizeof(int));
+        stg_slot  = (int *)malloc((size_t)P * sizeof(int));
+        stg_pos   = (int *)malloc((size_t)P * sizeof(int));
+        ri_all = (int *)malloc((size_t)NH * P * sizeof(int));
+        m_all  = (int *)malloc((size_t)NH * sizeof(int));
+        if (r2be.read_batch) {
+            rb_which = (int *)malloc((size_t)2 * P * sizeof(int));
+            rb_off   = (uint64_t *)malloc((size_t)2 * P * sizeof(uint64_t));
+            rb_dst   = (void **)malloc((size_t)2 * P * sizeof(void *));
+            if (!rb_which || !rb_off || !rb_dst) goto done;
+        }
+        if (!stgK || !stgV || !stg_stamp || !stg_slot || !stg_pos || !ri_all || !m_all) goto done;
+        for (int i = 0; i < P; i++) stg_stamp[i] = -1;
+        if (fuse) {
+            kpre = (float *)malloc((size_t)c->n_layers * P * KVD * sizeof(float));
+            vpre = (float *)malloc((size_t)c->n_layers * P * KVD * sizeof(float));
+            if (!kpre || !vpre) goto done;
+            fprintf(stderr, "    [fuse] compact-and-spill: dense full-P prefill buffer (%.1f MB), freed at the boundary\n",
+                    2.0 * c->n_layers * P * KVD * sizeof(float) / 1e6);
+        }
+        fprintf(stderr, "    [ring2] BACKEND spill ON (W=%d, sinks pinned; v1 per-layer dedupe staging%s)\n",
+                g_recall_w, r2be.read_batch ? ", batched reads" : ", serial reference reads");
+    }
+    /* NTT decode overlay init — mirrors the prefill overlay (HD-dispatch). */
     if (g_ntt_attn) {
         if (HD == 128 || HD == 256 || HD == 512) {
             pr = sp_pr_init((uint32_t)HD); if (pr) overlay_active = 1;
@@ -391,6 +516,35 @@ int qwen3_generate_kv(const qwen3_model *m, int32_t *seq, int n_prompt, int n_ge
         int tok = seq[pos];
         if (sp_embed_row(m, tok, E, x)) goto done;
 
+        if (fuse && pos == n_prompt) {
+            /* FUSE boundary: bulk-spill the prefill history to Ring-2, copy sinks +
+             * the recent window into the (sink+W) cache, FREE the full-P buffer. */
+            int W = r1W, sink = g_recall_sink;
+            int wlo = n_prompt - W; if (wlo < sink) wlo = sink;
+            for (uint32_t L = 0; L < c->n_layers; L++) {
+                const float *kpL = kpre + (size_t)L * P * KVD, *vpL = vpre + (size_t)L * P * KVD;
+                for (int s = 0; s < n_prompt; s++) {
+                    uint64_t boff = (uint64_t)((size_t)L * P + s) * (uint64_t)((size_t)KVD * sizeof(float));
+                    if (r2be.write_block(r2be.handle, 0, boff, kpL + (size_t)s * KVD, (size_t)KVD * sizeof(float)) ||
+                        r2be.write_block(r2be.handle, 1, boff, vpL + (size_t)s * KVD, (size_t)KVD * sizeof(float))) goto done;
+                }
+                float *kcL = kc + (size_t)L * r1cap * KVD, *vcL = vc + (size_t)L * r1cap * KVD;
+                for (int s = 0; s < sink && s < n_prompt; s++) {
+                    int sl = sp_arm_r1slot(s, 1, sink, W);
+                    memcpy(kcL + (size_t)sl * KVD, kpL + (size_t)s * KVD, (size_t)KVD * sizeof(float));
+                    memcpy(vcL + (size_t)sl * KVD, vpL + (size_t)s * KVD, (size_t)KVD * sizeof(float));
+                }
+                for (int s = wlo; s < n_prompt; s++) {
+                    int sl = sp_arm_r1slot(s, 1, sink, W);
+                    memcpy(kcL + (size_t)sl * KVD, kpL + (size_t)s * KVD, (size_t)KVD * sizeof(float));
+                    memcpy(vcL + (size_t)sl * KVD, vpL + (size_t)s * KVD, (size_t)KVD * sizeof(float));
+                }
+            }
+            free(kpre); free(vpre); kpre = NULL; vpre = NULL;
+            fprintf(stderr, "    [fuse] boundary @ pos=%d: spilled %d tok/layer to Ring-2, freed the prefill buffer\n",
+                    n_prompt, n_prompt);
+        }
+
         for (uint32_t L = 0; L < c->n_layers; L++) {
             const qwen3_layer *ly = &m->layers[L];
             sp_rmsnorm(x, sp_as_f32(m, ly->attn_norm), E, eps, nx);
@@ -402,10 +556,13 @@ int qwen3_generate_kv(const qwen3_model *m, int32_t *seq, int n_prompt, int n_ge
             for (int h = 0; h < NH;  h++) { float *qh = q    + (size_t)h * HD; sp_rmsnorm_head(qh, qn, HD, eps); sp_rope_neox(qh, HD, pos, base); }
             for (int h = 0; h < NKV; h++) { float *kh = knew + (size_t)h * HD; sp_rmsnorm_head(kh, kn, HD, eps); sp_rope_neox(kh, HD, pos, base); }
 
-            /* Store position-finalized K/V; KC/VC then point at the f32 attention reads
-             * as KC[s*KVD + kvh*HD]. Block path: encode into the persistent block cache,
-             * decode [0,pos] of this layer into the per-layer scratch. f32 path: optional
-             * in-place round-trip (parity ref) then memcpy into the full cache. */
+            /* recall sidecar: project the post-RoPE K of this (layer,pos) per kv-head. */
+            if (g_recall_b > 0)
+                for (int hh = 0; hh < NKV; hh++)
+                    sp_arm_project(recallR, g_recall_r, HD, knew + (size_t)hh * HD,
+                                   projk + (((size_t)L * P + pos) * NKV + hh) * (size_t)g_recall_r);
+
+            /* Store the position-finalized K/V; KC/VC point at what attention reads. */
             const float *KC, *VC;
             if (use_blocks) {
                 sp_spinor_block_t *kb = kcb + ((size_t)L * P + pos) * NKV * NBLK;
@@ -414,7 +571,7 @@ int qwen3_generate_kv(const qwen3_model *m, int32_t *seq, int n_prompt, int n_ge
                     sp_spinor_encode_vec(knew + (size_t)h * HD, HD, kb + (size_t)h * NBLK);
                     sp_spinor_encode_vec(vnew + (size_t)h * HD, HD, vb + (size_t)h * NBLK);
                 }
-                for (int s = 0; s <= pos; s++) {                /* decode the live window into scratch */
+                for (int s = 0; s <= pos; s++) {
                     const sp_spinor_block_t *ks = kcb + ((size_t)L * P + s) * NKV * NBLK;
                     const sp_spinor_block_t *vs = vcb + ((size_t)L * P + s) * NKV * NBLK;
                     for (int h = 0; h < NKV; h++) {
@@ -423,45 +580,161 @@ int qwen3_generate_kv(const qwen3_model *m, int32_t *seq, int n_prompt, int n_ge
                     }
                 }
                 KC = kdec; VC = vdec;
+            } else if (fuse && pos < n_prompt) {
+                /* FUSE dense prefill: full-P buffer, no window write, no spill. */
+                memcpy(kpre + ((size_t)L * P + pos) * KVD, knew, (size_t)KVD * sizeof(float));
+                memcpy(vpre + ((size_t)L * P + pos) * KVD, vnew, (size_t)KVD * sizeof(float));
+                KC = kpre + (size_t)L * P * KVD;
+                VC = vpre + (size_t)L * P * KVD;
             } else {
                 if (g_kv_spinor)   /* SP_KV_SPINOR_REF: f32 cache with the lossy round-trip */
                     for (int h = 0; h < NKV; h++) { kv_spinor_roundtrip(knew + (size_t)h * HD, HD); kv_spinor_roundtrip(vnew + (size_t)h * HD, HD); }
-                memcpy(kc + ((size_t)L * P + pos) * KVD, knew, (size_t)KVD * sizeof(float));
-                memcpy(vc + ((size_t)L * P + pos) * KVD, vnew, (size_t)KVD * sizeof(float));
-                KC = kc + (size_t)L * P * KVD;
-                VC = vc + (size_t)L * P * KVD;
+                int wslot = sp_arm_r1slot(pos, ring2_on, g_recall_sink, r1W);
+                memcpy(kc + ((size_t)L * r1cap + wslot) * KVD, knew, (size_t)KVD * sizeof(float));
+                memcpy(vc + ((size_t)L * r1cap + wslot) * KVD, vnew, (size_t)KVD * sizeof(float));
+                KC = kc + (size_t)L * r1cap * KVD;
+                VC = vc + (size_t)L * r1cap * KVD;
+            }
+            /* Ring-2 spill of the new position (skipped during the fuse dense prefill). */
+            if (r2be_on && !(fuse && pos < n_prompt)) {
+                uint64_t boff = (uint64_t)((size_t)L * P + pos) * (uint64_t)((size_t)KVD * sizeof(float));
+                if (r2be.write_block(r2be.handle, 0, boff, knew, (size_t)KVD * sizeof(float)) ||
+                    r2be.write_block(r2be.handle, 1, boff, vnew, (size_t)KVD * sizeof(float))) goto done;
+            } else if (ring2_on && !r2be_on) {
+                memcpy(ring2k + ((size_t)L * P + pos) * KVD, knew, (size_t)KVD * sizeof(float));
+                memcpy(ring2v + ((size_t)L * P + pos) * KVD, vnew, (size_t)KVD * sizeof(float));
             }
 
-            for (int h = 0; h < NH; h++) {                     /* attention over cached [0,pos] */
-                int kvh = h / group;
-                const float *qh = q + (size_t)h * HD;
-                float maxs = -INFINITY;
-                if (overlay_active) {                          /* exact poly-ring score (NTT) */
-                    for (int i = 0; i < HD; i++) qi[i] = (int32_t)lrintf(qh[i] * (float)SP_NTT_ATTN_SCALE);
+            /* ── attention over the cached [0,pos] ── */
+            int winlo = (pos + 1 > g_recall_w) ? (pos + 1 - g_recall_w) : 0;
+            int eB = (g_recall_decode_only && pos < n_prompt) ? 0 : g_recall_b;
+            if (fuse && pos < n_prompt) {
+                /* dense exact prefill over the full-P buffer (absolute slots) */
+                for (int h = 0; h < NH; h++) {
+                    int kvh = h / group; const float *qh = q + (size_t)h * HD;
+                    if (overlay_active) for (int i = 0; i < HD; i++) qi[i] = (int32_t)lrintf(qh[i] * (float)SP_NTT_ATTN_SCALE);
+                    float maxs = -INFINITY;
                     for (int s = 0; s <= pos; s++) {
-                        const float *kh = KC + (size_t)s * KVD + (size_t)kvh * HD;
-                        for (int i = 0; i < HD; i++) ki[i] = (int32_t)lrintf(kh[i] * (float)SP_NTT_ATTN_SCALE);
-                        int64_t ip = pr_b ? sp_pr_bluestein_inner(pr_b, qi, ki) : sp_pr_inner(pr, qi, ki);
-                        float d = (float)((double)ip / (SP_NTT_ATTN_SCALE * SP_NTT_ATTN_SCALE)) * ascale;
+                        float d = kv_pair_score(qh, KC + (size_t)s * KVD + (size_t)kvh * HD, HD, ascale, pr, pr_b, qi, ki);
                         sc[s] = d; if (d > maxs) maxs = d;
                     }
-                } else {                                       /* f32 dot (bit-identical reference) */
+                    float sum = 0.0f;
+                    for (int s = 0; s <= pos; s++) { sc[s] = expf(sc[s] - maxs); sum += sc[s]; }
+                    float inv = 1.0f / sum; float *out = ao + (size_t)h * HD;
+                    for (int i = 0; i < HD; i++) out[i] = 0.0f;
                     for (int s = 0; s <= pos; s++) {
-                        const float *kh = KC + (size_t)s * KVD + (size_t)kvh * HD;
-                        float acc = 0.0f;
-                        for (int i = 0; i < HD; i++) acc += qh[i] * kh[i];
-                        float d = acc * ascale; sc[s] = d; if (d > maxs) maxs = d;
+                        float w = sc[s] * inv; const float *vh = VC + (size_t)s * KVD + (size_t)kvh * HD;
+                        for (int i = 0; i < HD; i++) out[i] += w * vh[i];
                     }
                 }
-                float sum = 0.0f;
-                for (int s = 0; s <= pos; s++) { sc[s] = expf(sc[s] - maxs); sum += sc[s]; }
-                float inv = 1.0f / sum;
-                float *out = ao + (size_t)h * HD;
-                for (int i = 0; i < HD; i++) out[i] = 0.0f;
-                for (int s = 0; s <= pos; s++) {
-                    float w = sc[s] * inv;
-                    const float *vh = VC + (size_t)s * KVD + (size_t)kvh * HD;
-                    for (int i = 0; i < HD; i++) out[i] += w * vh[i];
+            } else if (r2be_on) {
+                /* 3-phase dedupe: select all heads -> fetch the union once -> attend. */
+                for (int h = 0; h < NH; h++)
+                    m_all[h] = sp_arm_select(recallR, g_recall_r, HD, q + (size_t)h * HD,
+                                             projk, (size_t)L, P, NKV, h / group, eB, g_recall_w,
+                                             g_recall_sink, pos, cand, ri_all + (size_t)h * P);
+                stg_gen++;
+                int nstage = 0;
+                for (int h = 0; h < NH; h++) {
+                    const int *rih = ri_all + (size_t)h * P;
+                    for (int jj = 0; jj < m_all[h]; jj++) {
+                        int s = rih[jj];
+                        if (s < winlo && s >= g_recall_sink && stg_stamp[s] != stg_gen) {
+                            stg_stamp[s] = stg_gen; stg_slot[s] = nstage; stg_pos[nstage] = s; nstage++;
+                        }
+                    }
+                }
+                if (nstage > 0 && r2be.read_batch) {
+                    for (int i = 0; i < nstage; i++) {
+                        uint64_t boff = (uint64_t)((size_t)L * P + stg_pos[i]) * (uint64_t)((size_t)KVD * sizeof(float));
+                        rb_which[2 * i] = 0;     rb_off[2 * i] = boff;     rb_dst[2 * i] = stgK + (size_t)i * KVD;
+                        rb_which[2 * i + 1] = 1; rb_off[2 * i + 1] = boff; rb_dst[2 * i + 1] = stgV + (size_t)i * KVD;
+                    }
+                    if (r2be.read_batch(r2be.handle, rb_which, rb_off, rb_dst,
+                                        (size_t)KVD * sizeof(float), 2 * nstage)) goto done;
+                } else {
+                    for (int i = 0; i < nstage; i++) {
+                        uint64_t boff = (uint64_t)((size_t)L * P + stg_pos[i]) * (uint64_t)((size_t)KVD * sizeof(float));
+                        if (r2be.read_block(r2be.handle, 0, boff, stgK + (size_t)i * KVD, (size_t)KVD * sizeof(float)) ||
+                            r2be.read_block(r2be.handle, 1, boff, stgV + (size_t)i * KVD, (size_t)KVD * sizeof(float))) goto done;
+                    }
+                }
+                for (int h = 0; h < NH; h++) {
+                    int kvh = h / group; const float *qh = q + (size_t)h * HD;
+                    const int *rih = ri_all + (size_t)h * P; int mm = m_all[h];
+                    if (overlay_active) for (int i = 0; i < HD; i++) qi[i] = (int32_t)lrintf(qh[i] * (float)SP_NTT_ATTN_SCALE);
+                    float maxs = -INFINITY;
+                    for (int jj = 0; jj < mm; jj++) {
+                        int s = rih[jj];
+                        const float *kbase = (s < winlo && s >= g_recall_sink)
+                            ? stgK + (size_t)stg_slot[s] * KVD
+                            : KC + (size_t)sp_arm_r1slot(s, ring2_on, g_recall_sink, r1W) * KVD;
+                        float d = kv_pair_score(qh, kbase + (size_t)kvh * HD, HD, ascale, pr, pr_b, qi, ki);
+                        sc[jj] = d; if (d > maxs) maxs = d;
+                    }
+                    float sum = 0.0f;
+                    for (int jj = 0; jj < mm; jj++) { sc[jj] = expf(sc[jj] - maxs); sum += sc[jj]; }
+                    float inv = 1.0f / sum; float *out = ao + (size_t)h * HD;
+                    for (int i = 0; i < HD; i++) out[i] = 0.0f;
+                    for (int jj = 0; jj < mm; jj++) {
+                        int s = rih[jj]; float w = sc[jj] * inv;
+                        const float *vbase = (s < winlo && s >= g_recall_sink)
+                            ? stgV + (size_t)stg_slot[s] * KVD
+                            : VC + (size_t)sp_arm_r1slot(s, ring2_on, g_recall_sink, r1W) * KVD;
+                        const float *vh = vbase + (size_t)kvh * HD;
+                        for (int i = 0; i < HD; i++) out[i] += w * vh[i];
+                    }
+                }
+            } else if (g_recall_b > 0) {
+                /* inline select + attend (mock Ring-2 / pure sparse / decode-only). */
+                for (int h = 0; h < NH; h++) {
+                    int kvh = h / group; const float *qh = q + (size_t)h * HD;
+                    int mm = sp_arm_select(recallR, g_recall_r, HD, qh, projk, (size_t)L, P,
+                                           NKV, kvh, eB, g_recall_w, g_recall_sink, pos, cand, ri);
+                    if (overlay_active) for (int i = 0; i < HD; i++) qi[i] = (int32_t)lrintf(qh[i] * (float)SP_NTT_ATTN_SCALE);
+                    float maxs = -INFINITY;
+                    for (int jj = 0; jj < mm; jj++) {
+                        int s = ri[jj];
+                        const float *kbase = (ring2_on && s < winlo && s >= g_recall_sink)
+                            ? ring2k + ((size_t)L * P + s) * KVD
+                            : KC + (size_t)sp_arm_r1slot(s, ring2_on, g_recall_sink, r1W) * KVD;
+                        float d = kv_pair_score(qh, kbase + (size_t)kvh * HD, HD, ascale, pr, pr_b, qi, ki);
+                        sc[jj] = d; if (d > maxs) maxs = d;
+                    }
+                    float sum = 0.0f;
+                    for (int jj = 0; jj < mm; jj++) { sc[jj] = expf(sc[jj] - maxs); sum += sc[jj]; }
+                    float inv = 1.0f / sum; float *out = ao + (size_t)h * HD;
+                    for (int i = 0; i < HD; i++) out[i] = 0.0f;
+                    for (int jj = 0; jj < mm; jj++) {
+                        int s = ri[jj]; float w = sc[jj] * inv;
+                        const float *vbase = (ring2_on && s < winlo && s >= g_recall_sink)
+                            ? ring2v + ((size_t)L * P + s) * KVD
+                            : VC + (size_t)sp_arm_r1slot(s, ring2_on, g_recall_sink, r1W) * KVD;
+                        const float *vh = vbase + (size_t)kvh * HD;
+                        for (int i = 0; i < HD; i++) out[i] += w * vh[i];
+                    }
+                }
+            } else {
+                /* plain full-context path (ARM off) — the bit-identical baseline. */
+                for (int h = 0; h < NH; h++) {
+                    int kvh = h / group;
+                    const float *qh = q + (size_t)h * HD;
+                    if (overlay_active) for (int i = 0; i < HD; i++) qi[i] = (int32_t)lrintf(qh[i] * (float)SP_NTT_ATTN_SCALE);
+                    float maxs = -INFINITY;
+                    for (int s = 0; s <= pos; s++) {
+                        float d = kv_pair_score(qh, KC + (size_t)s * KVD + (size_t)kvh * HD, HD, ascale, pr, pr_b, qi, ki);
+                        sc[s] = d; if (d > maxs) maxs = d;
+                    }
+                    float sum = 0.0f;
+                    for (int s = 0; s <= pos; s++) { sc[s] = expf(sc[s] - maxs); sum += sc[s]; }
+                    float inv = 1.0f / sum;
+                    float *out = ao + (size_t)h * HD;
+                    for (int i = 0; i < HD; i++) out[i] = 0.0f;
+                    for (int s = 0; s <= pos; s++) {
+                        float w = sc[s] * inv;
+                        const float *vh = VC + (size_t)s * KVD + (size_t)kvh * HD;
+                        for (int i = 0; i < HD; i++) out[i] += w * vh[i];
+                    }
                 }
             }
             if (sp_matmul(m, ly->attn_output, ao, 1, QD, E, ap)) goto done;
@@ -488,8 +761,13 @@ int qwen3_generate_kv(const qwen3_model *m, int32_t *seq, int n_prompt, int n_ge
     rc = n;
 done:
     free(kcb); free(vcb); free(kdec); free(vdec);
-    free(kc); free(vc); free(x); free(nx); free(q); free(knew); free(vnew);
+    free(kc); free(vc); free(kpre); free(vpre); free(x); free(nx); free(q); free(knew); free(vnew);
     free(ao); free(ap); free(gg); free(up); free(dn); free(sc); free(lg);
+    free(recallR); free(projk); free(ri); free(cand);
+    free(ring2k); free(ring2v);
+    free(stgK); free(stgV); free(stg_stamp); free(stg_slot); free(stg_pos);
+    free(ri_all); free(m_all); free(rb_which); free(rb_off); free(rb_dst);
+    if (r2be.handle && r2be.close) r2be.close(r2be.handle);
     free(qi); free(ki); sp_pr_free(pr); sp_pr_bluestein_free(pr_b);
     return rc;
 }
