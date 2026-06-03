@@ -24,3 +24,15 @@ sp_add_module(session
     TEST_SOURCES qwen3_fixture.c gemma3_fixture.c gemma4_fixture.c qwen25_fixture.c
     TEST_NAME    T_SESSION
     DEPENDS      sp_io_format sp_forward sp_model sp_arena sp_frobenius sp_io_hash)
+
+# ── Stage-D run-gates: ARM two-ring + NTT decode through qwen3_generate_kv ──
+# Drives the canonical decode on the synthetic qwen3 fixture (HD=8 => the NTT
+# overlay engages via Bluestein). Identity-budget parity proves the spill/fetch
+# byte-exactness structurally (eviction is the poison). See arm_genkv_gate.c.
+if(NOT DEFINED SP_SYSTEM_BUILD_TESTS OR SP_SYSTEM_BUILD_TESTS)
+    add_executable(test_arm_genkv arm_genkv_gate.c qwen3_fixture.c)
+    target_link_libraries(test_arm_genkv PRIVATE sp_session)
+    target_include_directories(test_arm_genkv PRIVATE ${SP_INCLUDE_DIR})
+    target_compile_options(test_arm_genkv PRIVATE ${SP_C_FLAGS})
+    add_test(NAME T_ARM_GENKV COMMAND test_arm_genkv)
+endif()
