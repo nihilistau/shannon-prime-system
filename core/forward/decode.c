@@ -170,6 +170,36 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
     const int r1W = (g_recall_w > 0) ? g_recall_w : 1;
     const int r1cap = ring2_on ? (g_recall_sink + r1W) : P;
 
+    /* NTT decode overlay + FUSION init — mirrors the prefill overlay HD-dispatch.
+     * overlay (g_ntt_attn): per-pair poly-ring score, direct or Bluestein.
+     * fusion (g_ntt_kv):    keystore residue cache, DIRECT-N only. */
+    if (g_ntt_attn || g_ntt_kv) {
+        if (HD == 128 || HD == 256 || HD == 512) {
+            pr = sp_pr_init((uint32_t)HD);
+        } else if (g_ntt_attn && HD >= 2 && HD <= 256 && (HD & (HD - 1)) == 0) {
+            pr_b = sp_pr_bluestein_init((uint32_t)HD);
+        }
+        overlay_active = g_ntt_attn && (pr || pr_b);
+        /* stage-2: fusion composes with the ARM rings — the K stream is residue
+         * blocks end-to-end (Ring-1 slots, mock store, backend spill/fetch, fuse
+         * buffer). V stays f32 (never scored; fp is plumbing). */
+        fusion_on = g_ntt_kv && pr != NULL && !use_blocks;
+        if (overlay_active || fusion_on) {
+            qi = (int32_t *)malloc((size_t)HD * sizeof(int32_t));
+            ki = (int32_t *)malloc((size_t)HD * sizeof(int32_t));
+            if (!qi || !ki) goto done;
+        }
+        if (fusion_on) {
+            krw = sp_pr_kstore_words(pr);                  /* 2N u32 per stored head */
+            kres = (uint32_t *)malloc((size_t)c->n_layers * r1cap * NKV * krw * sizeof(uint32_t));
+            if (!kres) goto done;
+            fprintf(stderr, "    [ntt-kv] FUSION ON: K cached natively as dual-prime residue blocks "
+                    "(%zu u32/head, write-once transform; scores = residue dot + Garner, exact)\n", krw);
+        }
+        if (overlay_active && fusion_on) overlay_active = 0;   /* fusion branch supersedes */
+    }
+
+
     if (use_blocks) {
         size_t nb = (size_t)c->n_layers * P * NKV * NBLK;
         kcb  = (sp_spinor_block_t *)malloc(nb * sizeof(sp_spinor_block_t));
@@ -273,35 +303,6 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
         fprintf(stderr, "    [ring2] BACKEND spill ON (W=%d, sinks pinned; v1 per-layer dedupe staging%s)\n",
                 g_recall_w, r2be.read_batch ? ", batched reads" : ", serial reference reads");
     }
-    /* NTT decode overlay + FUSION init — mirrors the prefill overlay HD-dispatch.
-     * overlay (g_ntt_attn): per-pair poly-ring score, direct or Bluestein.
-     * fusion (g_ntt_kv):    keystore residue cache, DIRECT-N only. */
-    if (g_ntt_attn || g_ntt_kv) {
-        if (HD == 128 || HD == 256 || HD == 512) {
-            pr = sp_pr_init((uint32_t)HD);
-        } else if (g_ntt_attn && HD >= 2 && HD <= 256 && (HD & (HD - 1)) == 0) {
-            pr_b = sp_pr_bluestein_init((uint32_t)HD);
-        }
-        overlay_active = g_ntt_attn && (pr || pr_b);
-        /* stage-2: fusion composes with the ARM rings — the K stream is residue
-         * blocks end-to-end (Ring-1 slots, mock store, backend spill/fetch, fuse
-         * buffer). V stays f32 (never scored; fp is plumbing). */
-        fusion_on = g_ntt_kv && pr != NULL && !use_blocks;
-        if (overlay_active || fusion_on) {
-            qi = (int32_t *)malloc((size_t)HD * sizeof(int32_t));
-            ki = (int32_t *)malloc((size_t)HD * sizeof(int32_t));
-            if (!qi || !ki) goto done;
-        }
-        if (fusion_on) {
-            krw = sp_pr_kstore_words(pr);                  /* 2N u32 per stored head */
-            kres = (uint32_t *)malloc((size_t)c->n_layers * r1cap * NKV * krw * sizeof(uint32_t));
-            if (!kres) goto done;
-            fprintf(stderr, "    [ntt-kv] FUSION ON: K cached natively as dual-prime residue blocks "
-                    "(%zu u32/head, write-once transform; scores = residue dot + Garner, exact)\n", krw);
-        }
-        if (overlay_active && fusion_on) overlay_active = 0;   /* fusion branch supersedes */
-    }
-
     for (int pos = 0; pos < P; pos++) {
         int tok = seq[pos];
         if (sp_embed_row(m, tok, E, x)) goto done;
