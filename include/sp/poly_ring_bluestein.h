@@ -103,6 +103,33 @@ void sp_pr_bluestein_set_backend(sp_pr_bluestein_ctx *ctx,
                                  sp_compute_ntt_dispatch_fn forward,
                                  sp_compute_ntt_dispatch_fn inverse);
 
+/* ── NTT-FUSION keystore (Bluestein side; see sp/poly_ring.h for the direct-N
+ * contract). The stored key is the FULLY PADDED, POST-CHIRP, POST-WEIGHT
+ * residue state: involute -> psi-twist -> zero-pad to M -> inner forward NTT
+ * -> per-index weight fold. The weights w_j realise the linear functional
+ * C^ -> (D[0] + D[N]) mod p (the fold that recovers coefficient 0; the k=0
+ * untwist is psi^0 = identity) and are derived EMPIRICALLY at init by pushing
+ * unit residue vectors through the public ntt_inverse — convention-proof
+ * against the inner kernel's ordering/twiddle layout. Scoring is then the
+ * same unweighted modular dot as the direct-N keystore:
+ *     <q,k> mod p = sum_j Q^_j * kstore_j   (weights live in kstore).
+ * EXACTNESS CONTRACT: score(encode(k)) == sp_pr_bluestein_inner(q,k) to the
+ * BIT for all inputs (gate T_PR_KSTORE, Bluestein arm). */
+
+/* Stored-key block: [M residues mod q1][M residues mod q2] = 2M u32. */
+size_t sp_pr_bluestein_kstore_words(const sp_pr_bluestein_ctx *ctx);  /* == 2M */
+
+/* Write-once: involute + twist + pad + forward + weight-fold into kres_out[2M]. */
+void sp_pr_bluestein_kstore_encode(sp_pr_bluestein_ctx *ctx, const int32_t *k,
+                                   uint32_t *kres_out);
+
+/* Per (head, step): twist + pad + forward q once into the context scratch. */
+void sp_pr_bluestein_query_begin(sp_pr_bluestein_ctx *ctx, const int32_t *q);
+
+/* Exact <q,k> against a stored key block (after query_begin): plain modular
+ * dot per prime + Garner, signed centered. Bit-equal to sp_pr_bluestein_inner. */
+int64_t sp_pr_bluestein_score_kstore(sp_pr_bluestein_ctx *ctx, const uint32_t *kres);
+
 #ifdef __cplusplus
 }
 #endif

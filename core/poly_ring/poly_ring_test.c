@@ -729,6 +729,43 @@ static void T_PR_KSTORE(void) {
     }
 }
 
+
+/* T_PR_KSTORE_BLUE — the Bluestein keystore exactness contract: scoring against
+ * the stored (padded, post-chirp, post-weight) key block must equal
+ * sp_pr_bluestein_inner to the BIT for every Bluestein-admissible N. The
+ * weights were derived empirically at init through the public ntt_inverse; a
+ * mismatch falsifies the linear-functional derivation — surface UPSTREAM. */
+static void T_PR_KSTORE_BLUE(void) {
+    static const uint32_t Ns[8] = { 2, 4, 8, 16, 32, 64, 128, 256 };
+    for (int ni = 0; ni < 8; ni++) {
+        const uint32_t N = Ns[ni];
+        sp_pr_bluestein_ctx *ctx = sp_pr_bluestein_init(N);
+        SP_CHECK(ctx != NULL, "bluestein kstore ctx init");
+        if (!ctx) continue;
+        int32_t *q  = malloc(sizeof(int32_t) * N);
+        int32_t *k  = malloc(sizeof(int32_t) * N);
+        uint32_t *kr = malloc(sizeof(uint32_t) * sp_pr_bluestein_kstore_words(ctx));
+        SP_CHECK(q && k && kr, "bluestein kstore scratch");
+        int ok = 1;
+        for (int trial = 0; trial < 16 && ok; trial++) {
+            int32_t mag = (trial < 12) ? 65536 : 1048576;
+            for (uint32_t i = 0; i < N; i++) { q[i] = ks_coeff(mag); k[i] = ks_coeff(mag); }
+            int64_t want = sp_pr_bluestein_inner(ctx, q, k);
+            sp_pr_bluestein_kstore_encode(ctx, k, kr);
+            sp_pr_bluestein_query_begin(ctx, q);
+            int64_t got = sp_pr_bluestein_score_kstore(ctx, kr);
+            if (got != want) {
+                fprintf(stderr, "    BLUE KSTORE MISMATCH N=%u trial=%d want=%lld got=%lld\n",
+                        N, trial, (long long)want, (long long)got);
+                ok = 0;
+            }
+        }
+        SP_CHECK(ok, "bluestein kstore score == sp_pr_bluestein_inner BIT-EXACT (16 trials)");
+        free(q); free(k); free(kr);
+        sp_pr_bluestein_free(ctx);
+    }
+}
+
 int main(void) {
     SP_RUN(T_PR_1);
     SP_RUN(T_PR_2);
@@ -741,5 +778,6 @@ int main(void) {
     SP_RUN(T_NTT5B_BACKEND_FORWARD_PASSTHROUGH);
     SP_RUN(T_NTT5A_NULL_FOR_INADMISSIBLE_N);
     SP_RUN(T_PR_KSTORE);
+    SP_RUN(T_PR_KSTORE_BLUE);
     return SP_DONE();
 }
