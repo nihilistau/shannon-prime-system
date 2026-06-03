@@ -281,6 +281,15 @@ struct sp_pr_bluestein_ctx {
     void                       *backend_handle;
     sp_compute_ntt_dispatch_fn  backend_forward;
     sp_compute_ntt_dispatch_fn  backend_inverse;
+    /* ── NTT-FUSION keystore state ──
+     * w1/w2: per-index weights realising C^ -> (D[0]+D[N]) mod p, derived
+     * empirically at init via unit vectors through the public ntt_inverse
+     * (convention-proof). qf1/qf2: the current query's forward residues.
+     * kstar: involution scratch (N). */
+    uint32_t *w1, *w2;       /* per-prime weight tables (M each)   */
+    uint32_t *qf1, *qf2;     /* transformed query (M each)         */
+    int32_t  *kstar;         /* involuted key scratch (N)          */
+
     /* Per-call u32 scratch for backend dispatch (sized M). Math-core's host
      * ntt_forward takes int32_t* in; the backend ABI takes uint32_t*. The
      * int32 pad buffers above already hold values in [0, qP) so a memcpy-
@@ -335,13 +344,49 @@ sp_pr_bluestein_ctx *sp_pr_bluestein_init(uint32_t N) {
     ctx->u32_pad_q1 = (uint32_t *)malloc(sizeof(uint32_t) * M);
     ctx->u32_pad_q2 = (uint32_t *)malloc(sizeof(uint32_t) * M);
 
+    ctx->w1    = (uint32_t *)malloc(sizeof(uint32_t) * M);
+    ctx->w2    = (uint32_t *)malloc(sizeof(uint32_t) * M);
+    ctx->qf1   = (uint32_t *)malloc(sizeof(uint32_t) * M);
+    ctx->qf2   = (uint32_t *)malloc(sizeof(uint32_t) * M);
+    ctx->kstar = (int32_t  *)malloc(sizeof(int32_t)  * N);
+
     if (!ctx->a_pad_q1 || !ctx->a_pad_q2 || !ctx->b_pad_q1 || !ctx->b_pad_q2 ||
         !ctx->a_res_q1 || !ctx->a_res_q2 || !ctx->b_res_q1 || !ctx->b_res_q2 ||
         !ctx->c_res_q1 || !ctx->c_res_q2 || !ctx->scratch_q1 || !ctx->scratch_q2 ||
         !ctx->D || !ctx->c_fold_q1 || !ctx->c_fold_q2 ||
-        !ctx->u32_pad_q1 || !ctx->u32_pad_q2) {
+        !ctx->u32_pad_q1 || !ctx->u32_pad_q2 ||
+        !ctx->w1 || !ctx->w2 || !ctx->qf1 || !ctx->qf2 || !ctx->kstar) {
         sp_pr_bluestein_free(ctx);
         return NULL;
+    }
+
+    /* ── keystore weight derivation (one-time, ~2M public INTT calls) ──
+     * The functional C^ -> (D[0] + D[N]) mod p is linear; its matrix row is
+     * recovered by unit residue vectors. With C^_qOther = 0, the CRT output D
+     * satisfies D == INTT_qP(e_j) (mod qP), so reducing D[0]/D[N] mod qP
+     * yields exactly the per-prime weight — no assumption about the inner
+     * kernel's ordering, twiddle folding, or scaling conventions. */
+    {
+        uint32_t j;
+        for (j = 0; j < M; j++) { ctx->c_res_q1[j] = 0u; ctx->c_res_q2[j] = 0u; }
+        for (j = 0; j < M; j++) {
+            ctx->c_res_q1[j] = 1u;
+            ntt_inverse(ctx->inner, ctx->c_res_q1, ctx->c_res_q2, ctx->D);
+            uint32_t a = pr_blue_reduce_i64_modq(ctx->D[0], SP_NTT_Q1);
+            uint32_t b = pr_blue_reduce_i64_modq(ctx->D[N], SP_NTT_Q1);
+            uint32_t w = a + b; if (w >= SP_NTT_Q1) w -= SP_NTT_Q1;
+            ctx->w1[j] = w;
+            ctx->c_res_q1[j] = 0u;
+        }
+        for (j = 0; j < M; j++) {
+            ctx->c_res_q2[j] = 1u;
+            ntt_inverse(ctx->inner, ctx->c_res_q1, ctx->c_res_q2, ctx->D);
+            uint32_t a = pr_blue_reduce_i64_modq(ctx->D[0], SP_NTT_Q2);
+            uint32_t b = pr_blue_reduce_i64_modq(ctx->D[N], SP_NTT_Q2);
+            uint32_t w = a + b; if (w >= SP_NTT_Q2) w -= SP_NTT_Q2;
+            ctx->w2[j] = w;
+            ctx->c_res_q2[j] = 0u;
+        }
     }
     /* backend_* fields land NULL via calloc; explicit set_backend opts in. */
     return ctx;
@@ -361,6 +406,7 @@ void sp_pr_bluestein_free(sp_pr_bluestein_ctx *ctx) {
     free(ctx->D);
     free(ctx->c_fold_q1); free(ctx->c_fold_q2);
     free(ctx->u32_pad_q1); free(ctx->u32_pad_q2);
+    free(ctx->w1); free(ctx->w2); free(ctx->qf1); free(ctx->qf2); free(ctx->kstar);
     free(ctx);
 }
 
@@ -588,4 +634,46 @@ int64_t sp_pr_bluestein_inner(sp_pr_bluestein_ctx *ctx,
     free(kstar);
     free(prod);
     return c0;
+}
+
+/* ── NTT-FUSION keystore (Bluestein side; contract in the header) ─────────── */
+
+size_t sp_pr_bluestein_kstore_words(const sp_pr_bluestein_ctx *ctx) {
+    return ctx ? (size_t)2u * ctx->M : 0u;
+}
+
+void sp_pr_bluestein_kstore_encode(sp_pr_bluestein_ctx *ctx, const int32_t *k,
+                                   uint32_t *kres_out) {
+    const uint32_t N = ctx->N, M = ctx->M;
+    ctx->kstar[0] = k[0];
+    for (uint32_t j = 1; j < N; j++) ctx->kstar[j] = -k[N - j];   /* involution */
+    pr_blue_twist_input(ctx, ctx->kstar, ctx->b_pad_q1, ctx->b_pad_q2);
+    ntt_forward(ctx->inner, ctx->b_pad_q1, ctx->b_res_q1, ctx->scratch_q2);
+    ntt_forward(ctx->inner, ctx->b_pad_q2, ctx->scratch_q1, ctx->b_res_q2);
+    /* fold the coefficient-0 weights into the stored key */
+    for (uint32_t j = 0; j < M; j++) {
+        kres_out[j]     = pr_blue_modmul(ctx->b_res_q1[j], ctx->w1[j], ctx->p1.q, ctx->p1.mu);
+        kres_out[M + j] = pr_blue_modmul(ctx->b_res_q2[j], ctx->w2[j], ctx->p2.q, ctx->p2.mu);
+    }
+}
+
+void sp_pr_bluestein_query_begin(sp_pr_bluestein_ctx *ctx, const int32_t *q) {
+    pr_blue_twist_input(ctx, q, ctx->a_pad_q1, ctx->a_pad_q2);
+    ntt_forward(ctx->inner, ctx->a_pad_q1, ctx->qf1, ctx->scratch_q2);
+    ntt_forward(ctx->inner, ctx->a_pad_q2, ctx->scratch_q1, ctx->qf2);
+}
+
+int64_t sp_pr_bluestein_score_kstore(sp_pr_bluestein_ctx *ctx, const uint32_t *kres) {
+    const uint32_t M = ctx->M;
+    const uint32_t q1 = ctx->p1.q, q2 = ctx->p2.q;
+    const uint64_t mu1 = ctx->p1.mu, mu2 = ctx->p2.mu;
+    uint64_t acc1 = 0, acc2 = 0;
+    for (uint32_t j = 0; j < M; j++) {
+        acc1 += pr_blue_modmul(ctx->qf1[j], kres[j],     q1, mu1);
+        acc2 += pr_blue_modmul(ctx->qf2[j], kres[M + j], q2, mu2);
+        /* partials < M * 2^30 <= 2^39 — single reduce below */
+    }
+    uint32_t s1 = (uint32_t)(acc1 % q1);
+    uint32_t s2 = (uint32_t)(acc2 % q2);
+    return pr_blue_garner(s1, s2, q1, q2, mu2, ctx->q1_inv_mod_q2);
 }

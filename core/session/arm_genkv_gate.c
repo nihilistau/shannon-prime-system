@@ -231,6 +231,53 @@ static void T_GENKV_NTT_TOP1(void) {
     knobs_off();
 }
 
+
+/* ── NTT FUSION run-gates (Bluestein-unlocked): the HD=8 fixture engages the
+ * keystore via the Bluestein arm, so the fusion architecture is validated
+ * NATIVELY in-tree — plain, two-ring, backend, and the compact-and-spill
+ * fusion (the named success metric). All identity-budget == baseline. */
+static void T_GENKV_FUSION_PLAIN(void) {
+    knobs_off(); knob("SP_NTT_KV", "1");
+    int32_t got[PTOT];
+    SP_CHECK_EQ_I64(run_decode(got), PTOT, "fusion plain decode completes (Bluestein HD=8)");
+    if (!seq_equal(g_base, got)) dump_seq("fusion-plain", got);
+    SP_CHECK(seq_equal(g_base, got), "fusion (residue K cache) == baseline sequence");
+    knobs_off(); knob("SP_NTT_KV", "0");
+}
+static void T_GENKV_FUSION_MOCK_RING(void) {
+    knobs_off(); knobs_ring_common();
+    knob("SP_NTT_KV", "1"); knob("SP_RECALL_B", "64"); knob("SP_RING2", "1");
+    int32_t got[PTOT];
+    SP_CHECK_EQ_I64(run_decode(got), PTOT, "fusion x mock two-ring completes");
+    if (!seq_equal(g_base, got)) dump_seq("fusion-mock", got);
+    SP_CHECK(seq_equal(g_base, got), "fusion x mock Ring-2 (residue spill/fetch) == baseline");
+    knobs_off(); knob("SP_NTT_KV", "0");
+}
+static void T_GENKV_FUSION_BACKEND(void) {
+    knobs_off(); knobs_ring_common();
+    knob("SP_NTT_KV", "1"); knob("SP_RECALL_B", "64");
+    knob("SP_RING2", "1"); knob("SP_RING2_DISK", "1"); knob("SP_RING2_DIR", ".");
+    int32_t got[PTOT];
+    SP_CHECK_EQ_I64(run_decode(got), PTOT, "fusion x stdio backend completes");
+    if (!seq_equal(g_base, got)) dump_seq("fusion-backend", got);
+    SP_CHECK(seq_equal(g_base, got), "fusion x Ring-2 backend (residue blocks on disk) == baseline");
+    knobs_off(); knob("SP_NTT_KV", "0");
+    remove("sp_arm_ring2_k.bin"); remove("sp_arm_ring2_v.bin");
+}
+static void T_GENKV_FUSION_FUSE(void) {
+    knobs_off(); knobs_ring_common();
+    knob("SP_NTT_KV", "1"); knob("SP_RECALL_B", "64");
+    knob("SP_RING2", "1"); knob("SP_RING2_DISK", "1"); knob("SP_RING2_DIR", ".");
+    knob("SP_RECALL_FUSE", "1");
+    int32_t got[PTOT];
+    SP_CHECK_EQ_I64(run_decode(got), PTOT, "fusion x compact-and-spill completes");
+    if (!seq_equal(g_base, got)) dump_seq("fusion-fuse", got);
+    SP_CHECK(seq_equal(g_base, got),
+             "fusion x compact-and-spill (residue prefill buffer + boundary bulk-spill) == baseline");
+    knobs_off(); knob("SP_NTT_KV", "0");
+    remove("sp_arm_ring2_k.bin"); remove("sp_arm_ring2_v.bin");
+}
+
 int main(void) {
     if (load_model()) { fprintf(stderr, "FATAL: fixture model load failed\n"); return 1; }
     SP_RUN(T_GENKV_DETERMINISM);
@@ -240,6 +287,10 @@ int main(void) {
     SP_RUN(T_GENKV_ARM_SPARSE_RUNS);
     SP_RUN(T_GENKV_REGISTERED_BACKEND);
     SP_RUN(T_GENKV_NTT_TOP1);
+    SP_RUN(T_GENKV_FUSION_PLAIN);
+    SP_RUN(T_GENKV_FUSION_MOCK_RING);
+    SP_RUN(T_GENKV_FUSION_BACKEND);
+    SP_RUN(T_GENKV_FUSION_FUSE);
     qwen3_free(g_qm);
     sp_model_unload(g_sm);
     remove("fx_arm.spm"); remove("fx_arm.spt");
