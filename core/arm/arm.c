@@ -97,20 +97,9 @@ int sp_arm_select(const signed char *R, int r, int hd, const float *qh,
     return m;
 }
 
-/* ── bit-packed popcount router (SimHash overlay; see arm.h contract) ─────── */
-
-static int arm_popcount64(uint64_t x) {
-#if defined(__GNUC__) || defined(__clang__)
-    return __builtin_popcountll(x);
-#else
-    /* portable SWAR fallback (MSVC also has __popcnt64, but this keeps the
-     * reference toolchain-independent and the count is off the hot loop). */
-    x = x - ((x >> 1) & 0x5555555555555555ULL);
-    x = (x & 0x3333333333333333ULL) + ((x >> 2) & 0x3333333333333333ULL);
-    x = (x + (x >> 4)) & 0x0F0F0F0F0F0F0F0FULL;
-    return (int)((x * 0x0101010101010101ULL) >> 56);
-#endif
-}
+/* ── bit-packed popcount router (SimHash overlay; see arm.h contract) ───────
+ * The candidate scoring scan lives in arm_scan.c (its own archive member —
+ * the engine-overridable seam); this TU keeps projection + selection. */
 
 uint64_t sp_arm_project_sig(const signed char *R, int r, int hd, const float *vec) {
     uint64_t sig = 0;
@@ -135,12 +124,11 @@ int sp_arm_select_sig(const signed char *R, int r, int hd, const float *qh,
     if (cand_hi > pos + 1) cand_hi = pos + 1;
     int topk = B - W - sink; if (topk < 0) topk = 0;
     if (topk > cand_hi - sink) topk = cand_hi - sink;
-    int nc = 0;                       /* score = NEGATED Hamming (reuse the
-                                       * descending quickselect: closest first) */
-    for (int s = sink; s < cand_hi; s++) {
-        int ham = arm_popcount64(qsig ^ sigk[((size_t)L * P + s) * NKV + kvh]);
-        cand[nc].s = -(float)ham; cand[nc].i = s; nc++;
-    }
+    /* head-major sidecar: this head's signatures are stride-1 — hand the
+     * contiguous slice to the scan seam (engine: VPOPCNTDQ + OMP). */
+    const uint64_t *hs = sigk + ((size_t)L * NKV + kvh) * (size_t)P;
+    int nc = cand_hi - sink;
+    sp_arm_scan_sig(qsig, hs + sink, nc, sink, cand);
     qsel_topk(cand, nc, topk);
     int m = 0;
     for (int s = 0; s < sink; s++) ri[m++] = s;             /* pinned sink anchors */

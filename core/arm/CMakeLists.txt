@@ -16,6 +16,6 @@ include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/sp_module.cmake)
 # stdio reference store. Self-contained (no module dependencies); the forward
 # consumes it, platform Ring-2 stores register through the backend interface.
 sp_add_module(arm
-    SOURCES   arm.c
+    SOURCES   arm.c arm_scan.c
     TEST      arm_test.c
     TEST_NAME T_ARM)

@@ -232,9 +232,26 @@ static void T_ARM_SIG(void) {
         for (int d = 0; d < HD; d++) keys[s][d] = 0.05f * lcg_unit();
     float q[HD];
     for (int d = 0; d < HD; d++) { q[d] = lcg_unit(); keys[NEEDLE][d] = 4.0f * q[d]; }
+    /* head-major layout v2: sigk[(L*NKV + kvh)*P + s]; NKV=1, L=0 => [s] */
     static uint64_t sigk[(size_t)P * NKV];
     for (int s = 0; s < P; s++)
-        sigk[(size_t)s * NKV + 0] = sp_arm_project_sig(Rm, R, HD, keys[s]);
+        sigk[s] = sp_arm_project_sig(Rm, R, HD, keys[s]);
+
+    /* scan-seam contract: sp_arm_scan_sig == inline reference, exact floats
+     * + indices (any engine override must keep THIS equality — quickselect
+     * consumes these values, so score equality => selection identity). */
+    {
+        uint64_t qsig0 = sp_arm_project_sig(Rm, R, HD, keys[3]);
+        sp_arm_sidx got[P];
+        sp_arm_scan_sig(qsig0, sigk + 1, P - 2, 1, got);
+        int scan_ok = 1;
+        for (int i = 0; i < P - 2; i++) {
+            uint64_t x = qsig0 ^ sigk[1 + i];
+            int ham = 0; while (x) { ham += (int)(x & 1ULL); x >>= 1; }
+            if (got[i].s != -(float)ham || got[i].i != 1 + i) scan_ok = 0;
+        }
+        SP_CHECK(scan_ok, "scan seam == inline reference (exact scores + indices)");
+    }
 
     int pos = P - 1;
     m = sp_arm_select_sig(Rm, R, HD, q, sigk, /*L=*/0, P, NKV, /*kvh=*/0,
