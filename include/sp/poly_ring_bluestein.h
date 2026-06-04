@@ -37,6 +37,7 @@
 #ifndef SP_POLY_RING_BLUESTEIN_H
 #define SP_POLY_RING_BLUESTEIN_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include "sp/sp_l1.h"   /* sp_compute_ntt_dispatch_fn (Sprint NTT.5b) */
 
@@ -129,6 +130,19 @@ void sp_pr_bluestein_query_begin(sp_pr_bluestein_ctx *ctx, const int32_t *q);
 /* Exact <q,k> against a stored key block (after query_begin): plain modular
  * dot per prime + Garner, signed centered. Bit-equal to sp_pr_bluestein_inner. */
 int64_t sp_pr_bluestein_score_kstore(sp_pr_bluestein_ctx *ctx, const uint32_t *kres);
+
+/* ── batched keystore (mirrors sp/poly_ring.h §batch; gate T_PR_BATCH) ──
+ * Correctness-path loops over the proven single-call path (the throughput
+ * lever is the direct-N arm). Strides in elements; query i at q + i*qstride,
+ * block i at kres_out + i*ostride (2M u32 each). */
+void sp_pr_bluestein_query_begin_batch(sp_pr_bluestein_ctx *ctx,
+                                       const int32_t *q, size_t qstride, int nb);
+int64_t sp_pr_bluestein_score_kstore_b(sp_pr_bluestein_ctx *ctx, int i,
+                                       const uint32_t *kres);
+void sp_pr_bluestein_kstore_encode_batch(sp_pr_bluestein_ctx *ctx,
+                                         const int32_t *k, size_t kstride,
+                                         uint32_t *kres_out, size_t ostride,
+                                         int nb);
 
 #ifdef __cplusplus
 }

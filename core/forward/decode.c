@@ -123,18 +123,25 @@ static float kv_pair_score(const float *qh, const float *kh, int HD, float ascal
 static size_t fz_kstore_words(sp_pr_ctx *pr, sp_pr_bluestein_ctx *pr_b) {
     return pr ? sp_pr_kstore_words(pr) : sp_pr_bluestein_kstore_words(pr_b);
 }
-static void fz_kstore_encode(sp_pr_ctx *pr, sp_pr_bluestein_ctx *pr_b,
-                             const int32_t *k, uint32_t *out) {
-    if (pr) sp_pr_kstore_encode(pr, k, out);
-    else    sp_pr_bluestein_kstore_encode(pr_b, k, out);
+/* batched dispatch (q-transform amortization): the per-token homologous
+ * transforms (NH queries / NKV key encodes per layer) go through ONE
+ * sp_ntt_fwd_batch call on the direct-N arm — the engine override runs
+ * lanes = heads. Bit-equal to the single-call path (gate T_PR_BATCH). */
+static void fz_kstore_encode_batch(sp_pr_ctx *pr, sp_pr_bluestein_ctx *pr_b,
+                                   const int32_t *k, size_t kstride,
+                                   uint32_t *out, size_t ostride, int nb) {
+    if (pr) sp_pr_kstore_encode_batch(pr, k, kstride, out, ostride, nb);
+    else    sp_pr_bluestein_kstore_encode_batch(pr_b, k, kstride, out, ostride, nb);
 }
-static void fz_query_begin(sp_pr_ctx *pr, sp_pr_bluestein_ctx *pr_b, const int32_t *q) {
-    if (pr) sp_pr_query_begin(pr, q);
-    else    sp_pr_bluestein_query_begin(pr_b, q);
+static void fz_query_begin_batch(sp_pr_ctx *pr, sp_pr_bluestein_ctx *pr_b,
+                                 const int32_t *q, size_t qstride, int nb) {
+    if (pr) sp_pr_query_begin_batch(pr, q, qstride, nb);
+    else    sp_pr_bluestein_query_begin_batch(pr_b, q, qstride, nb);
 }
-static int64_t fz_score_kstore(sp_pr_ctx *pr, sp_pr_bluestein_ctx *pr_b,
-                               const uint32_t *kres) {
-    return pr ? sp_pr_score_kstore(pr, kres) : sp_pr_bluestein_score_kstore(pr_b, kres);
+static int64_t fz_score_kstore_b(sp_pr_ctx *pr, sp_pr_bluestein_ctx *pr_b,
+                                 int i, const uint32_t *kres) {
+    return pr ? sp_pr_score_kstore_b(pr, i, kres)
+              : sp_pr_bluestein_score_kstore_b(pr_b, i, kres);
 }
 
 
@@ -179,6 +186,7 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
     /* NTT decode-attention overlay (SP_ENGINE_NTT_ATTN). */
     sp_pr_ctx *pr = NULL; sp_pr_bluestein_ctx *pr_b = NULL; int overlay_active = 0;
     int32_t *qi = NULL, *ki = NULL;
+    int32_t *qib = NULL, *kib = NULL;  /* fusion batch staging: NH×HD / NKV×HD */
     uint32_t *kres = NULL; int fusion_on = 0; size_t krw = 0;  /* SP_NTT_KV keystore */
     uint32_t *kres_pre = NULL;     /* fusion x fuse: full-P residue prefill buffer */
     uint32_t *ring2k_res = NULL;   /* fusion x mock Ring-2: residue K byte store */
@@ -213,7 +221,9 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
         if (fusion_on) {
             krw = fz_kstore_words(pr, pr_b);               /* 2N (direct) / 2M (Bluestein) u32 per head */
             kres = (uint32_t *)malloc((size_t)c->n_layers * r1cap * NKV * krw * sizeof(uint32_t));
-            if (!kres) goto done;
+            qib  = (int32_t *)malloc((size_t)NH  * HD * sizeof(int32_t));
+            kib  = (int32_t *)malloc((size_t)NKV * HD * sizeof(int32_t));
+            if (!kres || !qib || !kib) goto done;
             fprintf(stderr, "    [ntt-kv] FUSION ON: K cached natively as dual-prime residue blocks "
                     "(%zu u32/head, write-once transform; scores = residue dot + Garner, exact)\n", krw);
         }
@@ -404,13 +414,15 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
                 KC = kdec; VC = vdec;
             } else if (fuse && pos < n_prompt) {
                 /* FUSE dense prefill: full-P buffer, no window write, no spill. */
-                if (fusion_on)
+                if (fusion_on) {
                     for (int h = 0; h < NKV; h++) {
                         const float *kh = knew + (size_t)h * HD;
-                        for (int i = 0; i < HD; i++) ki[i] = (int32_t)lrintf(kh[i] * (float)SP_NTT_ATTN_SCALE);
-                        fz_kstore_encode(pr, pr_b, ki, kres_pre + (((size_t)L * P + pos) * NKV + h) * krw);
+                        for (int i = 0; i < HD; i++)
+                            kib[(size_t)h * HD + i] = (int32_t)lrintf(kh[i] * (float)SP_NTT_ATTN_SCALE);
                     }
-                else
+                    fz_kstore_encode_batch(pr, pr_b, kib, (size_t)HD,
+                                           kres_pre + ((size_t)L * P + pos) * NKV * krw, krw, NKV);
+                } else
                     memcpy(kpre + ((size_t)L * P + pos) * KVD, knew, (size_t)KVD * sizeof(float));
                 memcpy(vpre + ((size_t)L * P + pos) * KVD, vnew, (size_t)KVD * sizeof(float));
                 KC = kpre ? kpre + (size_t)L * P * KVD : NULL;
@@ -426,12 +438,15 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
                 /* NTT FUSION write path: the position-finalized K head is quantized
                  * and forward-transformed ONCE; the residue block is the stored unit
                  * (ring slot when offloading — identical to (L*P+pos) when r1cap==P). */
-                if (fusion_on)
+                if (fusion_on) {
                     for (int h = 0; h < NKV; h++) {
                         const float *kh = knew + (size_t)h * HD;
-                        for (int i = 0; i < HD; i++) ki[i] = (int32_t)lrintf(kh[i] * (float)SP_NTT_ATTN_SCALE);
-                        fz_kstore_encode(pr, pr_b, ki, kres + (((size_t)L * r1cap + wslot) * NKV + h) * krw);
+                        for (int i = 0; i < HD; i++)
+                            kib[(size_t)h * HD + i] = (int32_t)lrintf(kh[i] * (float)SP_NTT_ATTN_SCALE);
                     }
+                    fz_kstore_encode_batch(pr, pr_b, kib, (size_t)HD,
+                                           kres + ((size_t)L * r1cap + wslot) * NKV * krw, krw, NKV);
+                }
             }
             /* Ring-2 spill of the new position (skipped during the fuse dense prefill). */
             if (r2be_on && !(fuse && pos < n_prompt)) {
@@ -461,15 +476,22 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
             int eB = (g_recall_decode_only && pos < n_prompt) ? 0 : g_recall_b;
             if (fuse && pos < n_prompt) {
                 /* dense exact prefill over the full-P buffer (absolute slots) */
+                if (fusion_on) {           /* all NH query transforms in ONE batch */
+                    for (int h = 0; h < NH; h++) {
+                        const float *qh = q + (size_t)h * HD;
+                        for (int i = 0; i < HD; i++)
+                            qib[(size_t)h * HD + i] = (int32_t)lrintf(qh[i] * (float)SP_NTT_ATTN_SCALE);
+                    }
+                    fz_query_begin_batch(pr, pr_b, qib, (size_t)HD, NH);
+                }
                 for (int h = 0; h < NH; h++) {
                     int kvh = h / group; const float *qh = q + (size_t)h * HD;
-                    if (overlay_active || fusion_on) for (int i = 0; i < HD; i++) qi[i] = (int32_t)lrintf(qh[i] * (float)SP_NTT_ATTN_SCALE);
-                    if (fusion_on) fz_query_begin(pr, pr_b, qi);
+                    if (overlay_active) for (int i = 0; i < HD; i++) qi[i] = (int32_t)lrintf(qh[i] * (float)SP_NTT_ATTN_SCALE);
                     float maxs = -INFINITY;
                     for (int s = 0; s <= pos; s++) {
                         float d;
                         if (fusion_on) {
-                            int64_t ip = fz_score_kstore(pr, pr_b, kres_pre + (((size_t)L * P + s) * NKV + kvh) * krw);
+                            int64_t ip = fz_score_kstore_b(pr, pr_b, h, kres_pre + (((size_t)L * P + s) * NKV + kvh) * krw);
                             d = (float)((double)ip / (SP_NTT_ATTN_SCALE * SP_NTT_ATTN_SCALE)) * ascale;
                         } else
                             d = kv_pair_score(qh, KC + (size_t)s * KVD + (size_t)kvh * HD, HD, ascale, pr, pr_b, qi, ki);
@@ -531,11 +553,18 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
                     }
                 }
                 }
+                if (fusion_on) {           /* all NH query transforms in ONE batch */
+                    for (int h = 0; h < NH; h++) {
+                        const float *qh = q + (size_t)h * HD;
+                        for (int i = 0; i < HD; i++)
+                            qib[(size_t)h * HD + i] = (int32_t)lrintf(qh[i] * (float)SP_NTT_ATTN_SCALE);
+                    }
+                    fz_query_begin_batch(pr, pr_b, qib, (size_t)HD, NH);
+                }
                 for (int h = 0; h < NH; h++) {
                     int kvh = h / group; const float *qh = q + (size_t)h * HD;
                     const int *rih = ri_all + (size_t)h * P; int mm = m_all[h];
-                    if (overlay_active || fusion_on) for (int i = 0; i < HD; i++) qi[i] = (int32_t)lrintf(qh[i] * (float)SP_NTT_ATTN_SCALE);
-                    if (fusion_on) fz_query_begin(pr, pr_b, qi);
+                    if (overlay_active) for (int i = 0; i < HD; i++) qi[i] = (int32_t)lrintf(qh[i] * (float)SP_NTT_ATTN_SCALE);
                     float maxs = -INFINITY;
                     for (int jj = 0; jj < mm; jj++) {
                         int s = rih[jj];
@@ -545,7 +574,7 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
                                 ? stgKres + (size_t)stg_slot[s] * NKV * krw
                                 : kres + ((size_t)L * r1cap +
                                       (size_t)sp_arm_r1slot(s, ring2_on, g_recall_sink, r1W)) * NKV * krw;
-                            int64_t ip = fz_score_kstore(pr, pr_b, kblk + (size_t)kvh * krw);
+                            int64_t ip = fz_score_kstore_b(pr, pr_b, h, kblk + (size_t)kvh * krw);
                             d = (float)((double)ip / (SP_NTT_ATTN_SCALE * SP_NTT_ATTN_SCALE)) * ascale;
                         } else {
                             const float *kbase = (s < winlo && s >= g_recall_sink)
@@ -570,12 +599,19 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
                 }
             } else if (g_recall_b > 0) {
                 /* inline select + attend (mock Ring-2 / pure sparse / decode-only). */
+                if (fusion_on) {           /* all NH query transforms in ONE batch */
+                    for (int h = 0; h < NH; h++) {
+                        const float *qh = q + (size_t)h * HD;
+                        for (int i = 0; i < HD; i++)
+                            qib[(size_t)h * HD + i] = (int32_t)lrintf(qh[i] * (float)SP_NTT_ATTN_SCALE);
+                    }
+                    fz_query_begin_batch(pr, pr_b, qib, (size_t)HD, NH);
+                }
                 for (int h = 0; h < NH; h++) {
                     int kvh = h / group; const float *qh = q + (size_t)h * HD;
                     int mm = sp_arm_select(recallR, g_recall_r, HD, qh, projk, (size_t)L, P,
                                            NKV, kvh, eB, g_recall_w, g_recall_sink, pos, cand, ri);
-                    if (overlay_active || fusion_on) for (int i = 0; i < HD; i++) qi[i] = (int32_t)lrintf(qh[i] * (float)SP_NTT_ATTN_SCALE);
-                    if (fusion_on) fz_query_begin(pr, pr_b, qi);
+                    if (overlay_active) for (int i = 0; i < HD; i++) qi[i] = (int32_t)lrintf(qh[i] * (float)SP_NTT_ATTN_SCALE);
                     float maxs = -INFINITY;
                     for (int jj = 0; jj < mm; jj++) {
                         int s = ri[jj];
@@ -585,7 +621,7 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
                                 ? ring2k_res + ((size_t)L * P + s) * NKV * krw
                                 : kres + ((size_t)L * r1cap +
                                       (size_t)sp_arm_r1slot(s, ring2_on, g_recall_sink, r1W)) * NKV * krw;
-                            int64_t ip = fz_score_kstore(pr, pr_b, kblk + (size_t)kvh * krw);
+                            int64_t ip = fz_score_kstore_b(pr, pr_b, h, kblk + (size_t)kvh * krw);
                             d = (float)((double)ip / (SP_NTT_ATTN_SCALE * SP_NTT_ATTN_SCALE)) * ascale;
                         } else {
                             const float *kbase = (ring2_on && s < winlo && s >= g_recall_sink)
@@ -609,16 +645,21 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
                     }
                 }
             } else if (fusion_on) {
-                /* NTT FUSION read path: q transformed once per head; each cached K
-                 * costs one residue dot per prime + scalar Garner — the exact
-                 * integer <q,k>, no per-pair forward, no inverse butterflies. */
+                /* NTT FUSION read path: ALL NH query transforms in one batch
+                 * (the engine override runs lanes = heads); each cached K costs
+                 * one residue dot per prime + scalar Garner — the exact integer
+                 * <q,k>, no per-pair forward, no inverse butterflies. */
                 for (int h = 0; h < NH; h++) {
-                    int kvh = h / group; const float *qh = q + (size_t)h * HD;
-                    for (int i = 0; i < HD; i++) qi[i] = (int32_t)lrintf(qh[i] * (float)SP_NTT_ATTN_SCALE);
-                    fz_query_begin(pr, pr_b, qi);
+                    const float *qh = q + (size_t)h * HD;
+                    for (int i = 0; i < HD; i++)
+                        qib[(size_t)h * HD + i] = (int32_t)lrintf(qh[i] * (float)SP_NTT_ATTN_SCALE);
+                }
+                fz_query_begin_batch(pr, pr_b, qib, (size_t)HD, NH);
+                for (int h = 0; h < NH; h++) {
+                    int kvh = h / group;
                     float maxs = -INFINITY;
                     for (int s = 0; s <= pos; s++) {
-                        int64_t ip = fz_score_kstore(pr, pr_b, kres + (((size_t)L * r1cap + s) * NKV + kvh) * krw);
+                        int64_t ip = fz_score_kstore_b(pr, pr_b, h, kres + (((size_t)L * r1cap + s) * NKV + kvh) * krw);
                         float d = (float)((double)ip / (SP_NTT_ATTN_SCALE * SP_NTT_ATTN_SCALE)) * ascale;
                         sc[s] = d; if (d > maxs) maxs = d;
                     }
@@ -711,7 +752,8 @@ done:
     if (r2be_owned && r2be.handle && r2be.close) r2be.close(r2be.handle);
     free(kres_pre); free(ring2k_res);
     if (stgKres) { if (stg_hooked) r2be.free_aligned(r2be.handle, stgKres); else free(stgKres); }
-    free(qi); free(ki); free(kres); sp_pr_free(pr); sp_pr_bluestein_free(pr_b);
+    free(qi); free(ki); free(qib); free(kib); free(kres);
+    sp_pr_free(pr); sp_pr_bluestein_free(pr_b);
     return rc;
 }
 

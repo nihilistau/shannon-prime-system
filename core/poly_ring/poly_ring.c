@@ -32,6 +32,13 @@ struct sp_pr_ctx {
     uint32_t *qf1, *qf2;   /* transformed query (per prime, N each)     */
     uint32_t  ninv1, ninv2;/* N^{-1} mod q1, mod q2                     */
     uint32_t  q1inv_q2;    /* q1^{-1} mod q2                            */
+    /* batched keystore scratch (sp_pr_query_begin_batch /
+     * sp_pr_kstore_encode_batch), grown on demand: qb1/qb2 hold nb
+     * transformed queries (N residues each per prime); kb stages nb
+     * involuted keys (N int32 each) for one sp_ntt_fwd_batch call. */
+    uint32_t *qb1, *qb2;
+    int32_t  *kb;
+    int       qb_cap, kb_cap;
 };
 
 /* modular helpers over the frozen 30-bit primes: every product of two values
@@ -91,6 +98,7 @@ void sp_pr_free(sp_pr_ctx *ctx) {
     free(ctx->c1); free(ctx->c2);
     free(ctx->prod); free(ctx->invk);
     free(ctx->qf1); free(ctx->qf2);
+    free(ctx->qb1); free(ctx->qb2); free(ctx->kb);
     free(ctx);
 }
 
@@ -191,14 +199,66 @@ void sp_pr_query_begin(sp_pr_ctx *ctx, const int32_t *q) {
     ntt_forward(ctx->ntt, q, ctx->qf1, ctx->qf2);
 }
 
-int64_t sp_pr_score_kstore(sp_pr_ctx *ctx, const uint32_t *kres) {
+/* shared score core: residue dots against the given transformed query. */
+static int64_t pr_score_with(const sp_pr_ctx *ctx, const uint32_t *qf1,
+                             const uint32_t *qf2, const uint32_t *kres) {
     const uint32_t N = ctx->N;
-    uint32_t s1 = pr_mulmod(sp_pr_resdot(ctx->qf1, kres,     N, SP_NTT_Q1), ctx->ninv1, SP_NTT_Q1);
-    uint32_t s2 = pr_mulmod(sp_pr_resdot(ctx->qf2, kres + N, N, SP_NTT_Q2), ctx->ninv2, SP_NTT_Q2);
+    uint32_t s1 = pr_mulmod(sp_pr_resdot(qf1, kres,     N, SP_NTT_Q1), ctx->ninv1, SP_NTT_Q1);
+    uint32_t s2 = pr_mulmod(sp_pr_resdot(qf2, kres + N, N, SP_NTT_Q2), ctx->ninv2, SP_NTT_Q2);
     /* scalar Garner: x = s1 + q1 * ((s2 - s1) * q1^{-1} mod q2), centered */
     uint32_t s1m = s1 % SP_NTT_Q2;
     uint32_t t   = pr_mulmod((s2 + SP_NTT_Q2 - s1m) % SP_NTT_Q2, ctx->q1inv_q2, SP_NTT_Q2);
     int64_t  x   = (int64_t)s1 + (int64_t)SP_NTT_Q1 * (int64_t)t;
     if (x > SP_NTT_M / 2) x -= SP_NTT_M;
     return x;
+}
+
+int64_t sp_pr_score_kstore(sp_pr_ctx *ctx, const uint32_t *kres) {
+    return pr_score_with(ctx, ctx->qf1, ctx->qf2, kres);
+}
+
+/* ── batched keystore (see poly_ring.h contract; gate T_PR_BATCH) ─────────── */
+
+static int pr_grow_qb(sp_pr_ctx *ctx, int nb) {
+    if (nb <= ctx->qb_cap) return 1;
+    uint32_t *n1 = realloc(ctx->qb1, sizeof(uint32_t) * (size_t)nb * ctx->N);
+    if (!n1) return 0;
+    ctx->qb1 = n1;
+    uint32_t *n2 = realloc(ctx->qb2, sizeof(uint32_t) * (size_t)nb * ctx->N);
+    if (!n2) return 0;
+    ctx->qb2 = n2;
+    ctx->qb_cap = nb;
+    return 1;
+}
+
+void sp_pr_query_begin_batch(sp_pr_ctx *ctx, const int32_t *q, size_t qstride,
+                             int nb) {
+    if (nb <= 0 || !pr_grow_qb(ctx, nb)) return;
+    sp_ntt_fwd_batch(ctx->ntt, q, qstride,
+                     ctx->qb1, ctx->N, ctx->qb2, ctx->N, nb);
+}
+
+int64_t sp_pr_score_kstore_b(sp_pr_ctx *ctx, int i, const uint32_t *kres) {
+    return pr_score_with(ctx, ctx->qb1 + (size_t)i * ctx->N,
+                         ctx->qb2 + (size_t)i * ctx->N, kres);
+}
+
+void sp_pr_kstore_encode_batch(sp_pr_ctx *ctx, const int32_t *k, size_t kstride,
+                               uint32_t *kres_out, size_t ostride, int nb) {
+    const uint32_t N = ctx->N;
+    if (nb <= 0) return;
+    if (nb > ctx->kb_cap) {
+        int32_t *nk = realloc(ctx->kb, sizeof(int32_t) * (size_t)nb * N);
+        if (!nk) return;
+        ctx->kb = nk;
+        ctx->kb_cap = nb;
+    }
+    for (int i = 0; i < nb; i++) {            /* involute each key */
+        const int32_t *ki = k + (size_t)i * kstride;
+        int32_t *ks = ctx->kb + (size_t)i * N;
+        ks[0] = ki[0];
+        for (uint32_t j = 1; j < N; j++) ks[j] = -ki[N - j];
+    }
+    sp_ntt_fwd_batch(ctx->ntt, ctx->kb, N,
+                     kres_out, ostride, kres_out + N, ostride, nb);
 }
