@@ -44,6 +44,12 @@ static int g_recall_fuse = 0;
  * (Qwen3 HD=128); inadmissible configs fall back to the baseline silently.
  * Residue-domain Ring-1/Ring-2 spill (block == QUIC ResidueBlock) composes next. */
 static int g_ntt_kv = 0;
+/* SP_RECALL_BITS=1 — bit-packed popcount router (SimHash overlay): the projk
+ * sidecar shrinks from r floats to ONE u64 per (pos,kvh) (32x at r=32) and
+ * candidate scoring becomes popcount(qsig ^ ksig). STRICTLY LOSSIER than the
+ * f32 projection dot — gated by NIAH retrieval + PPL deflection per regime
+ * (see sp/arm.h contract). Off => the proven f32 router, bit-identical. */
+static int g_recall_bits = 0;
 
 #define KV_HEAD_MAX_BLOCKS 16
 static void kv_spinor_roundtrip(float *vec, int d) {
@@ -68,6 +74,7 @@ static void read_env_knobs(void) {
     { const char *e = getenv("SP_RECALL_DECODE_ONLY"); g_recall_decode_only = (e && e[0] == '1'); }
     { const char *e = getenv("SP_RECALL_FUSE");        g_recall_fuse = (e && e[0] == '1'); }
     { const char *e = getenv("SP_NTT_KV");             g_ntt_kv = (e && e[0] == '1'); }
+    { const char *e = getenv("SP_RECALL_BITS");        g_recall_bits = (e && e[0] == '1'); }
 }
 
 /* Persistent-KV O(n) greedy decode (GEN_KV) with the ARM two-ring memory.
@@ -173,6 +180,7 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
     float *x = NULL, *nx = NULL, *q = NULL, *knew = NULL, *vnew = NULL, *ao = NULL;
     float *ap = NULL, *gg = NULL, *up = NULL, *dn = NULL, *sc = NULL, *lg = NULL;
     signed char *recallR = NULL; float *projk = NULL;    /* recall sidecar (g_recall_b>0) */
+    uint64_t *sigk = NULL;       /* SP_RECALL_BITS: 1-u64 sign-bit sidecar instead */
     float *ring2k = NULL, *ring2v = NULL;                /* mock RAM Ring-2 store */
     float *stgK = NULL, *stgV = NULL;                    /* backend dedupe staging */
     int *stg_stamp = NULL, *stg_slot = NULL, *stg_pos = NULL;
@@ -271,13 +279,27 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
         goto done;
     if (g_recall_b > 0) {
         recallR = (signed char *)malloc((size_t)g_recall_r * HD);
-        projk   = (float *)malloc((size_t)c->n_layers * P * NKV * (size_t)g_recall_r * sizeof(float));
         ri      = (int *)malloc((size_t)P * sizeof(int));
         cand    = (sp_arm_sidx *)malloc((size_t)P * sizeof(sp_arm_sidx));
-        if (!recallR || !projk || !ri || !cand) goto done;
+        if (g_recall_bits) {
+            sigk = (uint64_t *)malloc((size_t)c->n_layers * P * NKV * sizeof(uint64_t));
+            if (!sigk) goto done;
+        } else {
+            projk = (float *)malloc((size_t)c->n_layers * P * NKV * (size_t)g_recall_r * sizeof(float));
+            if (!projk) goto done;
+        }
+        if (!recallR || !ri || !cand) goto done;
         sp_arm_build_R(recallR, g_recall_r, HD);   /* frozen ±1 matrix, deterministic */
-        fprintf(stderr, "    [recall] sidecar ON: r=%d B=%d W=%d sink=%d (post-RoPE ±1 projection router + sinks)\n",
-                g_recall_r, g_recall_b, g_recall_w, g_recall_sink);
+        if (g_recall_bits)
+            fprintf(stderr, "    [recall] sidecar ON: r=%d B=%d W=%d sink=%d BIT-PACKED popcount router "
+                    "(%zu KB vs %zu KB f32, %dx)\n",
+                    g_recall_r, g_recall_b, g_recall_w, g_recall_sink,
+                    ((size_t)c->n_layers * P * NKV * sizeof(uint64_t)) >> 10,
+                    ((size_t)c->n_layers * P * NKV * (size_t)g_recall_r * sizeof(float)) >> 10,
+                    (int)((size_t)g_recall_r * sizeof(float) / sizeof(uint64_t)));
+        else
+            fprintf(stderr, "    [recall] sidecar ON: r=%d B=%d W=%d sink=%d (post-RoPE ±1 projection router + sinks)\n",
+                    g_recall_r, g_recall_b, g_recall_w, g_recall_sink);
     }
     if (ring2_on && !r2be_on) {
         size_t kvn = (size_t)c->n_layers * P * KVD;
@@ -389,10 +411,16 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
             for (int h = 0; h < NKV; h++) { float *kh = knew + (size_t)h * HD; sp_rmsnorm_head(kh, kn, HD, eps); sp_rope_neox(kh, HD, pos, base); }
 
             /* recall sidecar: project the post-RoPE K of this (layer,pos) per kv-head. */
-            if (g_recall_b > 0)
-                for (int hh = 0; hh < NKV; hh++)
-                    sp_arm_project(recallR, g_recall_r, HD, knew + (size_t)hh * HD,
-                                   projk + (((size_t)L * P + pos) * NKV + hh) * (size_t)g_recall_r);
+            if (g_recall_b > 0) {
+                if (g_recall_bits)
+                    for (int hh = 0; hh < NKV; hh++)
+                        sigk[((size_t)L * P + pos) * NKV + hh] =
+                            sp_arm_project_sig(recallR, g_recall_r, HD, knew + (size_t)hh * HD);
+                else
+                    for (int hh = 0; hh < NKV; hh++)
+                        sp_arm_project(recallR, g_recall_r, HD, knew + (size_t)hh * HD,
+                                       projk + (((size_t)L * P + pos) * NKV + hh) * (size_t)g_recall_r);
+            }
 
             /* Store the position-finalized K/V; KC/VC point at what attention reads. */
             const float *KC, *VC;
@@ -509,9 +537,13 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
             } else if (r2be_on) {
                 /* 3-phase dedupe: select all heads -> fetch the union once -> attend. */
                 for (int h = 0; h < NH; h++)
-                    m_all[h] = sp_arm_select(recallR, g_recall_r, HD, q + (size_t)h * HD,
-                                             projk, (size_t)L, P, NKV, h / group, eB, g_recall_w,
-                                             g_recall_sink, pos, cand, ri_all + (size_t)h * P);
+                    m_all[h] = g_recall_bits
+                        ? sp_arm_select_sig(recallR, g_recall_r, HD, q + (size_t)h * HD,
+                                            sigk, (size_t)L, P, NKV, h / group, eB, g_recall_w,
+                                            g_recall_sink, pos, cand, ri_all + (size_t)h * P)
+                        : sp_arm_select(recallR, g_recall_r, HD, q + (size_t)h * HD,
+                                        projk, (size_t)L, P, NKV, h / group, eB, g_recall_w,
+                                        g_recall_sink, pos, cand, ri_all + (size_t)h * P);
                 stg_gen++;
                 int nstage = 0;
                 for (int h = 0; h < NH; h++) {
@@ -609,8 +641,11 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
                 }
                 for (int h = 0; h < NH; h++) {
                     int kvh = h / group; const float *qh = q + (size_t)h * HD;
-                    int mm = sp_arm_select(recallR, g_recall_r, HD, qh, projk, (size_t)L, P,
-                                           NKV, kvh, eB, g_recall_w, g_recall_sink, pos, cand, ri);
+                    int mm = g_recall_bits
+                        ? sp_arm_select_sig(recallR, g_recall_r, HD, qh, sigk, (size_t)L, P,
+                                            NKV, kvh, eB, g_recall_w, g_recall_sink, pos, cand, ri)
+                        : sp_arm_select(recallR, g_recall_r, HD, qh, projk, (size_t)L, P,
+                                        NKV, kvh, eB, g_recall_w, g_recall_sink, pos, cand, ri);
                     if (overlay_active) for (int i = 0; i < HD; i++) qi[i] = (int32_t)lrintf(qh[i] * (float)SP_NTT_ATTN_SCALE);
                     float maxs = -INFINITY;
                     for (int jj = 0; jj < mm; jj++) {
@@ -741,7 +776,7 @@ done:
     free(kcb); free(vcb); free(kdec); free(vdec);
     free(kc); free(vc); free(kpre); free(vpre); free(x); free(nx); free(q); free(knew); free(vnew);
     free(ao); free(ap); free(gg); free(up); free(dn); free(sc); free(lg);
-    free(recallR); free(projk); free(ri); free(cand);
+    free(recallR); free(projk); free(sigk); free(ri); free(cand);
     free(ring2k); free(ring2v);
     if (stg_hooked) {                  /* backend-provided direct-I/O buffers */
         if (stgK) r2be.free_aligned(r2be.handle, stgK);
