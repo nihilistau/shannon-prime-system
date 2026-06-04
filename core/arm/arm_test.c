@@ -194,6 +194,75 @@ static void T_ARM_REGISTER(void) {
     SP_CHECK_EQ_I64(sp_arm_ring2_registered(&got), 0, "unregister clears the hook");
 }
 
+/* T_ARM_SIG — the bit-packed popcount router (SimHash overlay):
+ *   (a) sig bits == signs of the exact float projections (same arithmetic);
+ *   (b) B=0 / within-budget identity parity (same off-guarantee);
+ *   (c) planted-needle recall through the 1-bit sidecar (the lossy estimator
+ *       still finds a strongly-aligned needle — the structural sanity bound);
+ *   (d) top-k Hamming property: max selected-candidate distance <= min
+ *       unselected distance (tie-tolerant quickselect contract);
+ *   (e) sinks + window pinned, m == B. */
+static void T_ARM_SIG(void) {
+    enum { R = 32, HD = 16, P = 64, NKV = 1, NEEDLE = 10,
+           SINK = 2, W = 4, B = 8 };
+    signed char Rm[R * HD];
+    sp_arm_build_R(Rm, R, HD);
+
+    /* (a) sign agreement with the float projection */
+    float v[HD], proj[R];
+    for (int d = 0; d < HD; d++) v[d] = lcg_unit();
+    sp_arm_project(Rm, R, HD, v, proj);
+    uint64_t sig = sp_arm_project_sig(Rm, R, HD, v);
+    int sign_ok = 1;
+    for (int p = 0; p < R; p++)
+        if (((sig >> p) & 1ULL) != (proj[p] >= 0.0f ? 1ULL : 0ULL)) sign_ok = 0;
+    SP_CHECK(sign_ok, "sig bits == float projection signs (exact)");
+
+    /* (b) identity parity when off / within budget */
+    int ri[P]; sp_arm_sidx cand[P];
+    int m = sp_arm_select_sig(NULL, R, HD, NULL, NULL, 0, P, 1, 0,
+                              /*B=*/0, W, SINK, P - 1, cand, ri);
+    SP_CHECK_EQ_I64(m, P, "sig: B=0 returns full [0,pos]");
+    int id = 1; for (int s = 0; s < P; s++) if (ri[s] != s) id = 0;
+    SP_CHECK(id, "sig: B=0 set is the identity");
+
+    /* (c)+(d)+(e) needle recall + Hamming top-k property */
+    static float keys[P][HD];
+    for (int s = 0; s < P; s++)
+        for (int d = 0; d < HD; d++) keys[s][d] = 0.05f * lcg_unit();
+    float q[HD];
+    for (int d = 0; d < HD; d++) { q[d] = lcg_unit(); keys[NEEDLE][d] = 4.0f * q[d]; }
+    static uint64_t sigk[(size_t)P * NKV];
+    for (int s = 0; s < P; s++)
+        sigk[(size_t)s * NKV + 0] = sp_arm_project_sig(Rm, R, HD, keys[s]);
+
+    int pos = P - 1;
+    m = sp_arm_select_sig(Rm, R, HD, q, sigk, /*L=*/0, P, NKV, /*kvh=*/0,
+                          B, W, SINK, pos, cand, ri);
+    SP_CHECK_EQ_I64(m, B, "sig: selection size == budget B");
+    int has_needle = 0, has_sink0 = 0, has_last = 0;
+    char in_sel[P]; memset(in_sel, 0, sizeof(in_sel));
+    for (int i = 0; i < m; i++) {
+        in_sel[ri[i]] = 1;
+        if (ri[i] == NEEDLE) has_needle = 1;
+        if (ri[i] == 0)      has_sink0 = 1;
+        if (ri[i] == pos)    has_last = 1;
+    }
+    SP_CHECK(has_needle, "sig: aligned needle recalled through the 1-bit sidecar");
+    SP_CHECK(has_sink0 && has_last, "sig: sinks + window pinned");
+    /* Hamming top-k property over the candidate range [SINK, P-W) */
+    uint64_t qsig = sp_arm_project_sig(Rm, R, HD, q);
+    int max_sel = -1, min_unsel = 999;
+    for (int s = SINK; s < P - W; s++) {
+        uint64_t x = qsig ^ sigk[(size_t)s * NKV];
+        int ham = 0; while (x) { ham += (int)(x & 1ULL); x >>= 1; }
+        if (in_sel[s]) { if (ham > max_sel) max_sel = ham; }
+        else           { if (ham < min_unsel) min_unsel = ham; }
+    }
+    SP_CHECK(max_sel <= min_unsel,
+             "sig: top-k Hamming property (selected <= unselected, tie-tolerant)");
+}
+
 int main(void) {
     SP_RUN(T_ARM_R_FROZEN);
     SP_RUN(T_ARM_PROJECT_EXACT);
@@ -203,5 +272,6 @@ int main(void) {
     SP_RUN(T_ARM_R1SLOT);
     SP_RUN(T_ARM_RING2_STDIO);
     SP_RUN(T_ARM_REGISTER);
+    SP_RUN(T_ARM_SIG);
     return SP_DONE();
 }

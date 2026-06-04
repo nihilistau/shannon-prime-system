@@ -68,6 +68,31 @@ int sp_arm_select(const signed char *R, int r, int hd, const float *qh,
                   const float *projk, size_t L, int P, int NKV, int kvh,
                   int B, int W, int sink, int pos, sp_arm_sidx *cand, int *ri);
 
+/* ── bit-packed popcount router (SimHash overlay — gated, strictly lossier) ──
+ *
+ * The r-float projk sidecar is the last full-P RAM resident (~940 MB @32k).
+ * Packing the SIGN of each Rademacher projection into one u64 per (pos,kvh)
+ * shrinks it 32x (r=32: 128 B -> 8 B) and turns scoring into hardware
+ * popcount(qsig ^ ksig) — Hamming distance, the SimHash angle estimator.
+ *
+ * HONEST CONTRACT: this is a LOSSIER estimator than the f32 projection dot
+ * (1 bit/row vs 32; scores take only r+1 distinct values, so top-k boundary
+ * ties are common and resolved deterministically-but-arbitrarily). It is an
+ * overlay knob (SP_RECALL_BITS), NEVER a default: any new (N, B, r) regime
+ * must re-pass the NIAH retrieval + PPL deflection gates before being
+ * trusted. Bit-exact-when-off parity is unchanged. */
+
+/* Pack the r sign bits of the projection of vec (bit p = proj[p] >= 0). */
+uint64_t sp_arm_project_sig(const signed char *R, int r, int hd, const float *vec);
+
+/* sp_arm_select with the bit-packed sidecar: identical selection structure
+ * (sinks ∪ top-(B-W-sink) ∪ recent-W, identity when B=0 or within budget),
+ * but candidates are ranked by ASCENDING popcount(qsig ^ sigk[s]). sigk is
+ * laid out sigk[(L*P + s)*NKV + kvh] (one u64 per stored position/head). */
+int sp_arm_select_sig(const signed char *R, int r, int hd, const float *qh,
+                      const uint64_t *sigk, size_t L, int P, int NKV, int kvh,
+                      int B, int W, int sink, int pos, sp_arm_sidx *cand, int *ri);
+
 /* ── Ring-1 slot map ──────────────────────────────────────────────────────── */
 
 /* Physical Ring-1 slot for logical token position s: sinks pinned at [0,sink),

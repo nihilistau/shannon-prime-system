@@ -97,6 +97,58 @@ int sp_arm_select(const signed char *R, int r, int hd, const float *qh,
     return m;
 }
 
+/* ── bit-packed popcount router (SimHash overlay; see arm.h contract) ─────── */
+
+static int arm_popcount64(uint64_t x) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_popcountll(x);
+#else
+    /* portable SWAR fallback (MSVC also has __popcnt64, but this keeps the
+     * reference toolchain-independent and the count is off the hot loop). */
+    x = x - ((x >> 1) & 0x5555555555555555ULL);
+    x = (x & 0x3333333333333333ULL) + ((x >> 2) & 0x3333333333333333ULL);
+    x = (x + (x >> 4)) & 0x0F0F0F0F0F0F0F0FULL;
+    return (int)((x * 0x0101010101010101ULL) >> 56);
+#endif
+}
+
+uint64_t sp_arm_project_sig(const signed char *R, int r, int hd, const float *vec) {
+    uint64_t sig = 0;
+    for (int p = 0; p < r; p++) {
+        const signed char *Rp = R + (size_t)p * hd;
+        float a = 0.0f;
+        for (int d = 0; d < hd; d++) a += (float)Rp[d] * vec[d];
+        if (a >= 0.0f) sig |= (1ULL << p);     /* sign bit of the SAME float dot */
+    }
+    return sig;
+}
+
+int sp_arm_select_sig(const signed char *R, int r, int hd, const float *qh,
+                      const uint64_t *sigk, size_t L, int P, int NKV, int kvh,
+                      int B, int W0, int sink0, int pos, sp_arm_sidx *cand, int *ri) {
+    if (B <= 0 || pos + 1 <= B) { for (int s = 0; s <= pos; s++) ri[s] = s; return pos + 1; }
+    const uint64_t qsig = sp_arm_project_sig(R, r, hd, qh);
+    int W = W0;       if (W > pos + 1) W = pos + 1;
+    int sink = sink0; if (sink > pos + 1) sink = pos + 1;
+    int cand_hi = pos + 1 - W;
+    if (cand_hi < sink) cand_hi = sink;
+    if (cand_hi > pos + 1) cand_hi = pos + 1;
+    int topk = B - W - sink; if (topk < 0) topk = 0;
+    if (topk > cand_hi - sink) topk = cand_hi - sink;
+    int nc = 0;                       /* score = NEGATED Hamming (reuse the
+                                       * descending quickselect: closest first) */
+    for (int s = sink; s < cand_hi; s++) {
+        int ham = arm_popcount64(qsig ^ sigk[((size_t)L * P + s) * NKV + kvh]);
+        cand[nc].s = -(float)ham; cand[nc].i = s; nc++;
+    }
+    qsel_topk(cand, nc, topk);
+    int m = 0;
+    for (int s = 0; s < sink; s++) ri[m++] = s;             /* pinned sink anchors */
+    for (int t = 0; t < topk; t++) ri[m++] = cand[t].i;     /* top-k (order-free) */
+    for (int s = cand_hi; s <= pos; s++) ri[m++] = s;       /* recent window */
+    return m;
+}
+
 /* ── Ring-1 slot map ──────────────────────────────────────────────────────── */
 
 int sp_arm_r1slot(int s, int offloading, int sink, int w) {
