@@ -277,6 +277,24 @@ void ntt_forward(const ntt_ctx *ctx, const int32_t *in,
     forward_one(ctx, &ctx->p2, in, out2);
 }
 
+/* Read-only forward-plan view for out-of-tree batch implementations (the
+ * engine's lane-parallel sp_ntt_fwd_batch override). Exposes only what an
+ * equivalent FORWARD transform needs; inverse tables stay private. */
+int ntt_fwd_plan_get(const ntt_ctx *ctx, ntt_fwd_plan *plan_out) {
+    if (!ctx || !plan_out) return 0;
+    plan_out->N      = ctx->N;
+    plan_out->logN   = ctx->logN;
+    plan_out->bitrev = ctx->bitrev;
+    const prime_ctx *pcs[2] = { &ctx->p1, &ctx->p2 };
+    for (int i = 0; i < 2; i++) {
+        plan_out->p[i].q       = pcs[i]->q;
+        plan_out->p[i].mu      = pcs[i]->mu;
+        plan_out->p[i].psi_pow = pcs[i]->psi_pow;
+        plan_out->p[i].w_fwd   = pcs[i]->w_fwd;
+    }
+    return 1;
+}
+
 /* inverse transform for one prime, producing residues in [0,q). */
 static void inverse_one(const ntt_ctx *ctx, const prime_ctx *pc,
                         const uint32_t *in, uint32_t *out) {

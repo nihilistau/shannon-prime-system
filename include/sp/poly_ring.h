@@ -32,6 +32,7 @@
 #ifndef SP_POLY_RING_H
 #define SP_POLY_RING_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -102,6 +103,27 @@ void sp_pr_query_begin(sp_pr_ctx *ctx, const int32_t *q);
  * dot per prime, scaled by N^{-1} mod p, Garner-recombined to the signed
  * centered integer in (-M/2, M/2]. Bit-equal to sp_pr_inner(q,k). */
 int64_t sp_pr_score_kstore(sp_pr_ctx *ctx, const uint32_t *kres);
+
+/* ── batched keystore (q-transform amortization) ────────────────────────────
+ * The decode's NH query transforms (and NKV key encodes) per layer are
+ * homologous; batching them through sp_ntt_fwd_batch lets the engine run
+ * lanes = heads. EXACTNESS: every _batch/_b call is bit-equal to the
+ * corresponding sequence of single calls (gate T_PR_BATCH). */
+
+/* Transform nb queries (query i at q + i*qstride, N int32 each) into the
+ * context's batch scratch (grown on demand). Replaces sp_pr_query_begin for
+ * the whole head loop; score with sp_pr_score_kstore_b(ctx, i, kres). */
+void sp_pr_query_begin_batch(sp_pr_ctx *ctx, const int32_t *q, size_t qstride,
+                             int nb);
+
+/* Exact <q_i,k> against a stored key block, scoring batch query i (after
+ * sp_pr_query_begin_batch). Bit-equal to query_begin(q_i)+score_kstore. */
+int64_t sp_pr_score_kstore_b(sp_pr_ctx *ctx, int i, const uint32_t *kres);
+
+/* Encode nb keys (key i at k + i*kstride) into nb residue blocks (block i at
+ * kres_out + i*ostride, 2N u32 each). Bit-equal to nb sp_pr_kstore_encode. */
+void sp_pr_kstore_encode_batch(sp_pr_ctx *ctx, const int32_t *k, size_t kstride,
+                               uint32_t *kres_out, size_t ostride, int nb);
 
 /* ── the keystore hot loop: modular residue dot ──────────────────────────────
  * sum_i a[i]*b[i] mod q for residues a[i], b[i] in [0, q), q < 2^30. Result in

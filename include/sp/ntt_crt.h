@@ -19,6 +19,7 @@
 #ifndef SP_NTT_CRT_H
 #define SP_NTT_CRT_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* Production sources must never pull in a 128-bit type. The configure-time
@@ -88,6 +89,44 @@ void ntt_pointwise_mul(const ntt_ctx *ctx,
  * the recombine step ntt_inverse performs internally. */
 void ntt_crt_recombine(const ntt_ctx *ctx, const uint32_t *x1,
                        const uint32_t *x2, int64_t *out);
+
+/* ── batched forward transform (the q-transform amortization seam) ──────────
+ *
+ * The autoregressive decode issues many HOMOLOGOUS forward transforms per
+ * token (NH query transforms + NKV key encodes per layer — same N, same
+ * bit-reversal, same twiddle sequence, different data). Batching them turns
+ * the butterfly tree from a latency problem into a throughput problem:
+ * lanes = batch items, twiddles broadcast, no intra-tree shuffles at any
+ * stage. EXACTNESS CONTRACT: bit-equal to nb independent ntt_forward calls
+ * (gate T_NTT_BATCH).
+ *
+ * Layout: input i is at in + i*in_stride (N int32 each); its residues land at
+ * out1 + i*out1_stride (mod q1) and out2 + i*out2_stride (mod q2), N u32 each.
+ * Strides are in ELEMENTS and may exceed N (e.g. writing straight into 2N-u32
+ * keystore blocks: out1 = blk, out2 = blk + N, both strides = block stride).
+ *
+ * ENGINE-OVERRIDABLE: the portable reference lives in its OWN archive member
+ * (ntt_batch.c) — same always-pulled-object pattern as sp_pr_resdot — so the
+ * engine may substitute an AVX2 lane-parallel implementation. */
+void sp_ntt_fwd_batch(const ntt_ctx *ctx, const int32_t *in, size_t in_stride,
+                      uint32_t *out1, size_t out1_stride,
+                      uint32_t *out2, size_t out2_stride, int nb);
+
+/* Read-only view of the forward-transform plan, for out-of-tree batch
+ * implementations (the engine override): the frozen tables an equivalent
+ * forward transform needs. Pointers reference ctx-owned storage, valid until
+ * ntt_free; treat as const. Returns 0 on NULL ctx, 1 otherwise. */
+typedef struct {
+    uint32_t        N, logN;
+    const uint32_t *bitrev;          /* bit-reversal permutation of [0,N) */
+    struct {
+        uint32_t        q;           /* modulus */
+        uint64_t        mu;          /* Barrett floor(2^60/q) */
+        const uint32_t *psi_pow;     /* psi^j, j in [0,N)  (pre-weight)   */
+        const uint32_t *w_fwd;       /* omega^j, j in [0,N/2) (butterflies) */
+    } p[2];
+} ntt_fwd_plan;
+int ntt_fwd_plan_get(const ntt_ctx *ctx, ntt_fwd_plan *plan_out);
 
 #ifdef __cplusplus
 }

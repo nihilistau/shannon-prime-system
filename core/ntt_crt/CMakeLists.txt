@@ -31,7 +31,7 @@ if(NOT MSVC)
 endif()
 
 sp_add_module(ntt_crt
-    SOURCES      ntt_crt.c
+    SOURCES      ntt_crt.c ntt_batch.c
     TEST         ntt_crt_test.c
     TEST_SOURCES ${_ntt_test_extra}
     TEST_NAME    T_NTT)

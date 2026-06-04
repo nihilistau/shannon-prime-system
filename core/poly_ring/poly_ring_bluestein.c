@@ -91,6 +91,7 @@
 #include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>    /* memcpy — batched query staging */
 
 /* ---- Bluestein admissible-N table ---------------------------------------- */
 
@@ -290,6 +291,8 @@ struct sp_pr_bluestein_ctx {
     uint32_t *w1, *w2;       /* per-prime weight tables (M each)   */
     uint32_t *qf1, *qf2;     /* transformed query (M each)         */
     int32_t  *kstar;         /* involuted key scratch (N)          */
+    uint32_t *qb1, *qb2;     /* batched queries (nb × M each), grown on demand */
+    int       qb_cap;
 
     /* Per-call u32 scratch for backend dispatch (sized M). Math-core's host
      * ntt_forward takes int32_t* in; the backend ABI takes uint32_t*. The
@@ -408,6 +411,7 @@ void sp_pr_bluestein_free(sp_pr_bluestein_ctx *ctx) {
     free(ctx->c_fold_q1); free(ctx->c_fold_q2);
     free(ctx->u32_pad_q1); free(ctx->u32_pad_q2);
     free(ctx->w1); free(ctx->w2); free(ctx->qf1); free(ctx->qf2); free(ctx->kstar);
+    free(ctx->qb1); free(ctx->qb2);
     free(ctx);
 }
 
@@ -670,4 +674,50 @@ int64_t sp_pr_bluestein_score_kstore(sp_pr_bluestein_ctx *ctx, const uint32_t *k
     uint32_t s1 = sp_pr_resdot(ctx->qf1, kres,     M, q1);
     uint32_t s2 = sp_pr_resdot(ctx->qf2, kres + M, M, q2);
     return pr_blue_garner(s1, s2, q1, q2, ctx->p2.mu, ctx->q1_inv_mod_q2);
+}
+
+/* ── batched keystore (Bluestein arm; contract in poly_ring.h §batch) ───────
+ * Correctness-path implementation: the chirp pre/post stages are per-item
+ * scalar work, so the batch variants LOOP the proven single-call path into
+ * per-item storage. Bit-exactness is inherited; the throughput lever lives in
+ * the direct-N arm (sp_ntt_fwd_batch lanes). If a Bluestein-shaped model ever
+ * becomes the speed target, batch the inner length-M transforms here too —
+ * surface that upstream rather than widening this quietly. */
+
+void sp_pr_bluestein_query_begin_batch(sp_pr_bluestein_ctx *ctx,
+                                       const int32_t *q, size_t qstride, int nb) {
+    const uint32_t M = ctx->M;
+    if (nb <= 0) return;
+    if (nb > ctx->qb_cap) {
+        uint32_t *n1 = (uint32_t *)realloc(ctx->qb1, sizeof(uint32_t) * (size_t)nb * M);
+        if (!n1) return;
+        ctx->qb1 = n1;
+        uint32_t *n2 = (uint32_t *)realloc(ctx->qb2, sizeof(uint32_t) * (size_t)nb * M);
+        if (!n2) return;
+        ctx->qb2 = n2;
+        ctx->qb_cap = nb;
+    }
+    for (int i = 0; i < nb; i++) {
+        sp_pr_bluestein_query_begin(ctx, q + (size_t)i * qstride);
+        memcpy(ctx->qb1 + (size_t)i * M, ctx->qf1, sizeof(uint32_t) * M);
+        memcpy(ctx->qb2 + (size_t)i * M, ctx->qf2, sizeof(uint32_t) * M);
+    }
+}
+
+int64_t sp_pr_bluestein_score_kstore_b(sp_pr_bluestein_ctx *ctx, int i,
+                                       const uint32_t *kres) {
+    const uint32_t M = ctx->M;
+    const uint32_t q1 = ctx->p1.q, q2 = ctx->p2.q;
+    uint32_t s1 = sp_pr_resdot(ctx->qb1 + (size_t)i * M, kres,     M, q1);
+    uint32_t s2 = sp_pr_resdot(ctx->qb2 + (size_t)i * M, kres + M, M, q2);
+    return pr_blue_garner(s1, s2, q1, q2, ctx->p2.mu, ctx->q1_inv_mod_q2);
+}
+
+void sp_pr_bluestein_kstore_encode_batch(sp_pr_bluestein_ctx *ctx,
+                                         const int32_t *k, size_t kstride,
+                                         uint32_t *kres_out, size_t ostride,
+                                         int nb) {
+    for (int i = 0; i < nb; i++)
+        sp_pr_bluestein_kstore_encode(ctx, k + (size_t)i * kstride,
+                                      kres_out + (size_t)i * ostride);
 }

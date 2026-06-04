@@ -797,6 +797,96 @@ static void T_PR_RESDOT(void) {
     SP_CHECK(ok, "resdot (deferred 15-chunk reduction) == naive modular dot, all lengths + extremes");
 }
 
+/* T_PR_BATCH — the batched-keystore exactness contract: every _batch/_b call
+ * is bit-equal to the corresponding sequence of single calls. Covers the
+ * direct-N arm (sp_ntt_fwd_batch — THE engine-overridable seam: any override
+ * must keep this gate green) and the Bluestein arm (loop path), odd batch
+ * sizes (1, 7, 8, 9, 16) and non-tight strides. */
+static void T_PR_BATCH(void) {
+    /* direct-N arm */
+    for (int ni = 0; ni < 3; ni++) {
+        const uint32_t N = kNs[ni];
+        sp_pr_ctx *ctx = sp_pr_init(N);
+        SP_CHECK(ctx != NULL, "batch ctx init");
+        if (!ctx) continue;
+        static const int nbs[5] = { 1, 7, 8, 9, 16 };
+        const size_t qstride = N + 3;          /* non-tight stride */
+        const size_t kwords = 2 * (size_t)N;
+        const size_t ostride = kwords + 5;
+        int32_t  *q  = malloc(sizeof(int32_t) * 16 * qstride);
+        int32_t  *k  = malloc(sizeof(int32_t) * 16 * qstride);
+        uint32_t *kb = malloc(sizeof(uint32_t) * 16 * ostride);
+        uint32_t *kr = malloc(sizeof(uint32_t) * kwords);
+        SP_CHECK(q && k && kb && kr, "batch scratch");
+        int ok = 1;
+        for (int bi = 0; bi < 5 && ok; bi++) {
+            int nb = nbs[bi];
+            for (int i = 0; i < nb; i++)
+                for (uint32_t j = 0; j < N; j++) {
+                    q[(size_t)i * qstride + j] = ks_coeff(65536);
+                    k[(size_t)i * qstride + j] = ks_coeff(65536);
+                }
+            /* batch encode vs single encode: bit-equal blocks */
+            sp_pr_kstore_encode_batch(ctx, k, qstride, kb, ostride, nb);
+            for (int i = 0; i < nb && ok; i++) {
+                sp_pr_kstore_encode(ctx, k + (size_t)i * qstride, kr);
+                for (size_t w = 0; w < kwords; w++)
+                    if (kb[(size_t)i * ostride + w] != kr[w]) { ok = 0; break; }
+            }
+            SP_CHECK(ok, "encode_batch blocks == single encode blocks (bit)");
+            /* batch query + score_b vs single query_begin + score */
+            sp_pr_query_begin_batch(ctx, q, qstride, nb);
+            for (int i = 0; i < nb && ok; i++) {
+                int64_t got = sp_pr_score_kstore_b(ctx, i, kb + (size_t)i * ostride);
+                sp_pr_query_begin(ctx, q + (size_t)i * qstride);
+                sp_pr_kstore_encode(ctx, k + (size_t)i * qstride, kr);
+                sp_pr_query_begin(ctx, q + (size_t)i * qstride);  /* encode clobbers */
+                int64_t want = sp_pr_score_kstore(ctx, kr);
+                if (got != want) {
+                    fprintf(stderr, "    BATCH MISMATCH N=%u nb=%d i=%d want=%lld got=%lld\n",
+                            N, nb, i, (long long)want, (long long)got);
+                    ok = 0;
+                }
+            }
+        }
+        SP_CHECK(ok, "score_kstore_b == single-call path BIT-EXACT (all nb)");
+        free(q); free(k); free(kb); free(kr);
+        sp_pr_free(ctx);
+    }
+    /* Bluestein arm (the fixture HD=8 path) */
+    {
+        const uint32_t N = 8;
+        sp_pr_bluestein_ctx *ctx = sp_pr_bluestein_init(N);
+        SP_CHECK(ctx != NULL, "batch blue ctx init");
+        if (!ctx) return;
+        const size_t kwords = sp_pr_bluestein_kstore_words(ctx);
+        int32_t  q[9 * 8], k[9 * 8];
+        uint32_t *kb = malloc(sizeof(uint32_t) * 9 * kwords);
+        uint32_t *kr = malloc(sizeof(uint32_t) * kwords);
+        SP_CHECK(kb && kr, "batch blue scratch");
+        int nb = 9, ok = 1;
+        for (int i = 0; i < nb; i++)
+            for (uint32_t j = 0; j < N; j++) {
+                q[(size_t)i * N + j] = ks_coeff(8192);
+                k[(size_t)i * N + j] = ks_coeff(8192);
+            }
+        sp_pr_bluestein_kstore_encode_batch(ctx, k, N, kb, kwords, nb);
+        sp_pr_bluestein_query_begin_batch(ctx, q, N, nb);
+        for (int i = 0; i < nb && ok; i++) {
+            int64_t got = sp_pr_bluestein_score_kstore_b(ctx, i, kb + (size_t)i * kwords);
+            sp_pr_bluestein_kstore_encode(ctx, k + (size_t)i * N, kr);
+            sp_pr_bluestein_query_begin(ctx, q + (size_t)i * N);
+            int64_t want = sp_pr_bluestein_score_kstore(ctx, kr);
+            for (size_t w = 0; w < kwords && ok; w++)
+                if (kb[(size_t)i * kwords + w] != kr[w]) ok = 0;
+            if (got != want) ok = 0;
+        }
+        SP_CHECK(ok, "bluestein batch == single-call path BIT-EXACT");
+        free(kb); free(kr);
+        sp_pr_bluestein_free(ctx);
+    }
+}
+
 int main(void) {
     SP_RUN(T_PR_1);
     SP_RUN(T_PR_2);
@@ -811,5 +901,6 @@ int main(void) {
     SP_RUN(T_PR_RESDOT);
     SP_RUN(T_PR_KSTORE);
     SP_RUN(T_PR_KSTORE_BLUE);
+    SP_RUN(T_PR_BATCH);
     return SP_DONE();
 }
