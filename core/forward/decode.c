@@ -412,9 +412,9 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
 
             /* recall sidecar: project the post-RoPE K of this (layer,pos) per kv-head. */
             if (g_recall_b > 0) {
-                if (g_recall_bits)
+                if (g_recall_bits)   /* head-major sidecar (arm.h layout v2) */
                     for (int hh = 0; hh < NKV; hh++)
-                        sigk[((size_t)L * P + pos) * NKV + hh] =
+                        sigk[((size_t)L * NKV + hh) * P + pos] =
                             sp_arm_project_sig(recallR, g_recall_r, HD, knew + (size_t)hh * HD);
                 else
                     for (int hh = 0; hh < NKV; hh++)

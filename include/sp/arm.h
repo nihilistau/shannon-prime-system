@@ -87,11 +87,28 @@ uint64_t sp_arm_project_sig(const signed char *R, int r, int hd, const float *ve
 
 /* sp_arm_select with the bit-packed sidecar: identical selection structure
  * (sinks ∪ top-(B-W-sink) ∪ recent-W, identity when B=0 or within budget),
- * but candidates are ranked by ASCENDING popcount(qsig ^ sigk[s]). sigk is
- * laid out sigk[(L*P + s)*NKV + kvh] (one u64 per stored position/head). */
+ * but candidates are ranked by ASCENDING popcount(qsig ^ ksig).
+ *
+ * sigk LAYOUT v2 — HEAD-MAJOR: sigk[(L*NKV + kvh)*P + s]. Each head's
+ * signature stream is a CONTIGUOUS stride-1 u64 array, so the candidate scan
+ * is pure streaming (vector loads, hardware-prefetcher-perfect) instead of
+ * a strided gather. (v1 interleaved heads position-major; nothing persisted
+ * v1 — the sidecar is rebuilt per run, so this is not a format break.) */
 int sp_arm_select_sig(const signed char *R, int r, int hd, const float *qh,
                       const uint64_t *sigk, size_t L, int P, int NKV, int kvh,
                       int B, int W, int sink, int pos, sp_arm_sidx *cand, int *ri);
+
+/* THE 32k WALL — the candidate scoring scan, hoisted into its OWN archive
+ * member (arm_scan.c — the resdot/ntt_batch seam): score n candidates
+ * s = s0..s0+n-1 of one head's contiguous signature slice,
+ *     cand[i] = { -(float)popcount(qsig ^ sigs[i]), s0 + i }.
+ * This is the quadratic term of streaming ingest (O(pos) per head per token);
+ * the engine overrides it with AVX512-VPOPCNTDQ (8 u64/instr) + OMP chunking.
+ * EXACTNESS CONTRACT: any override must produce IDENTICAL cand entries
+ * (same float score, same index, same order) — quickselect runs host-side on
+ * these values, so score-array equality ⇒ selection identity. */
+void sp_arm_scan_sig(uint64_t qsig, const uint64_t *sigs, int n, int s0,
+                     sp_arm_sidx *cand);
 
 /* ── Ring-1 slot map ──────────────────────────────────────────────────────── */
 
