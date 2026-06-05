@@ -138,6 +138,16 @@ typedef struct {
     void *(*alloc_aligned)(void *handle, size_t bytes);          /* optional */
     void  (*free_aligned)(void *handle, void *p);                /* optional */
     void  (*close)(void *handle);
+    /* OPTIONAL mixed-stream batch (added 2026-06-05, the device-overlap fix):
+     * one call carrying BOTH streams' requests with per-stream block sizes
+     * (len_by_stream[0] = K, [1] = V), so a split-device backend can issue
+     * the two physical queues CONCURRENTLY instead of the caller's two
+     * sequential read_batch calls serializing the drives (measured: serial
+     * split on asymmetric silicon is WORSE than a single device — 4u/S vs
+     * 3u/S; overlapped = 2u/S). NULL => caller falls back to read_batch /
+     * read_block. Appended LAST: struct layout of prior members unchanged. */
+    int   (*read_batch2)(void *handle, const int *which, const uint64_t *off,
+                         void *const *dst, const size_t len_by_stream[2], int n);
 } sp_arm_ring2_backend;
 
 /* Portable stdio reference backend (fopen/seek/read/write; two files

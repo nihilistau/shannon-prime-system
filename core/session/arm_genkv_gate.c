@@ -194,6 +194,7 @@ static void T_GENKV_REGISTERED_BACKEND(void) {
     SP_CHECK(g_cbe.mem[0] && g_cbe.mem[1], "counting backend buffers");
 
     sp_arm_ring2_backend be;
+    memset(&be, 0, sizeof(be));           /* optional members (read_batch2, ...) NULL */
     be.handle = &g_cbe;
     be.write_block = cbe_write; be.read_block = cbe_read; be.read_batch = cbe_read_batch;
     be.alloc_aligned = cbe_alloc; be.free_aligned = cbe_free;

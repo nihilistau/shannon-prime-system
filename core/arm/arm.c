@@ -198,6 +198,7 @@ int sp_arm_ring2_stdio_open(const char *dir, sp_arm_ring2_backend *out) {
     out->alloc_aligned = NULL;                             /* malloc is fine here */
     out->free_aligned  = NULL;
     out->close         = stdio_close;
+    out->read_batch2   = NULL;                             /* serial reference */
     return 0;
 }
 
