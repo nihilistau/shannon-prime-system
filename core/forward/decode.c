@@ -50,6 +50,17 @@ static int g_ntt_kv = 0;
  * f32 projection dot — gated by NIAH retrieval + PPL deflection per regime
  * (see sp/arm.h contract). Off => the proven f32 router, bit-identical. */
 static int g_recall_bits = 0;
+/* SP_RECALL_KVSEL=1 — GQA KV-head selection (the read-amplification lever):
+ * route/select ONCE per KV-head using the GROUP-CENTROID query (sum of the
+ * group's Q-heads — the Rademacher projection is linear, so the centroid's
+ * signature is the group's majority direction), instead of one independent
+ * selection per Q-head. Group members then attend over the SHARED recall
+ * set, collapsing the per-layer fetch union by up to group-size (measured
+ * ~1 GB/token at 32k from 16-way Q-head divergence; this halves it at the
+ * source for NH/NKV=2). CHANGES THE RECALLED SET — regime-gated by NIAH +
+ * PPL like every router-policy change; off = proven per-Q-head selection,
+ * bit-identical. Applies to both the f32 and bits routers. */
+static int g_recall_kvsel = 0;
 
 #define KV_HEAD_MAX_BLOCKS 16
 static void kv_spinor_roundtrip(float *vec, int d) {
@@ -75,6 +86,7 @@ static void read_env_knobs(void) {
     { const char *e = getenv("SP_RECALL_FUSE");        g_recall_fuse = (e && e[0] == '1'); }
     { const char *e = getenv("SP_NTT_KV");             g_ntt_kv = (e && e[0] == '1'); }
     { const char *e = getenv("SP_RECALL_BITS");        g_recall_bits = (e && e[0] == '1'); }
+    { const char *e = getenv("SP_RECALL_KVSEL");       g_recall_kvsel = (e && e[0] == '1'); }
 }
 
 /* Persistent-KV O(n) greedy decode (GEN_KV) with the ARM two-ring memory.
@@ -181,6 +193,7 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
     float *ap = NULL, *gg = NULL, *up = NULL, *dn = NULL, *sc = NULL, *lg = NULL;
     signed char *recallR = NULL; float *projk = NULL;    /* recall sidecar (g_recall_b>0) */
     uint64_t *sigk = NULL;       /* SP_RECALL_BITS: 1-u64 sign-bit sidecar instead */
+    float *qg = NULL;            /* SP_RECALL_KVSEL: group-centroid query scratch  */
     float *ring2k = NULL, *ring2v = NULL;                /* mock RAM Ring-2 store */
     float *stgK = NULL, *stgV = NULL;                    /* backend dedupe staging */
     int *stg_stamp = NULL, *stg_slot = NULL, *stg_pos = NULL;
@@ -289,6 +302,12 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
             if (!projk) goto done;
         }
         if (!recallR || !ri || !cand) goto done;
+        if (g_recall_kvsel) {
+            qg = (float *)malloc((size_t)HD * sizeof(float));
+            if (!qg) goto done;
+            fprintf(stderr, "    [recall] KV-HEAD selection ON: %d selections/layer (was %d) — "
+                    "group-centroid routing, shared recall sets\n", NKV, NH);
+        }
         sp_arm_build_R(recallR, g_recall_r, HD);   /* frozen ±1 matrix, deterministic */
         if (g_recall_bits)
             fprintf(stderr, "    [recall] sidecar ON: r=%d B=%d W=%d sink=%d BIT-PACKED popcount router "
@@ -535,19 +554,41 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
                     }
                 }
             } else if (r2be_on) {
-                /* 3-phase dedupe: select all heads -> fetch the union once -> attend. */
-                for (int h = 0; h < NH; h++)
-                    m_all[h] = g_recall_bits
-                        ? sp_arm_select_sig(recallR, g_recall_r, HD, q + (size_t)h * HD,
-                                            sigk, (size_t)L, P, NKV, h / group, eB, g_recall_w,
-                                            g_recall_sink, pos, cand, ri_all + (size_t)h * P)
-                        : sp_arm_select(recallR, g_recall_r, HD, q + (size_t)h * HD,
-                                        projk, (size_t)L, P, NKV, h / group, eB, g_recall_w,
-                                        g_recall_sink, pos, cand, ri_all + (size_t)h * P);
+                /* 3-phase dedupe: select -> fetch the union once -> attend.
+                 * SP_RECALL_KVSEL: ONE selection per KV-head from the group-
+                 * centroid query (projection is linear => centroid signature =
+                 * the group's majority direction); group members share the set,
+                 * collapsing the fetch union (the read-amplification lever). */
+                if (g_recall_kvsel) {
+                    for (int kvh = 0; kvh < NKV; kvh++) {
+                        for (int i = 0; i < HD; i++) qg[i] = 0.0f;
+                        for (int g2 = 0; g2 < group; g2++) {
+                            const float *qx = q + (size_t)(kvh * group + g2) * HD;
+                            for (int i = 0; i < HD; i++) qg[i] += qx[i];
+                        }
+                        int m = g_recall_bits
+                            ? sp_arm_select_sig(recallR, g_recall_r, HD, qg, sigk, (size_t)L, P,
+                                                NKV, kvh, eB, g_recall_w, g_recall_sink, pos,
+                                                cand, ri_all + (size_t)kvh * P)
+                            : sp_arm_select(recallR, g_recall_r, HD, qg, projk, (size_t)L, P,
+                                            NKV, kvh, eB, g_recall_w, g_recall_sink, pos,
+                                            cand, ri_all + (size_t)kvh * P);
+                        for (int g2 = 0; g2 < group; g2++) m_all[kvh * group + g2] = m;
+                    }
+                } else {
+                    for (int h = 0; h < NH; h++)
+                        m_all[h] = g_recall_bits
+                            ? sp_arm_select_sig(recallR, g_recall_r, HD, q + (size_t)h * HD,
+                                                sigk, (size_t)L, P, NKV, h / group, eB, g_recall_w,
+                                                g_recall_sink, pos, cand, ri_all + (size_t)h * P)
+                            : sp_arm_select(recallR, g_recall_r, HD, q + (size_t)h * HD,
+                                            projk, (size_t)L, P, NKV, h / group, eB, g_recall_w,
+                                            g_recall_sink, pos, cand, ri_all + (size_t)h * P);
+                }
                 stg_gen++;
                 int nstage = 0;
                 for (int h = 0; h < NH; h++) {
-                    const int *rih = ri_all + (size_t)h * P;
+                    const int *rih = ri_all + (size_t)(g_recall_kvsel ? (h / group) : h) * P;
                     for (int jj = 0; jj < m_all[h]; jj++) {
                         int s = rih[jj];
                         if (s < winlo && s >= g_recall_sink && stg_stamp[s] != stg_gen) {
@@ -595,7 +636,8 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
                 }
                 for (int h = 0; h < NH; h++) {
                     int kvh = h / group; const float *qh = q + (size_t)h * HD;
-                    const int *rih = ri_all + (size_t)h * P; int mm = m_all[h];
+                    const int *rih = ri_all + (size_t)(g_recall_kvsel ? kvh : h) * P;
+                    int mm = m_all[h];
                     if (overlay_active) for (int i = 0; i < HD; i++) qi[i] = (int32_t)lrintf(qh[i] * (float)SP_NTT_ATTN_SCALE);
                     float maxs = -INFINITY;
                     for (int jj = 0; jj < mm; jj++) {
@@ -639,13 +681,30 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
                     }
                     fz_query_begin_batch(pr, pr_b, qib, (size_t)HD, NH);
                 }
+                int kv_mm = 0;   /* SP_RECALL_KVSEL: the group's shared set size */
                 for (int h = 0; h < NH; h++) {
                     int kvh = h / group; const float *qh = q + (size_t)h * HD;
-                    int mm = g_recall_bits
-                        ? sp_arm_select_sig(recallR, g_recall_r, HD, qh, sigk, (size_t)L, P,
-                                            NKV, kvh, eB, g_recall_w, g_recall_sink, pos, cand, ri)
-                        : sp_arm_select(recallR, g_recall_r, HD, qh, projk, (size_t)L, P,
-                                        NKV, kvh, eB, g_recall_w, g_recall_sink, pos, cand, ri);
+                    int mm;
+                    if (g_recall_kvsel) {
+                        if (h % group == 0) {   /* group leader selects with the centroid */
+                            for (int i = 0; i < HD; i++) qg[i] = 0.0f;
+                            for (int g2 = 0; g2 < group; g2++) {
+                                const float *qx = q + (size_t)(kvh * group + g2) * HD;
+                                for (int i = 0; i < HD; i++) qg[i] += qx[i];
+                            }
+                            kv_mm = g_recall_bits
+                                ? sp_arm_select_sig(recallR, g_recall_r, HD, qg, sigk, (size_t)L, P,
+                                                    NKV, kvh, eB, g_recall_w, g_recall_sink, pos, cand, ri)
+                                : sp_arm_select(recallR, g_recall_r, HD, qg, projk, (size_t)L, P,
+                                                NKV, kvh, eB, g_recall_w, g_recall_sink, pos, cand, ri);
+                        }
+                        mm = kv_mm;             /* ri persists across the group */
+                    } else
+                        mm = g_recall_bits
+                            ? sp_arm_select_sig(recallR, g_recall_r, HD, qh, sigk, (size_t)L, P,
+                                                NKV, kvh, eB, g_recall_w, g_recall_sink, pos, cand, ri)
+                            : sp_arm_select(recallR, g_recall_r, HD, qh, projk, (size_t)L, P,
+                                            NKV, kvh, eB, g_recall_w, g_recall_sink, pos, cand, ri);
                     if (overlay_active) for (int i = 0; i < HD; i++) qi[i] = (int32_t)lrintf(qh[i] * (float)SP_NTT_ATTN_SCALE);
                     float maxs = -INFINITY;
                     for (int jj = 0; jj < mm; jj++) {
@@ -776,7 +835,7 @@ done:
     free(kcb); free(vcb); free(kdec); free(vdec);
     free(kc); free(vc); free(kpre); free(vpre); free(x); free(nx); free(q); free(knew); free(vnew);
     free(ao); free(ap); free(gg); free(up); free(dn); free(sc); free(lg);
-    free(recallR); free(projk); free(sigk); free(ri); free(cand);
+    free(recallR); free(projk); free(sigk); free(qg); free(ri); free(cand);
     free(ring2k); free(ring2v);
     if (stg_hooked) {                  /* backend-provided direct-I/O buffers */
         if (stgK) r2be.free_aligned(r2be.handle, stgK);
