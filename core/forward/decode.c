@@ -600,7 +600,23 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
                 const size_t kblk = fusion_on ? (size_t)NKV * krw * sizeof(uint32_t)
                                               : (size_t)KVD * sizeof(float);
                 const size_t vblk = (size_t)KVD * sizeof(float);
-                if (nstage > 0 && r2be.read_batch) {
+                if (nstage > 0 && r2be.read_batch2) {
+                    /* mixed-stream batch: BOTH streams in one call so a split-
+                     * device backend overlaps the two physical queues (the
+                     * device-overlap fix — two sequential read_batch calls
+                     * serialize the drives). rb_* arrays are sized 2*P. */
+                    for (int i = 0; i < nstage; i++) {
+                        rb_which[i] = 0;
+                        rb_off[i]   = (uint64_t)((size_t)L * P + stg_pos[i]) * (uint64_t)kblk;
+                        rb_dst[i]   = fusion_on ? (void *)(stgKres + (size_t)i * NKV * krw)
+                                                : (void *)(stgK + (size_t)i * KVD);
+                        rb_which[nstage + i] = 1;
+                        rb_off[nstage + i]   = (uint64_t)((size_t)L * P + stg_pos[i]) * (uint64_t)vblk;
+                        rb_dst[nstage + i]   = stgV + (size_t)i * KVD;
+                    }
+                    const size_t lens[2] = { kblk, vblk };
+                    if (r2be.read_batch2(r2be.handle, rb_which, rb_off, rb_dst, lens, 2 * nstage)) goto done;
+                } else if (nstage > 0 && r2be.read_batch) {
                     /* per-stream batches: K and V block sizes differ under fusion */
                     for (int i = 0; i < nstage; i++) {
                         rb_which[i] = 0;
