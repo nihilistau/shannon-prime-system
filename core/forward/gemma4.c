@@ -176,7 +176,15 @@ int gemma4_forward(const qwen3_model *m, const int32_t *tokens, int n_tok, float
             float *Vb = (float *)malloc((size_t)n_tok * kvd * sizeof(float));
             if (!K || !Vb) { free(K); free(Vb); goto done; }
             if (sp_matmul(m, ly->attn_k, nx, n_tok, E, kvd, K))  { free(K); free(Vb); goto done; }
-            if (sp_matmul(m, ly->attn_v, nx, n_tok, E, kvd, Vb)) { free(K); free(Vb); goto done; }
+            /* V-less layers (dense gemma-4 globals): attn_v is ABSENT — V is the
+             * RAW K projection (llama.cpp gemma4-iswa.cpp: "if v_proj is not
+             * present, use Kcur"). Copy BEFORE k_norm/rope; V then takes only
+             * the weightless norm below (and never the rope). */
+            if (ly->attn_v) {
+                if (sp_matmul(m, ly->attn_v, nx, n_tok, E, kvd, Vb)) { free(K); free(Vb); goto done; }
+            } else {
+                memcpy(Vb, K, (size_t)n_tok * kvd * sizeof(float));
+            }
             const float *kn = sp_as_f32(m, ly->attn_k_norm);
             for (int t = 0; t < n_tok; t++)
                 for (int h = 0; h < nkv; h++) {
