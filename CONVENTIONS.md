@@ -124,6 +124,35 @@ ctest --test-dir build --output-on-failure
 
 Run with `-DSP_UBSAN=ON` once before declaring a module done (gcc/clang only).
 
+## GPU / accelerator benchmarking (binding when reporting tok/s or GB/s)
+
+Added 2026-06-06 after a Stage-Beta speedup was reported as `12.65×` and turned
+out to be three stacked measurement artifacts. Before ANY GPU throughput number
+ships in a doc, gate, or commit message:
+
+1. **Warm up.** Run the timed path ≥1–2× untimed first. CUDA lazy module load +
+   cuBLAS JIT/heuristic selection happen on the FIRST kernel launch of a process
+   (~13× first-decode penalty at 0.6B). Cold-vs-warm comparisons are invalid.
+2. **Long window.** `n_gen ≥ 256` (or enough iters that wall-clock ≫ timer
+   jitter). Sub-second windows swing wildly (32/88/92 tok/s for one path).
+3. **Pin BOTH clocks.** `nvidia-smi -lgc <sm>,<sm>` locks ONLY the SM clock. A
+   weight-reading GEMV is **memory-bound**, so its throughput tracks the GDDR6
+   clock — which must be at full speed too (it auto-boosts under sustained load;
+   consumer GeForce `-lmc` is flaky/deprecated). Reset with `-rgc` after.
+4. **Confirm the kernel is on the binding bottleneck (Amdahl).** At 0.6B the
+   decode is *overhead*-bound (launches + attention + 150k-vocab argmax), not
+   weight-bandwidth-bound — a faster weight-GEMV ties f32 there. The win must be
+   measured where it binds (large model, or an isolated matmul sweep).
+5. **Trust within-run ratios over absolutes.** Clock/thermal drift moves the
+   absolute even under a lock; the A-vs-B ratio measured back-to-back is stable.
+6. **Isolated bench validates kernel MATH; production gate validates the
+   DATA-STRUCTURE handoff.** Both are required — a uniform-synthetic bench passed
+   while the production Q4 path returned 0/256 (a K-quant mixed-precision arena
+   read the Q8 head as Q4). Gate against the real artifact in the real loop.
+
+These are reusable across CUDA / Vulkan / Hexagon. Full rationale: engine
+`tests/bench_gemv_int8.cu` + lattice `papers/SESSION-CLOSED-stage-beta-speed.md`.
+
 ## Platform-gate policy
 
 This session closes the **Windows MinGW-gcc** tier (roadmap §3.7). Linux gcc
