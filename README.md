@@ -56,6 +56,8 @@ zero — the "unspecified" sentinel).
 
 ## 2. Current status
 
+**Update 2026-06-06.** The math-core now owns the canonical two-ring KV decode (`core/arm/` + `core/forward/decode.c` — the single-source `qwen3_generate_kv`/`qwen3_ppl_decode`). New since the snapshot below: dual-prime NTT keystore fusion (`core/poly_ring/`, write-once residue cache, exact `<q,k>` via residue dot + Garner — bit-exact to the scalar reference, gates `T_PR_KSTORE`/`_BLUE`/`_RESDOT`/`_BATCH`); the bit-packed popcount router (`sp_arm_project_sig`/`select_sig` + the `sp_arm_scan_sig` AVX512-overridable seam, gate `T_ARM_SIG`); GQA group-centroid kv-head selection; the batched forward-NTT seam (`sp_ntt_fwd_batch` + `ntt_fwd_plan` view). The Ring-2 abstract backend gained `read_batch2` (mixed-stream concurrent fetch). All overlay knobs are off-by-default and bit-identical when off. Suite 22/22. Detail in the lattice `papers/CONTRACT-C2`/`CONTRACT-SPEED`.
+
 Honest snapshot, 2026-06-03. This main reflects the standalone repo state.
 The engine-submoduled copy of math-core (under
 `shannon-prime-system-engine/lib/shannon-prime-system/`) carries the most
