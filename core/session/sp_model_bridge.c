@@ -622,16 +622,22 @@ struct qwen3_model *sp_model_to_gemma4(const sp_model *sm) {
     const int has_output_w = (sp_model_find_tensor(sm, "output.weight") != NULL) ? 1 : 0;
     const int has_ple = (ai.g4_n_embd_per_layer != 0u &&
                          sp_model_find_tensor(sm, "per_layer_token_embd.weight") != NULL) ? 1 : 0;
+    /* DENSE gemma-4 (e.g. 12B): NO AltUp/PLE (PL=0), but it still carries
+     * layer_output_scale per layer AND the global-layer rope_freqs table —
+     * both are INDEPENDENT of the E-series MatFormer machinery. Key on the
+     * tensors, not on has_ple (the oracle applies them whenever present). */
+    const int has_oscale = (sp_model_find_tensor(sm, "blk.0.layer_output_scale.weight") != NULL) ? 1 : 0;
+    const int has_rfreq  = (sp_model_find_tensor(sm, "rope_freqs.weight") != NULL) ? 1 : 0;
 
     /* Per layer: 9 matmul (attn q/k/v/output, ffn gate/up/down, per_layer inp_gate/proj)
      * + 8 norms (attn_norm, attn_q_norm, attn_k_norm, post_attention_norm, ffn_norm,
      * post_ffw_norm, post_norm=per_layer_post_norm, layer_output_scale). Globals:
      * token_embd (+output) + per_layer_token_embd + per_layer_model_proj (arena);
      * per_layer_proj_norm + rope_freqs + output_norm (norms). */
-    const int PLM = has_ple ? 2 : 0;   /* arena: per_layer_token_embd + per_layer_model_proj */
-    const int PLN = has_ple ? 2 : 0;   /* norms: per_layer_proj_norm + rope_freqs            */
-    const int MMPL = has_ple ? 9 : 7;  /* matmul per layer (incl per_layer inp_gate/proj)    */
-    const int NMPL = has_ple ? 8 : 6;  /* norms per layer (incl per_layer_post_norm + out_scale) */
+    const int PLM = has_ple ? 2 : 0;                 /* arena: per_layer_token_embd + per_layer_model_proj */
+    const int PLN = (has_ple ? 1 : 0) + has_rfreq;   /* norms: per_layer_proj_norm + rope_freqs            */
+    const int MMPL = has_ple ? 9 : 7;                /* matmul per layer (incl per_layer inp_gate/proj)    */
+    const int NMPL = (has_ple ? 7 : 6) + has_oscale; /* norms/layer (incl per_layer_post_norm + out_scale) */
     const int NSYN   = 2 + has_output_w + PLM + PLN + (MMPL + NMPL) * (int)NL;
     const int NARENA = 1 + has_output_w + PLM + MMPL * (int)NL;
     const int NNORM  = 1 + PLN + NMPL * (int)NL;
@@ -675,6 +681,8 @@ struct qwen3_model *sp_model_to_gemma4(const sp_model *sm) {
         pln_syn = si; SYNTH_NAME(si, "per_layer_proj_norm.weight"); si++;
         if (copy_norm(sm, "per_layer_proj_norm.weight", &nbuf[ni])) { sp_set_error("sp_model_to_gemma4: bad per_layer_proj_norm"); goto fail4; }
         nsrc[ni] = &synth[pln_syn]; ni++;
+    }
+    if (has_rfreq) {   /* global-layer proportional RoPE factors — dense 12B has them too */
         rf_syn = si; SYNTH_NAME(si, "rope_freqs.weight"); si++;
         if (copy_norm(sm, "rope_freqs.weight", &nbuf[ni])) { sp_set_error("sp_model_to_gemma4: bad rope_freqs"); goto fail4; }
         nsrc[ni] = &synth[rf_syn]; ni++;
@@ -696,7 +704,11 @@ struct qwen3_model *sp_model_to_gemma4(const sp_model *sm) {
         NORM(attn_norm,      "attn_norm.weight");
         MM  (attn_q,         "attn_q.weight");
         MM  (attn_k,         "attn_k.weight");
-        MM  (attn_v,         "attn_v.weight");
+        /* V-less layers (dense gemma-4 globals): attn_v may be ABSENT — the
+         * forward then uses the raw K projection as V (llama.cpp gemma4-iswa
+         * "use_alternative_attention"). ly->attn_v stays NULL. */
+        snprintf(nm, sizeof nm, "blk.%u.attn_v.weight", L);
+        if (sp_model_find_tensor(sm, nm)) MM(attn_v, "attn_v.weight");
         MM  (attn_output,    "attn_output.weight");
         NORM(attn_q_norm,    "attn_q_norm.weight");
         NORM(attn_k_norm,    "attn_k_norm.weight");
@@ -710,8 +722,8 @@ struct qwen3_model *sp_model_to_gemma4(const sp_model *sm) {
             MM  (per_layer_inp_gate, "inp_gate.weight");
             MM  (per_layer_proj,     "proj.weight");
             NORM(per_layer_post_norm,"post_norm.weight");
-            NORM(out_scale,          "layer_output_scale.weight");
         }
+        if (has_oscale) NORM(out_scale, "layer_output_scale.weight");
         #undef MM
         #undef NORM
     }
@@ -771,8 +783,8 @@ struct qwen3_model *sp_model_to_gemma4(const sp_model *sm) {
         qm->per_layer_token_embd = &synth[ple_syn];
         qm->per_layer_model_proj = &synth[plm_syn];
         qm->per_layer_proj_norm  = &synth[pln_syn];
-        qm->rope_freqs           = &synth[rf_syn];
     }
+    if (has_rfreq) qm->rope_freqs = &synth[rf_syn];
     return qm;
 
 fail4:
