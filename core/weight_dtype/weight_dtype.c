@@ -72,6 +72,27 @@ int sp_dequant_row(const void *src, uint32_t type, int n, float *dst) {
             for (int i = 0; i < n; i++) dst[i] = sp_f16_to_f32(h[i]);
             return 0;
         }
+        case SP_WDT_Q4_0: {
+            /* block_q4_0 = { f16 d; u8 qs[16]; } = 18 bytes / 32 elems.
+             * GGML layout: byte j holds elem j (LOW nibble) and elem j+16
+             * (HIGH nibble); value = (nib - 8) * d. The QAT-Q4_0 release
+             * (gemma-4-12B) carries ALL matmuls in this type. */
+            if (n % 32 != 0) return 1;
+            const uint8_t *p = (const uint8_t *)src;
+            int nb = n / 32;
+            for (int b = 0; b < nb; b++) {
+                uint16_t d16; memcpy(&d16, p, 2);
+                float d = sp_f16_to_f32(d16);
+                const uint8_t *qs = p + 2;
+                float *y = dst + (size_t)b * 32;
+                for (int j = 0; j < 16; j++) {
+                    y[j]      = (float)((int)(qs[j] & 0xF) - 8) * d;
+                    y[j + 16] = (float)((int)(qs[j] >>  4) - 8) * d;
+                }
+                p += 18;
+            }
+            return 0;
+        }
         case SP_WDT_Q8_0: {
             /* block_q8_0 = { f16 d; int8 qs[32]; } = 34 bytes / 32 elems */
             if (n % 32 != 0) return 1;
