@@ -15,7 +15,7 @@ extern "C" {
 #endif
 
 /* On-disk GGUF/GGML weight type tags this leaf dequantizes (the standard GGML IDs). */
-typedef enum { SP_WDT_F32 = 0, SP_WDT_F16 = 1, SP_WDT_Q8_0 = 8,
+typedef enum { SP_WDT_F32 = 0, SP_WDT_F16 = 1, SP_WDT_Q4_0 = 2, SP_WDT_Q8_0 = 8,
                SP_WDT_Q4_K = 12, SP_WDT_Q6_K = 14 } sp_weight_dtype;
 
 float    sp_f16_to_f32(uint16_t h);   /* IEEE half -> single precision. */
