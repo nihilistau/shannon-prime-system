@@ -152,18 +152,24 @@ size_t sp_frob_q4_packed_bytes(int rows, int cols);
  * This is the byte format EVERY backend (CPU/CUDA/Vulkan/Hexagon) reads inline at
  * matmul time, so it is versioned and frozen here. Per-ROW Frobenius — NOT ggml's
  * per-32-block Q8_0; the two are not interchangeable. A change to the byte layout
- * or dequant convention REQUIRES bumping SP_FROB_ARENA_LAYOUT_VERSION + migration. */
-#define SP_FROB_ARENA_LAYOUT_VERSION 1u
+ * or dequant convention REQUIRES bumping SP_FROB_ARENA_LAYOUT_VERSION + migration.
+ * v2 (2026-06-08, SPEC OK_Q4B): optional per-32-BLOCK f16 scales via `bscale`.
+ * bscale == NULL => v1 per-row semantics exactly (row_scale governs); bscale != NULL
+ * => Q4B rows: dequant = code * f16_to_f32(bscale[r*bs_nblk + c/32]) and row_scale
+ * MAY be NULL. alias bit 2 covers bscale. */
+#define SP_FROB_ARENA_LAYOUT_VERSION 2u
 
 typedef struct {
     int      rows;          /* weight rows (= out features) */
     int      cols;          /* elems per row (= in features) */
     uint8_t *row_prec;      /* [rows] per-row precision: 8 or 4 */
-    float   *row_scale;     /* [rows] per-row Frobenius scale (max abs) */
+    float   *row_scale;     /* [rows] per-row Frobenius scale (max abs); may be NULL when bscale set */
     size_t  *row_off;       /* [rows] byte offset of the row's codes in `codes` */
     uint8_t *codes;         /* packed codes: Q8 row = cols int8; Q4 row = ceil(cols/2) bytes */
     size_t   codes_bytes;   /* used bytes in `codes` */
-    uint8_t  alias_mask;    /* bit 0: codes mmap-aliased (do not free); bit 1: row_scale mmap-aliased */
+    uint8_t  alias_mask;    /* bit 0: codes aliased; bit 1: row_scale aliased; bit 2: bscale aliased */
+    const uint16_t *bscale; /* OK_Q4B: [rows * bs_nblk] per-32-block f16 scales (NULL = per-row) */
+    int      bs_nblk;       /* blocks per row = ceil(cols/32); 0 when bscale == NULL */
 } sp_frob_packed_tensor;
 
 /* Source-row reader: writes row `j` of the weight matrix as `cols` f32 into `dst`.
