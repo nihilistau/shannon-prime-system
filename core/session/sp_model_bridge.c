@@ -108,11 +108,51 @@ static int build_packed_q4(const sp_model *sm, const char *name, sp_frob_packed_
     return 0;
 }
 
-/* Dispatch to Q8 or Q4 builder depending on the tensor's on-disk dtype. */
+/* Build an OK_Q4B packed tensor (SPEC OK_Q4B, arena layout v2): nibble codes as
+ * per-row Q4 PLUS per-32-block f16 scales aliased from the ".bscale" sibling.
+ * row_scale stays NULL — the block scale IS the step size (store-then-derive). */
+static int build_packed_q4b(const sp_model *sm, const char *name, sp_frob_packed_tensor *out) {
+    memset(out, 0, sizeof *out);
+    const sp_tensor_entry *e = sp_model_find_tensor(sm, name);
+    if (!e || e->dtype_id != (uint32_t)SP_DT_OK_Q4B || e->n_dims < 2) return 1;
+    uint64_t cols = e->dims[0], rows = e->dims[1] * (e->n_dims >= 3 ? e->dims[2] : 1u);
+    if (rows == 0 || cols == 0) return 1;
+    uint64_t nib_cols = (cols + 1u) / 2u;
+    uint64_t nblk     = (cols + 31u) / 32u;
+    if (e->size_bytes != rows * nib_cols) return 1;
+    const uint8_t *codes = (const uint8_t *)sp_model_tensor_data(sm, e);
+    if (!codes) return 1;
+
+    char sn[96];
+    snprintf(sn, sizeof sn, "%s.bscale", name);
+    const sp_tensor_entry *se = sp_model_find_tensor(sm, sn);
+    if (!se || se->dtype_id != (uint32_t)SP_DT_BLOCK_SCALE_FP16 ||
+        se->size_bytes != rows * nblk * 2u) return 1;
+    const uint16_t *bs = (const uint16_t *)sp_model_tensor_data(sm, se);
+    if (!bs) return 1;
+
+    out->rows = (int)rows; out->cols = (int)cols; out->codes_bytes = (size_t)(rows * nib_cols);
+    out->row_prec = (uint8_t *)malloc((size_t)rows);
+    out->row_off  = (size_t  *)malloc((size_t)rows * sizeof(size_t));
+    if (!out->row_prec || !out->row_off) { sp_frob_packed_free(out); return 1; }
+    out->alias_mask = 0x7;                          /* codes + (absent) row_scale + bscale aliased */
+    out->codes     = (uint8_t *)(uintptr_t)codes;
+    out->row_scale = NULL;
+    out->bscale    = bs;
+    out->bs_nblk   = (int)nblk;
+    for (uint64_t r = 0; r < rows; r++) {
+        out->row_prec[r] = 4u;
+        out->row_off[r]  = (size_t)(r * nib_cols);
+    }
+    return 0;
+}
+
+/* Dispatch to Q8 / Q4 / Q4B builder depending on the tensor's on-disk dtype. */
 static int build_packed(const sp_model *sm, const char *name, sp_frob_packed_tensor *out) {
     const sp_tensor_entry *e = sp_model_find_tensor(sm, name);
     if (!e || e->n_dims < 2) { memset(out, 0, sizeof *out); return 1; }
-    if (e->dtype_id == (uint32_t)SP_DT_OK_Q4) return build_packed_q4(sm, name, out);
+    if (e->dtype_id == (uint32_t)SP_DT_OK_Q4)  return build_packed_q4(sm, name, out);
+    if (e->dtype_id == (uint32_t)SP_DT_OK_Q4B) return build_packed_q4b(sm, name, out);
     return build_packed_q8(sm, name, out);
 }
 

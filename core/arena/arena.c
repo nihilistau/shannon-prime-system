@@ -15,8 +15,17 @@
 /* Format-lock (Piece 3, roadmap §8.2.2): the packed arena byte layout + dequant
  * contract are owned by the math core (sp/frobenius_lift.h); these asserts make a
  * silent drift of that contract a compile error here too. A change REQUIRES bumping
- * SP_FROB_ARENA_LAYOUT_VERSION (frobenius) + a cross-backend migration. */
-_Static_assert(SP_FROB_ARENA_LAYOUT_VERSION == 1u, "arena layout v1 frozen; bump + migrate to change");
+ * SP_FROB_ARENA_LAYOUT_VERSION (frobenius) + a cross-backend migration.
+ *
+ * v1 -> v2 MIGRATION (2026-06-08, SPEC OK_Q4B): the descriptor gains OPTIONAL
+ * per-32-block f16 scales (bscale/bs_nblk). bscale == NULL preserves v1 semantics
+ * EXACTLY (row_scale governs; sp_frob_pack_tensor memsets the descriptor and all
+ * v1 producers are audited zero-init). bscale != NULL = OK_Q4B rows: dequant =
+ * code * f16(bscale[r][c/32]); row_scale may be NULL. Consumers migrated:
+ * sp_frob_packed_dequant_row, matmul_arena (forward_dispatch), CUDA
+ * upload_packed/gemm_w/gemm_w_lift/gemv_w_packed. THIS arena (GGUF -> per-row
+ * pack at load) remains a pure v1 producer. */
+_Static_assert(SP_FROB_ARENA_LAYOUT_VERSION == 2u, "arena layout v2 (optional Q4B bscale); migration note above");
 _Static_assert(SP_FROB_QMAX  == 127, "arena Q8 dequant: code in [-127,127], q*scale/127");
 _Static_assert(SP_FROB_QMAX4 == 7,   "arena Q4 dequant: code in [-7,7], q*scale/7, two per byte");
 _Static_assert(sizeof(float) == 4,   "arena per-row Frobenius scale is 4-byte IEEE-754 on the wire");

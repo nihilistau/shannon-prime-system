@@ -66,6 +66,24 @@ static int matmul_arena(const sp_arena_tensor *at, const float *X,
         const uint8_t *rc = pt->codes + pt->row_off[j];
         const int8_t *cp;
         float inv;
+        if (pt->row_prec[j] != 8 && pt->bscale) {
+            /* OK_Q4B row (arena v2): per-32-block f16 scales — accumulate per block,
+             * apply each block's scale, no trailing row scale. */
+            sp_frob_q4_unpack(rc, in, unp); cp = unp;
+            const uint16_t *bs = pt->bscale + (size_t)j * (size_t)pt->bs_nblk;
+            for (int t = 0; t < n_tok; t++) {
+                const float *x = X + (size_t)t * in;
+                float facc = 0.0f;
+                for (int b = 0; b * 32 < in; b++) {
+                    int i0 = b * 32, i1 = i0 + 32 < in ? i0 + 32 : in;
+                    float acc = 0.0f;
+                    for (int i = i0; i < i1; i++) acc += (float)cp[i] * x[i];
+                    facc += acc * sp_f16_to_f32(bs[b]);
+                }
+                Y[(size_t)t * out + j] = facc;
+            }
+            continue;
+        }
         if (pt->row_prec[j] == 8) { cp = (const int8_t *)rc; inv = pt->row_scale[j] / 127.0f; }
         else { sp_frob_q4_unpack(rc, in, unp); cp = unp; inv = pt->row_scale[j] / 7.0f; }
         for (int t = 0; t < n_tok; t++) {

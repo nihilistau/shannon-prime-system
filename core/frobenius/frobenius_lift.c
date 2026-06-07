@@ -3,6 +3,7 @@
  * the full contract and the rounding-rule / error-bound documentation.
  */
 #include "sp/frobenius_lift.h"
+#include "sp/weight_dtype.h"   /* sp_f16_to_f32 (OK_Q4B block-scale dequant) */
 
 #include <math.h>
 #include <stddef.h>
@@ -196,6 +197,16 @@ int sp_frob_packed_dequant_row(const sp_frob_packed_tensor *t, int r, float *dst
         const int8_t *cp = (const int8_t *)rc;
         float inv = t->row_scale[r] / (float)SP_FROB_QMAX;
         for (int i = 0; i < t->cols; i++) dst[i] = (float)cp[i] * inv;
+    } else if (t->bscale) {
+        /* OK_Q4B (arena layout v2): per-32-block f16 scales; codes ALREADY quantized
+         * against the stored f16 scale (store-then-derive), so dequant is exact:
+         * w = code * f16(bscale). No /QMAX4 — the block scale IS the step size. */
+        const uint16_t *bs = t->bscale + (size_t)r * (size_t)t->bs_nblk;
+        for (int i = 0; i < t->cols; i++) {
+            uint8_t b = (i & 1) ? (uint8_t)(rc[i >> 1] >> 4) : (uint8_t)(rc[i >> 1] & 0xF);
+            int8_t v = (int8_t)((b & 0x8) ? (int)b - 16 : (int)b);
+            dst[i] = (float)v * sp_f16_to_f32(bs[i >> 5]);
+        }
     } else {
         float inv = t->row_scale[r] / (float)SP_FROB_QMAX4;
         for (int i = 0; i < t->cols; i++) {
