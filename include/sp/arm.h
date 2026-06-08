@@ -76,6 +76,14 @@ int sp_arm_select(const signed char *R, int r, int hd, const float *qh,
 void sp_arm_hits_attach(int *buf, int n);
 void sp_arm_hits_detach(void);
 
+/* C1L.2 cold-evict mask (the curator's consolidation knob, f32 router).
+ * mask[s]=1 evicts position s (skipped as a recall candidate). Evicting the
+ * COLD set (zero content-hits) is lossless — bit-identical decode, smaller
+ * episode; evicting a HOT position diverges (the rewind trigger). NULL = no
+ * eviction, bit-exact. */
+void sp_arm_evict_attach(const unsigned char *mask, int n);
+void sp_arm_evict_detach(void);
+
 /* ── bit-packed popcount router (SimHash overlay — gated, strictly lossier) ──
  *
  * The r-float projk sidecar is the last full-P RAM resident (~940 MB @32k).
