@@ -178,7 +178,9 @@ static void stdio_close(void *handle) {
     free(st);
 }
 
-int sp_arm_ring2_stdio_open(const char *dir, sp_arm_ring2_backend *out) {
+/* fmode: "w+b" = fresh store (spill path); "rb" = read-only LOAD (replay path,
+ * non-truncating — opens an existing persisted episode for recall). */
+static int stdio_open_mode(const char *dir, sp_arm_ring2_backend *out, const char *fmode) {
     if (!dir || !out) return 1;
     sp_arm_ring2_stdio *st = (sp_arm_ring2_stdio *)calloc(1, sizeof(*st));
     if (!st) return 1;
@@ -188,7 +190,7 @@ int sp_arm_ring2_stdio_open(const char *dir, sp_arm_ring2_backend *out) {
     int sep = (dl > 0 && dir[dl - 1] != '/' && dir[dl - 1] != '\\');
     for (int w = 0; w < 2; w++) {
         snprintf(path, sizeof(path), "%s%s%s", dir, sep ? "/" : "", names[w]);
-        st->f[w] = fopen(path, "w+b");                     /* fresh store per open */
+        st->f[w] = fopen(path, fmode);
         if (!st->f[w]) { stdio_close(st); return 1; }
     }
     out->handle        = st;
@@ -200,6 +202,16 @@ int sp_arm_ring2_stdio_open(const char *dir, sp_arm_ring2_backend *out) {
     out->close         = stdio_close;
     out->read_batch2   = NULL;                             /* serial reference */
     return 0;
+}
+
+int sp_arm_ring2_stdio_open(const char *dir, sp_arm_ring2_backend *out) {
+    return stdio_open_mode(dir, out, "w+b");               /* fresh store per open (spill) */
+}
+
+/* C1L.0b: non-truncating read-only LOAD of a persisted episode (replay-decode).
+ * Replay is read-path only; a curated episode is written via the spill open. */
+int sp_arm_ring2_stdio_open_ro(const char *dir, sp_arm_ring2_backend *out) {
+    return stdio_open_mode(dir, out, "rb");                /* load existing, no truncate */
 }
 
 /* ── platform-backend registration (the L1 hook) ──────────────────────────── */

@@ -61,6 +61,18 @@ static int g_recall_bits = 0;
  * PPL like every router-policy change; off = proven per-Q-head selection,
  * bit-identical. Applies to both the f32 and bits routers. */
 static int g_recall_kvsel = 0;
+/* SP_REPLAY=1 — C1L.0b replay-decode (XBAR curator seam): for historical
+ * positions [0, SP_REPLAY_NPOS) the post-RoPE K/V computed by the forward are
+ * OVERWRITTEN with the blocks of a persisted episode loaded read-only (the
+ * non-truncating sp_arm_ring2_stdio_open_ro from SP_REPLAY_DIR), so projk, the
+ * Ring-1/2 cache, and attention all reflect the loaded history instead of a
+ * fresh recompute. Episode layout is the ring2 stdio spill's:
+ * K/V block (L,pos) at byte ((L*P)+pos)*KVD*sizeof(float). Admissible only on
+ * the plain f32 path (NOT use_blocks, NOT fusion). OFF => branch never entered
+ * => the canonical forward is bit-identical (the replay-off floor). */
+static int g_replay = 0;
+static const char *g_replay_dir = 0;
+static int g_replay_npos = 0;
 
 #define KV_HEAD_MAX_BLOCKS 16
 static void kv_spinor_roundtrip(float *vec, int d) {
@@ -87,6 +99,9 @@ static void read_env_knobs(void) {
     { const char *e = getenv("SP_NTT_KV");             g_ntt_kv = (e && e[0] == '1'); }
     { const char *e = getenv("SP_RECALL_BITS");        g_recall_bits = (e && e[0] == '1'); }
     { const char *e = getenv("SP_RECALL_KVSEL");       g_recall_kvsel = (e && e[0] == '1'); }
+    { const char *e = getenv("SP_REPLAY");             g_replay = (e && e[0] == '1'); }
+    { const char *e = getenv("SP_REPLAY_DIR");         g_replay_dir = (e && e[0]) ? e : "."; }
+    { const char *e = getenv("SP_REPLAY_NPOS");        g_replay_npos = e ? atoi(e) : 0; if (g_replay_npos < 0) g_replay_npos = 0; }
 }
 
 /* Persistent-KV O(n) greedy decode (GEN_KV) with the ARM two-ring memory.
@@ -202,6 +217,7 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
     int *ri = NULL; sp_arm_sidx *cand = NULL;            /* inline-path selection scratch */
     sp_arm_ring2_backend r2be; int r2be_on = 0; r2be.handle = NULL; r2be.close = NULL;
     int r2be_owned = 0;      /* stdio reference = owned (closed at done); registered = borrowed */
+    sp_arm_ring2_backend replay_be; int replay_on = 0; replay_be.handle = NULL; replay_be.close = NULL; /* C1L.0b _ro episode load */
     int stg_hooked = 0;      /* staging buffers came from the backend's aligned allocator */
     int stg_gen = 0;
     /* NTT decode-attention overlay (SP_ENGINE_NTT_ATTN). */
@@ -375,6 +391,15 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
         fprintf(stderr, "    [ring2] BACKEND spill ON (W=%d, sinks pinned; v1 per-layer dedupe staging%s)\n",
                 g_recall_w, r2be.read_batch ? ", batched reads" : ", serial reference reads");
     }
+    /* C1L.0b: open the persisted episode READ-ONLY (non-truncating) for replay.
+     * Admissible only on the plain f32 path (block/fusion layouts differ);
+     * inadmissible configs leave replay_on=0 and the forward is unperturbed. */
+    if (g_replay && g_replay_npos > 0 && !use_blocks && !fusion_on) {
+        if (sp_arm_ring2_stdio_open_ro(g_replay_dir, &replay_be)) { replay_on = 0; goto done; }
+        replay_on = 1;
+        fprintf(stderr, "    [replay] episode LOAD ON: K/V for positions [0,%d) overwritten "
+                "from %s (read-only, non-truncating)\n", g_replay_npos, g_replay_dir);
+    }
     for (int pos = 0; pos < P; pos++) {
         int tok = seq[pos];
         if (sp_embed_row(m, tok, E, x)) goto done;
@@ -428,6 +453,19 @@ static int generate_kv_impl(const qwen3_model *m, int32_t *seq, int n_prompt, in
             const float *qn = sp_as_f32(m, ly->attn_q_norm), *kn = sp_as_f32(m, ly->attn_k_norm);
             for (int h = 0; h < NH;  h++) { float *qh = q    + (size_t)h * HD; sp_rmsnorm_head(qh, qn, HD, eps); sp_rope_neox(qh, HD, pos, base); }
             for (int h = 0; h < NKV; h++) { float *kh = knew + (size_t)h * HD; sp_rmsnorm_head(kh, kn, HD, eps); sp_rope_neox(kh, HD, pos, base); }
+
+            /* C1L.0b replay: overwrite this (layer,pos) post-RoPE K/V with the
+             * persisted episode's block, so the recall sidecar (projk), the
+             * Ring-1/2 cache, and attention all consume the LOADED history
+             * rather than the fresh recompute. The stored K is already
+             * post-RoPE (capture spilled post-RoPE knew), so no re-RoPE. Byte
+             * layout matches the ring2 stdio spill: block (L,pos) at
+             * ((L*P)+pos)*KVD*sizeof(float). The live query q is NOT replaced. */
+            if (replay_on && pos < g_replay_npos) {
+                uint64_t b = (uint64_t)((size_t)L * P + pos) * (uint64_t)((size_t)KVD * sizeof(float));
+                if (replay_be.read_block(replay_be.handle, 0, b, knew, (size_t)KVD * sizeof(float)) ||
+                    replay_be.read_block(replay_be.handle, 1, b, vnew, (size_t)KVD * sizeof(float))) goto done;
+            }
 
             /* recall sidecar: project the post-RoPE K of this (layer,pos) per kv-head. */
             if (g_recall_b > 0) {
@@ -860,6 +898,7 @@ done:
     free(stg_stamp); free(stg_slot); free(stg_pos);
     free(ri_all); free(m_all); free(rb_which); free(rb_off); free(rb_dst);
     if (r2be_owned && r2be.handle && r2be.close) r2be.close(r2be.handle);
+    if (replay_on && replay_be.handle && replay_be.close) replay_be.close(replay_be.handle);  /* C1L.0b _ro load (owned) */
     free(kres_pre); free(ring2k_res);
     if (stgKres) { if (stg_hooked) r2be.free_aligned(r2be.handle, stgKres); else free(stgKres); }
     free(qi); free(ki); free(qib); free(kib); free(kres);

@@ -31,6 +31,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#ifdef _WIN32
+#  include <direct.h>
+#  define sp_mkdir(d) _mkdir(d)
+#  define sp_rmdir(d) _rmdir(d)
+#else
+#  include <sys/stat.h>
+#  define sp_mkdir(d) mkdir((d), 0777)
+#  define sp_rmdir(d) rmdir(d)
+#endif
 
 #define NPROMPT 4
 #define NGEN    24
@@ -52,6 +61,7 @@ static void knobs_off(void) {
     knob("SP_RING2", "0");     knob("SP_RING2_DISK", "0");
     knob("SP_RING2_DIR", "."); knob("SP_RECALL_DECODE_ONLY", "0");
     knob("SP_RECALL_FUSE", "0");
+    knob("SP_REPLAY", "0"); knob("SP_REPLAY_DIR", "."); knob("SP_REPLAY_NPOS", "0");
 }
 
 /* Small ring config so the P=28 decode genuinely evicts/offloads:
@@ -279,6 +289,61 @@ static void T_GENKV_FUSION_FUSE(void) {
     remove("sp_arm_ring2_k.bin"); remove("sp_arm_ring2_v.bin");
 }
 
+/* ── C1L.0b: replay-decode null (XBAR curator load seam at the MODEL layer) ──
+ * Capture a full episode to a private dir via the ring2 spill, then re-decode
+ * with SP_REPLAY overwriting every position's post-RoPE K/V from the loaded
+ * (bit-identical) episode read back through the non-truncating
+ * sp_arm_ring2_stdio_open_ro path. Three checks:
+ *   (1) replay of the INTACT episode == baseline sequence (faithful round-trip
+ *       — the loaded K/V flow through projk + cache + attention losslessly);
+ *   (2) a ZEROED episode must DIVERGE (proves the loaded bytes actually drive
+ *       attention — replay is not a silent no-op);
+ *   (3) replay-off is the baseline itself (the bit-exact floor; every other
+ *       gate in this file runs with SP_REPLAY=0). */
+static void zero_file(const char *path) {
+    FILE *f = fopen(path, "r+b");
+    if (!f) return;
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    unsigned char zb[4096]; memset(zb, 0, sizeof zb);
+    while (n > 0) { size_t c = (n < (long)sizeof zb) ? (size_t)n : sizeof zb;
+                    fwrite(zb, 1, c, f); n -= (long)c; }
+    fclose(f);
+}
+static void T_GENKV_REPLAY_NULL(void) {
+    sp_mkdir("epcap");
+    /* CAPTURE: spill the full episode to epcap/ (identity budget => == baseline). */
+    knobs_off(); knobs_ring_common();
+    knob("SP_RECALL_B", "64");
+    knob("SP_RING2", "1"); knob("SP_RING2_DISK", "1"); knob("SP_RING2_DIR", "epcap");
+    int32_t cap[PTOT];
+    SP_CHECK_EQ_I64(run_decode(cap), PTOT, "capture decode completes (episode -> epcap/)");
+    SP_CHECK(seq_equal(g_base, cap), "capture (ring2 spill) == baseline");
+
+    /* REPLAY-INTACT: ring/recall OFF; full-context f32 cache; overwrite all
+     * positions' K/V from the loaded episode via the _ro path. */
+    knobs_off();
+    char np[16]; snprintf(np, sizeof np, "%d", PTOT);
+    knob("SP_REPLAY", "1"); knob("SP_REPLAY_DIR", "epcap"); knob("SP_REPLAY_NPOS", np);
+    int32_t rep[PTOT];
+    SP_CHECK_EQ_I64(run_decode(rep), PTOT, "replay decode completes (loaded episode as history)");
+    if (!seq_equal(g_base, rep)) dump_seq("replay", rep);
+    SP_CHECK(seq_equal(g_base, rep),
+             "replay of INTACT episode == baseline (faithful K/V round-trip through _ro load)");
+
+    /* NEGATIVE CONTROL: zero the episode bins, replay again -> must DIVERGE. */
+    zero_file("epcap/sp_arm_ring2_k.bin");
+    zero_file("epcap/sp_arm_ring2_v.bin");
+    int32_t neg[PTOT];
+    SP_CHECK_EQ_I64(run_decode(neg), PTOT, "zeroed-episode replay completes");
+    SP_CHECK(!seq_equal(g_base, neg),
+             "ZEROED episode DIVERGES from baseline (loaded K/V bytes drive attention)");
+    dump_seq("replay-zeroed", neg);
+
+    knobs_off();
+    remove("epcap/sp_arm_ring2_k.bin"); remove("epcap/sp_arm_ring2_v.bin");
+    sp_rmdir("epcap");
+}
+
 int main(void) {
     if (load_model()) { fprintf(stderr, "FATAL: fixture model load failed\n"); return 1; }
     SP_RUN(T_GENKV_DETERMINISM);
@@ -292,6 +357,7 @@ int main(void) {
     SP_RUN(T_GENKV_FUSION_MOCK_RING);
     SP_RUN(T_GENKV_FUSION_BACKEND);
     SP_RUN(T_GENKV_FUSION_FUSE);
+    SP_RUN(T_GENKV_REPLAY_NULL);
     qwen3_free(g_qm);
     sp_model_unload(g_sm);
     remove("fx_arm.spm"); remove("fx_arm.spt");
