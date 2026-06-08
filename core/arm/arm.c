@@ -67,6 +67,19 @@ static void qsel_topk(sp_arm_sidx *a, int n, int k) {
     }
 }
 
+/* ── recall-hit telemetry (C1L.2: the LRU / association signal) ──────────────
+ * Opt-in per-position counter. When a buffer is attached, sp_arm_select{,_sig}
+ * increment g_arm_hits[s] for each CONTENT-selected top-k position s (the sinks
+ * and the recent window are structural — always chosen — so they carry no
+ * coldness signal and are NOT counted). Cold positions = low hit count = the
+ * curator's eviction candidates. Detached (NULL) => zero work, selection and
+ * the decoded sequence are bit-identical (the telemetry-null guarantee). */
+static int *g_arm_hits = NULL;
+static int  g_arm_hits_n = 0;
+
+void sp_arm_hits_attach(int *buf, int n) { g_arm_hits = buf; g_arm_hits_n = (buf ? n : 0); }
+void sp_arm_hits_detach(void)            { g_arm_hits = NULL; g_arm_hits_n = 0; }
+
 /* ── recall selection ─────────────────────────────────────────────────────── */
 
 int sp_arm_select(const signed char *R, int r, int hd, const float *qh,
@@ -92,7 +105,10 @@ int sp_arm_select(const signed char *R, int r, int hd, const float *qh,
     qsel_topk(cand, nc, topk);                              /* expected O(N) */
     int m = 0;
     for (int s = 0; s < sink; s++) ri[m++] = s;             /* pinned sink anchors */
-    for (int t = 0; t < topk; t++) ri[m++] = cand[t].i;     /* top-k (order-free) */
+    for (int t = 0; t < topk; t++) {                        /* top-k (order-free) */
+        const int hs = cand[t].i; ri[m++] = hs;
+        if (g_arm_hits && hs < g_arm_hits_n) g_arm_hits[hs]++;  /* C1L.2 coldness signal */
+    }
     for (int s = cand_hi; s <= pos; s++) ri[m++] = s;       /* recent window */
     return m;
 }
@@ -132,7 +148,10 @@ int sp_arm_select_sig(const signed char *R, int r, int hd, const float *qh,
     qsel_topk(cand, nc, topk);
     int m = 0;
     for (int s = 0; s < sink; s++) ri[m++] = s;             /* pinned sink anchors */
-    for (int t = 0; t < topk; t++) ri[m++] = cand[t].i;     /* top-k (order-free) */
+    for (int t = 0; t < topk; t++) {                        /* top-k (order-free) */
+        const int hs = cand[t].i; ri[m++] = hs;
+        if (g_arm_hits && hs < g_arm_hits_n) g_arm_hits[hs]++;  /* C1L.2 coldness signal */
+    }
     for (int s = cand_hi; s <= pos; s++) ri[m++] = s;       /* recent window */
     return m;
 }
