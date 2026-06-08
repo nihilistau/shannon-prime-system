@@ -80,6 +80,19 @@ static int  g_arm_hits_n = 0;
 void sp_arm_hits_attach(int *buf, int n) { g_arm_hits = buf; g_arm_hits_n = (buf ? n : 0); }
 void sp_arm_hits_detach(void)            { g_arm_hits = NULL; g_arm_hits_n = 0; }
 
+/* ── cold-evict mask (C1L.2 Step 2: the curator's consolidation knob) ────────
+ * mask[s]=1 => position s is EVICTED from the store and skipped as a recall
+ * candidate. Evicting the COLD set (positions with zero content-hits) is
+ * LOSSLESS — a position that never won top-k cannot be removed from any recall
+ * set, so the decode is bit-identical while the episode shrinks. Evicting a HOT
+ * position changes the recall set => the decode diverges (the gate that the
+ * curator rewinds). Attached on the f32 router (sp_arm_select); NULL = no
+ * eviction, bit-exact. */
+static const unsigned char *g_arm_evict = NULL;
+static int g_arm_evict_n = 0;
+void sp_arm_evict_attach(const unsigned char *mask, int n) { g_arm_evict = mask; g_arm_evict_n = (mask ? n : 0); }
+void sp_arm_evict_detach(void)                             { g_arm_evict = NULL; g_arm_evict_n = 0; }
+
 /* ── recall selection ─────────────────────────────────────────────────────── */
 
 int sp_arm_select(const signed char *R, int r, int hd, const float *qh,
@@ -97,11 +110,13 @@ int sp_arm_select(const signed char *R, int r, int hd, const float *qh,
     if (topk > cand_hi - sink) topk = cand_hi - sink;
     int nc = 0;                                             /* score candidates */
     for (int s = sink; s < cand_hi; s++) {
+        if (g_arm_evict && s < g_arm_evict_n && g_arm_evict[s]) continue;  /* C1L.2: evicted from the store */
         const float *pk = projk + (((size_t)L * P + s) * NKV + kvh) * (size_t)r;
         float a = 0.0f;
         for (int p = 0; p < r; p++) a += pq[p] * pk[p];
         cand[nc].s = a; cand[nc].i = s; nc++;
     }
+    if (topk > nc) topk = nc;                               /* fewer survivors after eviction */
     qsel_topk(cand, nc, topk);                              /* expected O(N) */
     int m = 0;
     for (int s = 0; s < sink; s++) ri[m++] = s;             /* pinned sink anchors */

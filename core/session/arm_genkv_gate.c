@@ -380,6 +380,53 @@ static void T_GENKV_RECALL_HITS(void) {
     knobs_off();
 }
 
+/* ── C1L.2 Step 2: cold-evict consolidation (the first useful curator act) ───
+ * Profile recall hits, then have the curator evict positions and gate the
+ * result by sequence identity (the transactional accept/reject of C1L.1):
+ *   COLD evict (all zero-hit positions) — episode shrinks, decode BIT-IDENTICAL
+ *     (a zero-hit position never won top-k, so it cannot leave any recall set)
+ *     => the curator PROMOTES the smaller episode.
+ *   HOT evict (the single most-recalled position) — decode DIVERGES => the
+ *     curator REWINDS (a too-aggressive eviction is caught, not shipped). */
+static void T_GENKV_COLD_EVICT(void) {
+    knobs_off(); knobs_ring_common();
+    knob("SP_RECALL_B", "8"); knob("SP_RING2", "1");
+    int hits[PTOT]; memset(hits, 0, sizeof hits);
+    int32_t ref[PTOT];
+    sp_arm_hits_attach(hits, PTOT);
+    SP_CHECK_EQ_I64(run_decode(ref), PTOT, "profiling decode (hits) completes");
+    sp_arm_hits_detach();
+
+    unsigned char cold[PTOT]; int ncold = 0, maxpos = 0;
+    for (int i = 0; i < PTOT; i++) {
+        cold[i] = (hits[i] == 0) ? 1 : 0; ncold += cold[i];
+        if (hits[i] > hits[maxpos]) maxpos = i;
+    }
+
+    sp_arm_evict_attach(cold, PTOT);
+    int32_t got_cold[PTOT];
+    SP_CHECK_EQ_I64(run_decode(got_cold), PTOT, "cold-evicted decode completes");
+    sp_arm_evict_detach();
+    int cold_ok = seq_equal(ref, got_cold);
+    fprintf(stderr, "    [cold-evict] evicted %d/%d zero-hit positions -> %s\n",
+            ncold, PTOT, cold_ok ? "PROMOTE (lossless shrink)" : "REWIND (diverged)");
+    SP_CHECK(ncold > 0, "cold set non-empty (episode can shrink)");
+    SP_CHECK(cold_ok,
+             "cold-evict is LOSSLESS (bit-identical decode) => curator PROMOTES the shrunk episode");
+
+    unsigned char hot[PTOT]; memset(hot, 0, sizeof hot); hot[maxpos] = 1;
+    sp_arm_evict_attach(hot, PTOT);
+    int32_t got_hot[PTOT];
+    SP_CHECK_EQ_I64(run_decode(got_hot), PTOT, "hot-evicted decode completes");
+    sp_arm_evict_detach();
+    int hot_diverged = !seq_equal(ref, got_hot);
+    fprintf(stderr, "    [hot-evict]  evicted pos %d (hits=%d) -> %s\n",
+            maxpos, hits[maxpos], hot_diverged ? "REWIND (diverged, caught)" : "NO CHANGE (unexpected)");
+    SP_CHECK(hot_diverged,
+             "evicting a HOT position diverges => curator REWINDS (too-aggressive evict caught)");
+    knobs_off();
+}
+
 int main(void) {
     if (load_model()) { fprintf(stderr, "FATAL: fixture model load failed\n"); return 1; }
     SP_RUN(T_GENKV_DETERMINISM);
@@ -395,6 +442,7 @@ int main(void) {
     SP_RUN(T_GENKV_FUSION_FUSE);
     SP_RUN(T_GENKV_REPLAY_NULL);
     SP_RUN(T_GENKV_RECALL_HITS);
+    SP_RUN(T_GENKV_COLD_EVICT);
     qwen3_free(g_qm);
     sp_model_unload(g_sm);
     remove("fx_arm.spm"); remove("fx_arm.spt");
