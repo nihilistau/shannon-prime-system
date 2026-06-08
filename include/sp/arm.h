@@ -156,6 +156,11 @@ typedef struct {
  * performance twin. Returns 0 and fills *out on success. */
 int sp_arm_ring2_stdio_open(const char *dir, sp_arm_ring2_backend *out);
 
+/* C1L.0b replay-decode: non-truncating READ-ONLY load of a persisted episode
+ * (opens the two .bin files with "rb"). Use to read back a curated episode for
+ * replay-recall; the spill open above ("w+b") truncates and is write-path. */
+int sp_arm_ring2_stdio_open_ro(const char *dir, sp_arm_ring2_backend *out);
+
 /* ── platform-backend registration (the L1 hook) ─────────────────────────────
  * A platform store (engine Optane NO_BUFFERING+IOCP, a QUIC peer, ...) wraps
  * itself in sp_arm_ring2_backend and registers ONCE at startup; the canonical
