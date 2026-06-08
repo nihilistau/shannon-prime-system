@@ -68,6 +68,14 @@ int sp_arm_select(const signed char *R, int r, int hd, const float *qh,
                   const float *projk, size_t L, int P, int NKV, int kvh,
                   int B, int W, int sink, int pos, sp_arm_sidx *cand, int *ri);
 
+/* C1L.2 recall-hit telemetry (the LRU / association signal for cold-evict).
+ * Attach a per-position counter buffer (sized >= max absolute position + 1,
+ * zeroed by the caller); sp_arm_select{,_sig} then increment buf[s] for each
+ * CONTENT-selected top-k position s (sinks + recent window excluded). Detach
+ * (or never attach) => zero work, selection + decoded sequence bit-identical. */
+void sp_arm_hits_attach(int *buf, int n);
+void sp_arm_hits_detach(void);
+
 /* ── bit-packed popcount router (SimHash overlay — gated, strictly lossier) ──
  *
  * The r-float projk sidecar is the last full-P RAM resident (~940 MB @32k).

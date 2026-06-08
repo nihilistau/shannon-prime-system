@@ -344,6 +344,42 @@ static void T_GENKV_REPLAY_NULL(void) {
     sp_rmdir("epcap");
 }
 
+/* ── C1L.2 Step 1: recall-hit telemetry (the LRU / association signal) ───────
+ * Attach a per-position counter; the content-selected top-k positions are
+ * counted (sinks + window excluded, being structural). Proves: (a) attaching
+ * the counter does NOT change the decoded sequence (telemetry-null), and (b)
+ * the hit histogram is non-uniform — some positions are recalled by content
+ * (hot), others never (cold) — which is the signal cold-evict (Step 2) acts on. */
+static void T_GENKV_RECALL_HITS(void) {
+    knobs_off(); knobs_ring_common();
+    knob("SP_RECALL_B", "8");           /* sparse: 2 sinks + 2 top-k + 4 window */
+    knob("SP_RING2", "1");
+    int32_t ref[PTOT];
+    SP_CHECK_EQ_I64(run_decode(ref), PTOT, "sparse decode (no telemetry) completes");
+
+    int hits[PTOT]; memset(hits, 0, sizeof hits);
+    sp_arm_hits_attach(hits, PTOT);
+    int32_t got[PTOT];
+    SP_CHECK_EQ_I64(run_decode(got), PTOT, "sparse decode (telemetry attached) completes");
+    sp_arm_hits_detach();
+
+    SP_CHECK(seq_equal(ref, got),
+             "telemetry-null: attached counters do NOT change the decoded sequence");
+
+    int total = 0, maxh = 0, hot = 0, cold = 0;
+    for (int i = 0; i < PTOT; i++) {
+        total += hits[i]; if (hits[i] > maxh) maxh = hits[i];
+        if (hits[i] > 0) hot++; else cold++;
+    }
+    fprintf(stderr, "    [hits] total=%d max=%d hot=%d cold=%d  hist:", total, maxh, hot, cold);
+    for (int i = 0; i < PTOT; i++) fprintf(stderr, " %d", hits[i]);
+    fprintf(stderr, "\n");
+    SP_CHECK(total > 0, "content selections were recorded (the recall signal exists)");
+    SP_CHECK(hot > 0 && cold > 0,
+             "hit histogram is non-uniform — cold positions are identifiable (the evict signal)");
+    knobs_off();
+}
+
 int main(void) {
     if (load_model()) { fprintf(stderr, "FATAL: fixture model load failed\n"); return 1; }
     SP_RUN(T_GENKV_DETERMINISM);
@@ -358,6 +394,7 @@ int main(void) {
     SP_RUN(T_GENKV_FUSION_BACKEND);
     SP_RUN(T_GENKV_FUSION_FUSE);
     SP_RUN(T_GENKV_REPLAY_NULL);
+    SP_RUN(T_GENKV_RECALL_HITS);
     qwen3_free(g_qm);
     sp_model_unload(g_sm);
     remove("fx_arm.spm"); remove("fx_arm.spt");
