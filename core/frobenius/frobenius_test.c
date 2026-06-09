@@ -347,8 +347,11 @@ static int mat_row(void *ctx, int j, float *dst) {
 }
 
 static void T_FRO_5(void) {
-    /* frozen arena layout guard — bumping forces a conscious migration. */
-    SP_CHECK_EQ_I64(SP_FROB_ARENA_LAYOUT_VERSION, 1, "T_FRO_5 frozen arena layout version == 1");
+    /* frozen arena layout guard — bumping forces a conscious migration.
+     * v1 -> v2: the OK_Q4B per-32 f16 block-scale migration (core 85aadd3,
+     * gold-campaign-ratified 2026-06-08, ledger 06-R9/R10). This guard now
+     * pins v2; the next bump again requires a formal migration. */
+    SP_CHECK_EQ_I64(SP_FROB_ARENA_LAYOUT_VERSION, 2, "T_FRO_5 frozen arena layout version == 2 (bscale migration 85aadd3)");
 
     const int rows = 40, cols = 53;
     float *w = (float *)malloc((size_t)rows * (size_t)cols * sizeof(float));

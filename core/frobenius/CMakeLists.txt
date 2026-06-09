@@ -13,4 +13,5 @@ include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/sp_module.cmake)
 sp_add_module(frobenius
     SOURCES   frobenius_lift.c
     TEST      frobenius_test.c
-    TEST_NAME T_FRO)
+    TEST_NAME T_FRO
+    DEPENDS   sp_weight_dtype)   # frobenius_lift.c uses sp_f16_to_f32 (OK_Q4B per-32 f16 block scales, core 85aadd3)
