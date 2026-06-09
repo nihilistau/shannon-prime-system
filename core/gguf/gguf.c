@@ -234,7 +234,13 @@ gguf_ctx *gguf_open(const char *path) {
     /* ── tensor data base: align the post-table cursor ── */
     uint64_t a = ctx->alignment;
     ctx->data_offset = (c.pos + a - 1) / a * a;
-    if (ctx->data_offset > ctx->size) return fail(ctx);
+    if (ctx->data_offset > ctx->size) {
+        /* vocab-only GGUFs (n_tensors==0, e.g. llama.cpp models/ggml-vocab-*.gguf)
+         * end right after the kvs; the aligned cursor may land past EOF. Valid:
+         * there is no data region. Anything WITH tensors stays a hard fail. */
+        if (ctx->n_tensors > 0) return fail(ctx);
+        ctx->data_offset = ctx->size;
+    }
 
     /* validate every tensor lies within the file */
     for (uint64_t i = 0; i < ctx->n_tensors; i++) {
