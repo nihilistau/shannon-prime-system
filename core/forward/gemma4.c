@@ -196,6 +196,10 @@ int gemma4_forward(const qwen3_model *m, const int32_t *tokens, int n_tok, float
             Kst[L] = K; Vst[L] = Vb; Kuse = K; Vuse = Vb;
         } else {
             const int src = kvfs - (global ? 1 : 2);
+            /* shared-KV owner must be a real owner layer: a malformed arch
+             * struct (kvfs < 2) would index Kst[-1] — fail loudly, never OOB.
+             * (P3 pre-flight audit finding, 2026-06-10.) */
+            if (src < 0 || src >= kvfs) goto done;
             Kuse = Kst[src]; Vuse = Vst[src];
             if (!Kuse || !Vuse) goto done;
         }
