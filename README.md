@@ -1,13 +1,54 @@
 # shannon-prime-system
 
 The **math core** of the [shannon-prime-lattice](https://github.com/nihilistau/shannon-prime-lattice)
-project: a clean from-scratch C library (`libshannonprime`) that exposes a
-frozen Layer-1 C ABI for inference + the discrete-algebra primitives every
-engine backend shares.
+project — the canonical **discrete inference substrate**: a clean
+from-scratch C library (`libshannonprime`) exposing a frozen Layer-1 C ABI
+for inference plus the discrete-algebra primitives (`Z_q`, CRT-NTT,
+Frobenius lift, Spinor block, KSTE) every engine backend shares.
+
+What lives here now (status tags: **[PROVEN]** = gated with receipts in the
+lattice papers; **[WIRED]** = built + gated, off the headline path;
+**[DESIGN]** = spec only):
+
+- **The only decode in the tree** — `core/forward/decode.c`
+  (`generate_kv_impl`, shared by `qwen3_generate_kv` / `qwen3_ppl_decode`):
+  the two-ring KV decode + recall router + the `SP_REPLAY` episode-replay
+  seam (off-path bit-exact; gate `T_GENKV_REPLAY_NULL` 34/34). **[PROVEN]**
+- **ARM** (`core/arm/`) — the Algebraic Resonance Memory recall router:
+  ±1 Rademacher projection + bit-packed signature scan, recall-hit
+  telemetry (`sp_arm_hits_*`), cold-evict mask (`sp_arm_evict_*`), the
+  abstract Ring-2 backend ABI (stdio reference here; Optane + QUIC
+  backends live in the engine), and the **per-layer-class geom API**
+  (`sp_arm_geom_layout` + `sp_arm_{project,select,scan}*_geom`) for
+  jagged-geometry models — gate `T_ARM_GEOM` 26/26, uniform-null
+  bit-identical; the legacy uniform entry points delegate to the geom
+  bodies. This is the G-P3-GEOM substrate for porting the ring to
+  gemma4's per-layer-class NKV/HD. **[PROVEN]**
+- **Curator tools** (`tools/curator/`) — the Ring 2′ shadow mechanism:
+  `curator_core.c` (clone-isolate → gate → atomic-promote / rewind, with
+  append-only receipts) and `curator_replay.c` (episode persistence
+  `{k.bin, manifest}` + router re-projection determinism — `projk`
+  recovered bit-identically from the persisted K store). C1-lite is
+  COMPLETE on the qwen3 CPU two-ring (tag `xbar-c1-lite-complete`;
+  cold-evict gate `T_GENKV_COLD_EVICT` 45/45 — lossless cold-evict
+  PROMOTES, hot-evict diverges and REWINDS). **[PROVEN]**
+- **Forwards** (`core/forward/`) — qwen3 / qwen25 / gemma3 / gemma4 /
+  qwen36 (Gated DeltaNet MoE) reference forwards, argmax bit-exact per
+  family. `gemma4.c` is forward-only — wiring the ring into the gemma4
+  decode is P3, pending. **[PROVEN]**
+- **Packed-weight arena** (`core/frobenius/` + `core/arena/`) — the
+  Frobenius-lift per-row Q8/Q4 codec + **arena layout v2** (optional
+  per-32-block f16 `bscale` for the **OK_Q4B** codec; `bscale == NULL`
+  preserves v1 semantics exactly). This layout carries the gemma-4-12B
+  sovereign artifact. **[PROVEN]**
+- **Discrete primitives** — dual-prime **CRT-NTT** (`core/ntt_crt/` +
+  `core/poly_ring/`), the frozen 63-byte **Spinor block** (`core/vht2/`,
+  `0xA5` sentinel), **KSTE** packed-tree fingerprints (`core/kste/`),
+  sieve / dominance, `O_K` integer arithmetic. **[PROVEN]**
 
 This library is consumed by [shannon-prime-system-engine](https://github.com/nihilistau/shannon-prime-system-engine)
 (as a Git submodule under `lib/shannon-prime-system/`). Every accelerated
-backend — CPU AVX2/AVX-512, CUDA PTX, Vulkan, Hexagon HVX — registers
+backend — CPU AVX2/AVX-512, CUDA, Vulkan, Hexagon HVX — registers
 against this library's L1 ABI; the scalar reference forward defined here
 is the bit-exact correctness anchor each backend gates against.
 
@@ -15,9 +56,41 @@ The project's public, receipts-first results (the two-ring long-context
 memory envelope, the reducing loader, the quantization story) live at
 **[Position Is Arithmetic](https://github.com/nihilistau/Position_Is_Arithmetic)**
 (live site: https://nihilistau.github.io/Position_Is_Arithmetic/). The
-developer umbrella is [shannon-prime-lattice](https://github.com/nihilistau/shannon-prime-lattice).
+developer umbrella is [shannon-prime-lattice](https://github.com/nihilistau/shannon-prime-lattice);
+ground-truth project state is its `papers/PPT-LAT-STATE.md` +
+`papers/RFC-XBAR-auditable-latent-crossbar.md`.
 
 License: MIT. See `LICENSE`.
+
+---
+
+## 0. Where this repo sits — the four-tier rings + XBAR
+
+XBAR (the **auditable latent crossbar**, lattice `RFC-XBAR`) is the system
+this substrate serves: **Exec** (the big generator — the engine's CUDA/CPU
+forwards) and **Memo** (a small curator) share a tiered latent memory, and
+every write to canonical memory is receipted, gated, and rewindable.
+
+```
+  Exec (engine forward)                  Memo (curator: tools/curator)
+    │ write        ▲ recall from BOTH      │ propose         ▲ read
+    ▼              │                       ▼                 │
+  Ring 1 ────── Ring 2 (verbatim       ◄─ Ring 2′ (shadow staging:
+  (working KV)   episodic Spinor KV,       promote-on-accept w/ receipt,
+                 "hippocampus")            or REWIND)
+                   ▲                          │ promote (gated)
+                   └── Ring 3 (adapter-compressed consolidated,
+                       "neocortex"; G-R3-LOSS bounded)        [DESIGN]
+```
+
+This repo owns the substrate tiers: **Ring 1 + Ring 2** (the two-ring
+decode in `decode.c`, the ARM recall router, the abstract Ring-2 backend
+ABI), **Ring 2′** (the curator transaction in `tools/curator/`), and the
+`SP_REPLAY` seam that **NIGHTSHIFT** (the offline consolidation loop,
+RFC-XBAR §7) replays episodes through. **Ring 3** and NIGHTSHIFT proper
+are **[DESIGN]** (RFC-XBAR §3.1 / §7). The engine repo owns Exec's
+accelerated forwards, the Optane / QUIC Ring-2 stores, the `SP_XBAR_*`
+experiment harness, and the daemon tier.
 
 ---
 
@@ -38,6 +111,7 @@ The scalar reference forward here is the **bit-exact correctness anchor** — a 
 | **KSTE encoder** | `include/sp/kste.h` | Deterministic 64-byte packed-tree fingerprint for K-vectors of int32 components. `T_{60,3}` family. Tier-0/Tier-1 componentwise dominance. |
 | **Forward dispatch** | `include/sp/forward_dispatch.h` | `sp_matmul`, `sp_embed_row`, `sp_as_f32` — the model-coupled weight-access layer. Honors `SP_ENGINE_FROB`, `SP_ENGINE_F16_ACT`, `SP_Q4_PROMOTE` knobs. |
 | **Forward kernels** | `include/sp/forward_kernels.h` | `sp_dot_f32`, `sp_rmsnorm`, `sp_rope_neox`, `sp_attn_head` — portable scalar reference primitives every backend gates against. |
+| **ARM** | `include/sp/arm.h` | The two-ring recall router: ±1 Rademacher projection (`sp_arm_project`/`_sig`), selection (`sp_arm_select*`), Ring-2 backend ABI, hits telemetry, cold-evict mask, and the per-layer-class geom API (`sp_arm_geom_layout` + `*_geom` variants) for jagged-geometry models. |
 | **Weight dtype** | `include/sp/weight_dtype.h` | GGUF/GGML on-disk dequant: `sp_f16_to_f32`, `sp_f32_to_f16`, `sp_dequant_row` (F32 / F16 / Q8_0). |
 | **GGUF parser** | `include/sp/gguf.h` | GGUF v3 mmap parser → backend-agnostic descriptor. Used by `sp_transcode` to produce `.sp-model` files. |
 | **Hash primitives** | `include/sp/sp_hash.h` | CRC-32, SHA-256, XXH64 for `.sp-model` tensor-name hashing + integrity. |
@@ -56,18 +130,33 @@ zero — the "unspecified" sentinel).
 
 ## 2. Current status
 
+**Update 2026-06-10.** New since 06-08: the **per-layer-class geom API**
+(`sp_arm_*_geom`, commits `d118a92` + `64b698c` — gate `T_ARM_GEOM` 26/26,
+uniform-null bit-identical, legacy entry points delegate to the geom bodies;
+the G-P3-GEOM substrate for the gemma4 ring port). **C1-lite COMPLETE**
+(tag `xbar-c1-lite-complete`): the transactional curator core + episode
+persistence / router re-projection (`tools/curator/`), the `SP_REPLAY`
+replay-decode seam in `decode.c` (`T_GENKV_REPLAY_NULL` 34/34), recall-hit
+telemetry (`sp_arm_hits_*`) and cold-evict consolidation
+(`T_GENKV_COLD_EVICT` 45/45). Gemma4 tokenizer dispatch, core side
+(`SP_TOK_GEMMA4_BPE` family tag + vocab-only GGUF open fix, `9d3cc72`;
+the engine carries the `gemma4_bpe` module + gates). P3 pre-flight
+hardening: gemma4 shared-KV owner-index bounds guard + standalone
+frobenius link fix + `T_FRO_5` aligned to arena layout v2 (`c608b2f`).
+The two-ring / replay / cold-evict gate harness lives in
+`core/session/arm_genkv_gate.c`.
+
 **Update 2026-06-08.** The packed-weight arena moved to **layout v2** (formal migration: `core/arena/arena.c` pin + `sp/frobenius_lift.h` v2 note): the descriptor gains optional per-32-block f16 scales (`bscale`/`bs_nblk`) for the **OK_Q4B** codec — `bscale == NULL` preserves v1 semantics exactly (all producers audited zero-init). Migrated consumers: `sp_frob_packed_dequant_row` + `matmul_arena` per-block paths; new bridge builder `build_packed_q4b` (`.bscale` sibling; dtypes 13/14 in `sp/sp_model.h`). This format carries the gemma-4-12B sovereign artifact (GPU-gated PPL 5.12 vs the gold reference 4.6776 — lattice CONTRACT-SPEED + the public `GEMMA4-QUANT-FIX.md`).
 
 **Update 2026-06-06.** The math-core now owns the canonical two-ring KV decode (`core/arm/` + `core/forward/decode.c` — the single-source `qwen3_generate_kv`/`qwen3_ppl_decode`). New since the snapshot below: dual-prime NTT keystore fusion (`core/poly_ring/`, write-once residue cache, exact `<q,k>` via residue dot + Garner — bit-exact to the scalar reference, gates `T_PR_KSTORE`/`_BLUE`/`_RESDOT`/`_BATCH`); the bit-packed popcount router (`sp_arm_project_sig`/`select_sig` + the `sp_arm_scan_sig` AVX512-overridable seam, gate `T_ARM_SIG`); GQA group-centroid kv-head selection; the batched forward-NTT seam (`sp_ntt_fwd_batch` + `ntt_fwd_plan` view). The Ring-2 abstract backend gained `read_batch2` (mixed-stream concurrent fetch). All overlay knobs are off-by-default and bit-identical when off. Suite 22/22. Detail in the lattice `papers/CONTRACT-C2`/`CONTRACT-SPEED`.
 
 **GPU acceleration of this core's packed arena (engine-side, 2026-06-06).** The math-core's Q8/Q4 packed-weight arena (`core/frobenius/` + the codec) is now consumed directly on the GPU by a fused `__dp4a` GEMV in the engine's CUDA decode — 1 byte/weight (Q8) / 0.5 byte/weight (Q4) straight from VRAM, no f32 dequant. Isolated on an RTX 2060 at 12B-scale dims: **f32 1× (bus-saturated ~290 GB/s) → int8 ~3.8× → Q4 ~7.06×**, all top-1-lossless vs the core's dequant reference. This is the discrete-substrate payoff at deployment scale: the packed weights aren't just smaller on disk, they're ~7× faster to *compute* where the memory bus binds. See `shannon-prime-system-engine` README §5.2.1 + lattice `SESSION-CLOSED-stage-beta-speed.md`. GPU benchmarking discipline is in `CONVENTIONS.md`.
 
-Honest snapshot, 2026-06-03. This main reflects the standalone repo state.
-The engine-submoduled copy of math-core (under
-`shannon-prime-system-engine/lib/shannon-prime-system/`) carries the most
-recent sprint output including the WIRE-HEX §6 forward-backend hook —
-that submodule's commit will land back on this repo's main in the next
-sync wave.
+Sync discipline: this repo is ALSO carried as the engine's
+`lib/shannon-prime-system` submodule, so the two checkouts can diverge.
+Both track the same `origin/main`; `git fetch` + behind-check before any
+build or commit (see `CLAUDE.md`), and every standalone commit is followed
+by a submodule bump in the engine.
 
 **Headline (what the math-core now proves).** The discrete forward is bit-exact
 on **5 arch families** (through the 35B-A3B Gated-DeltaNet MoE); the reducing
@@ -83,7 +172,7 @@ the **Spinor per-vector KV codec ratio at bit-exact** (lossy 29/31 today) — se
 |-----------|--------|
 | `core/forward_kernels` — `sp_dot_f32`, `sp_rmsnorm`, `sp_rope_neox`, `sp_attn_head` | **shipped** (scalar reference) |
 | `core/forward_dispatch` — `sp_matmul`, `sp_embed_row`, `sp_as_f32` | **shipped** |
-| `core/forward` — Qwen3 / Gemma3 / Gemma4 / Qwen3.6-35B-A3B MoE (Gated DeltaNet) prefill + persistent-KV decode | **shipped** |
+| `core/forward` — Qwen3 / Qwen2.5 / Gemma3 / Gemma4 / Qwen3.6-35B-A3B MoE (Gated DeltaNet) prefill + persistent-KV decode (`decode.c` = the only decode in the tree; `SP_REPLAY` seam) | **shipped** |
 | `core/session` — `sp_session_create`, `sp_prefill_chunk`, `sp_decode_step`, clone/rewind, KV-mode flags | **shipped** |
 | `core/io_format` — `.sp-model` v0 loader (`sp_model_load`/`sp_model_unload`, `sp_model_arch`) | **shipped** |
 | `core/io_format` — **reducing codec** (`OK_Q4`/`OK_Q8` body ≤ source quant) | **shipped (C1)** — output-lossless top-1 (gemma4 + qwen35moe); qwen35moe 16.3 < 19.7 GB, Qwen3-0.6B-f16 1,439 → 720 MB (50%) |
@@ -99,11 +188,12 @@ the **Spinor per-vector KV codec ratio at bit-exact** (lossy 29/31 today) — se
 | `core/kste` — encoder + Tier-0/Tier-1 dominance | **shipped** |
 | `core/model` — Qwen3 / Qwen2.5 / Gemma3 / Gemma4 / Qwen3.6-35B-A3B MoE representation + GGUF load/free | **shipped** |
 | `core/ok_arith` — `O_K = Z[(1+√-163)/2]` integer arithmetic | **shipped** |
-| `core/arm` — Algebraic Resonance Memory (HRR binding in R_q) | **in progress** |
+| `core/arm` — Algebraic Resonance Memory (±1 Rademacher recall router + signature scan + Ring-2 backend ABI + hits telemetry + cold-evict + per-layer-class geom API) | **shipped** (gates `T_ARM`, `T_ARM_SIG`, `T_ARM_GEOM`, `T_ARM_GENKV`) |
+| `tools/curator` — Ring 2′ curator: propose→gate→promote/rewind transaction + episode persistence/replay | **shipped** (C1-lite complete; gates `G-C1L-1`, `T_GENKV_REPLAY_NULL`, `T_GENKV_COLD_EVICT`) |
 | `core/sieve` — Friedman-Kruskal dominance sieve | **in progress** |
 | `core/dominance` — componentwise dominance helpers | **shipped** |
 | `core/sp_channel` — TailSlayer channel oracle integration | **shipped** (offline cache pattern) |
-| L1 ABI §6 forward-backend hook (`sp_session_register_forward_backend`) | **shipped on engine submodule** (sprint WIRE-HEX); will sync to this repo's main in next bump |
+| L1 ABI §6 forward-backend hook (`sp_session_register_forward_backend`) | **shipped** (sprint WIRE-HEX) |
 
 **Frozen primes & constants** (mirrored in `include/sp/ntt_crt.h`):
 
@@ -129,6 +219,13 @@ L1 ABI, every cross-backend bit-identity gate).
 
 ## 3. Build
 
+**Build truth lives in the engine repo:**
+`shannon-prime-system-engine/docs/BUILD-ENV.md` is the authoritative,
+pinned toolchain doc. Summary: the canonical CPU build is **MinGW gcc
+15.2** in `build/` (Ninja); **MSVC cannot build the CPU tree** (GCC
+target attributes + `<stdatomic.h>`; Tier-3 MSVC parity is deferred);
+VS2019 BuildTools is the CUDA *host* compiler only.
+
 ### 3.1 Whole repo (default tier — Windows MinGW gcc 15.2 + Ninja)
 
 ```bash
@@ -143,7 +240,7 @@ ctest --test-dir build --output-on-failure
 |------|-----------|-------|
 | 1 | Windows MinGW gcc 15.2 | Closes in-session; primary CI target |
 | 2 | Linux gcc 11+ / clang 14+ | `.github/workflows/ci.yml` |
-| 3 | Windows MSVC (VS 2019 BT) | Follow-up wave; `cmake -B build-msvc -G "Visual Studio 16 2019"` |
+| 3 | Windows MSVC | **Cannot build the CPU tree today** (GCC `__attribute__((target))` + `__atomic_*` + `<stdatomic.h>`); Tier-3 parity deferred — see engine `docs/BUILD-ENV.md` |
 | Cross | `aarch64-linux-android` (NDK r25+) | Engine-side; see `shannon-prime-system-engine/tools/sp_daemon/build-android-libs.bat` |
 
 ### 3.3 Single-module fast iteration
