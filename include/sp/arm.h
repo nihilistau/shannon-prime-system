@@ -126,6 +126,71 @@ int sp_arm_select_sig(const signed char *R, int r, int hd, const float *qh,
 void sp_arm_scan_sig(uint64_t qsig, const uint64_t *sigs, int n, int s0,
                      sp_arm_sidx *cand);
 
+/* ── per-layer-class geometry (G-P3-GEOM substrate; CONTRACT-XBAR-C1-lite §3b) ──
+ *
+ * The router entry points above assume ONE uniform {NKV, head_dim} across all
+ * layers (the qwen3 geometry). gemma-4 is jagged per layer CLASS: GLOBAL
+ * layers (L % 6 == 5) have n_kv=1 / head_dim=512, SWA layers n_kv=2 /
+ * head_dim=256 (core/forward/gemma4.c:148-157). The geom API carries
+ * per-layer dims; the legacy functions are the uniform special case and
+ * DELEGATE here internally, so the two paths cannot drift — uniform inputs
+ * produce bit-identical selections (gate T_ARM_GEOM uniform-null).
+ *
+ * R SIZING CONTRACT: build ONE Rademacher matrix at hd_max = max class
+ * head_dim (sp_arm_build_R(R, r, hd_max)). A class with hd < hd_max projects
+ * through the FIRST hd columns of each of the r rows — the ROW STRIDE stays
+ * hd_max. Passing the smaller hd as the stride (i.e. calling the legacy
+ * sp_arm_project with hd=256 on a 512-built R) reads the wrong R elements —
+ * exactly the corruption mode the P3 audit flagged; T_ARM_GEOM guards it.
+ * hd == hd_max is bit-identical to the legacy projection.
+ *
+ * SIDECAR LAYOUT: per-layer BLOCKS at caller-computed ELEMENT offsets (off),
+ * heterogeneous because each layer's block size depends on its nkv:
+ *   f32 projk: block = P*nkv*r floats,  row  projk[off + ((size_t)s*nkv + kvh)*r]
+ *   sig  sigk: block = nkv*P u64, head-major sigk[off + (size_t)kvh*P + s]
+ * Uniform geometry with off = L*P*NKV*r (f32) / off = L*NKV*P (sig)
+ * reproduces the legacy layouts exactly. The episode/Ring-2 byte layout
+ * (((L*P)+pos)*KVD*4) is NOT touched — KVD is constant 512 across gemma4
+ * classes (audit finding #1); only the router index goes per-class. */
+
+typedef struct {
+    int    nkv;   /* kv heads in this layer's class */
+    int    hd;    /* head_dim in this layer's class (<= hd_max R was built with) */
+    size_t off;   /* element offset of this layer's sidecar block (floats for
+                     the f32 projk sidecar, u64 for the sig sidecar — whichever
+                     kind this descriptor array was laid out for) */
+} sp_arm_geom;
+
+/* Fill g[0..n_layers).off cumulatively for sidecar kind (0 = f32 projk,
+ * elements are floats and include the r factor; 1 = sig, elements are u64).
+ * g[i].nkv must be set by the caller first. Returns the TOTAL element count
+ * (the sidecar allocation size). */
+size_t sp_arm_geom_layout(sp_arm_geom *g, int n_layers, int P, int r, int kind);
+
+/* sp_arm_project with independent row stride: vec is hd floats; each of the
+ * r rows of R is read at stride hd_max. hd == hd_max => bit-identical to
+ * sp_arm_project (which delegates here). */
+void sp_arm_project_geom(const signed char *R, int r, int hd_max, int hd,
+                         const float *vec, float *proj);
+uint64_t sp_arm_project_sig_geom(const signed char *R, int r, int hd_max,
+                                 int hd, const float *vec);
+
+/* sp_arm_select{,_sig} with this layer's class descriptor g. Identical
+ * selection semantics (sinks ∪ top-(B-W-sink) ∪ recent-W, identity when B=0
+ * or within budget), identical hits/evict hook behavior; only the sidecar
+ * addressing + projection dims come from g. The legacy entry points delegate
+ * here with the uniform descriptor. */
+int sp_arm_select_geom(const signed char *R, int r, int hd_max,
+                       const sp_arm_geom *g, const float *qh,
+                       const float *projk, int P, int kvh,
+                       int B, int W, int sink, int pos,
+                       sp_arm_sidx *cand, int *ri);
+int sp_arm_select_sig_geom(const signed char *R, int r, int hd_max,
+                           const sp_arm_geom *g, const float *qh,
+                           const uint64_t *sigk, int P, int kvh,
+                           int B, int W, int sink, int pos,
+                           sp_arm_sidx *cand, int *ri);
+
 /* ── Ring-1 slot map ──────────────────────────────────────────────────────── */
 
 /* Physical Ring-1 slot for logical token position s: sinks pinned at [0,sink),
