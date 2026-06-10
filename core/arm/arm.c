@@ -26,14 +26,22 @@ void sp_arm_build_R(signed char *R, int r, int hd) {
     for (int i = 0; i < r * hd; i++) R[i] = (splitmix64(&s) & 1) ? 1 : -1;
 }
 
-void sp_arm_project(const signed char *R, int r, int hd,
-                    const float *vec, float *proj) {
+/* General projection (G-P3-GEOM): R row stride hd_max, vector length hd.
+ * The legacy uniform projection is the hd == hd_max special case below —
+ * identical loop, identical arithmetic order, so delegation is bit-exact. */
+void sp_arm_project_geom(const signed char *R, int r, int hd_max, int hd,
+                         const float *vec, float *proj) {
     for (int p = 0; p < r; p++) {
-        const signed char *Rp = R + (size_t)p * hd;
+        const signed char *Rp = R + (size_t)p * (size_t)hd_max;
         float a = 0.0f;
         for (int d = 0; d < hd; d++) a += (float)Rp[d] * vec[d];
         proj[p] = a;
     }
+}
+
+void sp_arm_project(const signed char *R, int r, int hd,
+                    const float *vec, float *proj) {
+    sp_arm_project_geom(R, r, hd, hd, vec, proj);
 }
 
 /* ── quickselect (Hoare, median-of-three Lomuto partition, DESCENDING) ────── */
@@ -95,12 +103,19 @@ void sp_arm_evict_detach(void)                             { g_arm_evict = NULL;
 
 /* ── recall selection ─────────────────────────────────────────────────────── */
 
-int sp_arm_select(const signed char *R, int r, int hd, const float *qh,
-                  const float *projk, size_t L, int P, int NKV, int kvh,
-                  int B, int W0, int sink0, int pos, sp_arm_sidx *cand, int *ri) {
+/* General per-layer-class selection (G-P3-GEOM): sidecar block at g->off,
+ * row addressing by g->nkv, projection dims {hd_max, g->hd}. The legacy
+ * uniform sp_arm_select below delegates here with off = L*P*NKV*r and
+ * hd_max = hd, reproducing the legacy addressing exactly (bit-identical). */
+int sp_arm_select_geom(const signed char *R, int r, int hd_max,
+                       const sp_arm_geom *g, const float *qh,
+                       const float *projk, int P, int kvh,
+                       int B, int W0, int sink0, int pos,
+                       sp_arm_sidx *cand, int *ri) {
+    (void)P;   /* f32 sidecar rows are position-major within the block */
     if (B <= 0 || pos + 1 <= B) { for (int s = 0; s <= pos; s++) ri[s] = s; return pos + 1; }
     float pq[SP_ARM_R_MAX];
-    sp_arm_project(R, r, hd, qh, pq);
+    sp_arm_project_geom(R, r, hd_max, g->hd, qh, pq);
     int W = W0;       if (W > pos + 1) W = pos + 1;
     int sink = sink0; if (sink > pos + 1) sink = pos + 1;
     int cand_hi = pos + 1 - W;
@@ -111,7 +126,7 @@ int sp_arm_select(const signed char *R, int r, int hd, const float *qh,
     int nc = 0;                                             /* score candidates */
     for (int s = sink; s < cand_hi; s++) {
         if (g_arm_evict && s < g_arm_evict_n && g_arm_evict[s]) continue;  /* C1L.2: evicted from the store */
-        const float *pk = projk + (((size_t)L * P + s) * NKV + kvh) * (size_t)r;
+        const float *pk = projk + g->off + ((size_t)s * (size_t)g->nkv + (size_t)kvh) * (size_t)r;
         float a = 0.0f;
         for (int p = 0; p < r; p++) a += pq[p] * pk[p];
         cand[nc].s = a; cand[nc].i = s; nc++;
@@ -128,14 +143,27 @@ int sp_arm_select(const signed char *R, int r, int hd, const float *qh,
     return m;
 }
 
+int sp_arm_select(const signed char *R, int r, int hd, const float *qh,
+                  const float *projk, size_t L, int P, int NKV, int kvh,
+                  int B, int W0, int sink0, int pos, sp_arm_sidx *cand, int *ri) {
+    sp_arm_geom g;
+    g.nkv = NKV; g.hd = hd;
+    g.off = (size_t)L * (size_t)P * (size_t)NKV * (size_t)r;
+    return sp_arm_select_geom(R, r, hd, &g, qh, projk, P, kvh,
+                              B, W0, sink0, pos, cand, ri);
+}
+
 /* ── bit-packed popcount router (SimHash overlay; see arm.h contract) ───────
  * The candidate scoring scan lives in arm_scan.c (its own archive member —
  * the engine-overridable seam); this TU keeps projection + selection. */
 
-uint64_t sp_arm_project_sig(const signed char *R, int r, int hd, const float *vec) {
+/* General sign-bit projection (G-P3-GEOM): same float dot as the f32 geom
+ * projection (R row stride hd_max, vector length hd), sign bit per row. */
+uint64_t sp_arm_project_sig_geom(const signed char *R, int r, int hd_max,
+                                 int hd, const float *vec) {
     uint64_t sig = 0;
     for (int p = 0; p < r; p++) {
-        const signed char *Rp = R + (size_t)p * hd;
+        const signed char *Rp = R + (size_t)p * (size_t)hd_max;
         float a = 0.0f;
         for (int d = 0; d < hd; d++) a += (float)Rp[d] * vec[d];
         if (a >= 0.0f) sig |= (1ULL << p);     /* sign bit of the SAME float dot */
@@ -143,11 +171,20 @@ uint64_t sp_arm_project_sig(const signed char *R, int r, int hd, const float *ve
     return sig;
 }
 
-int sp_arm_select_sig(const signed char *R, int r, int hd, const float *qh,
-                      const uint64_t *sigk, size_t L, int P, int NKV, int kvh,
-                      int B, int W0, int sink0, int pos, sp_arm_sidx *cand, int *ri) {
+uint64_t sp_arm_project_sig(const signed char *R, int r, int hd, const float *vec) {
+    return sp_arm_project_sig_geom(R, r, hd, hd, vec);
+}
+
+/* General per-layer-class sig selection (G-P3-GEOM): head-major block at
+ * g->off, head stride P. Legacy sp_arm_select_sig delegates with
+ * off = L*NKV*P and hd_max = hd (bit-identical addressing). */
+int sp_arm_select_sig_geom(const signed char *R, int r, int hd_max,
+                           const sp_arm_geom *g, const float *qh,
+                           const uint64_t *sigk, int P, int kvh,
+                           int B, int W0, int sink0, int pos,
+                           sp_arm_sidx *cand, int *ri) {
     if (B <= 0 || pos + 1 <= B) { for (int s = 0; s <= pos; s++) ri[s] = s; return pos + 1; }
-    const uint64_t qsig = sp_arm_project_sig(R, r, hd, qh);
+    const uint64_t qsig = sp_arm_project_sig_geom(R, r, hd_max, g->hd, qh);
     int W = W0;       if (W > pos + 1) W = pos + 1;
     int sink = sink0; if (sink > pos + 1) sink = pos + 1;
     int cand_hi = pos + 1 - W;
@@ -157,18 +194,42 @@ int sp_arm_select_sig(const signed char *R, int r, int hd, const float *qh,
     if (topk > cand_hi - sink) topk = cand_hi - sink;
     /* head-major sidecar: this head's signatures are stride-1 — hand the
      * contiguous slice to the scan seam (engine: VPOPCNTDQ + OMP). */
-    const uint64_t *hs = sigk + ((size_t)L * NKV + kvh) * (size_t)P;
+    const uint64_t *hs = sigk + g->off + (size_t)kvh * (size_t)P;
     int nc = cand_hi - sink;
     sp_arm_scan_sig(qsig, hs + sink, nc, sink, cand);
     qsel_topk(cand, nc, topk);
     int m = 0;
     for (int s = 0; s < sink; s++) ri[m++] = s;             /* pinned sink anchors */
     for (int t = 0; t < topk; t++) {                        /* top-k (order-free) */
-        const int hs = cand[t].i; ri[m++] = hs;
-        if (g_arm_hits && hs < g_arm_hits_n) g_arm_hits[hs]++;  /* C1L.2 coldness signal */
+        const int hs2 = cand[t].i; ri[m++] = hs2;
+        if (g_arm_hits && hs2 < g_arm_hits_n) g_arm_hits[hs2]++;  /* C1L.2 coldness signal */
     }
     for (int s = cand_hi; s <= pos; s++) ri[m++] = s;       /* recent window */
     return m;
+}
+
+int sp_arm_select_sig(const signed char *R, int r, int hd, const float *qh,
+                      const uint64_t *sigk, size_t L, int P, int NKV, int kvh,
+                      int B, int W0, int sink0, int pos, sp_arm_sidx *cand, int *ri) {
+    sp_arm_geom g;
+    g.nkv = NKV; g.hd = hd;
+    g.off = (size_t)L * (size_t)NKV * (size_t)P;
+    return sp_arm_select_sig_geom(R, r, hd, &g, qh, sigk, P, kvh,
+                                  B, W0, sink0, pos, cand, ri);
+}
+
+/* Cumulative per-layer sidecar block offsets for heterogeneous geometry.
+ * kind 0 = f32 projk (block = P*nkv*r floats); kind 1 = sig (block = nkv*P
+ * u64). Returns the total element count (the sidecar allocation size). */
+size_t sp_arm_geom_layout(sp_arm_geom *g, int n_layers, int P, int r, int kind) {
+    size_t off = 0;
+    for (int L = 0; L < n_layers; L++) {
+        g[L].off = off;
+        off += (kind == 0)
+             ? (size_t)P * (size_t)g[L].nkv * (size_t)r
+             : (size_t)g[L].nkv * (size_t)P;
+    }
+    return off;
 }
 
 /* ── Ring-1 slot map ──────────────────────────────────────────────────────── */
