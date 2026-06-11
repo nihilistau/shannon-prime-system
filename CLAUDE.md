@@ -13,3 +13,5 @@
 **Git (binding lesson):** this repo is ALSO carried as a submodule (`lib/shannon-prime-system`) inside the engine, so the standalone copy can sit **behind** `origin/main`. **`git fetch` + check `git rev-list --count HEAD..origin/main` BEFORE building/committing**; rebase if behind.
 
 **Non-negotiables:** receipts-first (no number without a command); bit-exact-when-off (the `SP_*` overlays are strict no-ops by default — verify it); no silent gate revision (surface upstream); check the code + commits + `git fetch` before trusting memory; verify Gemini's claims against the tree; drive by default. Full detail in lattice `prompt.md`.
+
+**Environment & credentials (2026-06-11):** compute lanes, shells/traps, storage law → lattice `ENVIRONMENT.md`. Current state/queue → lattice `SESSION-HANDOFF.md`. Secrets → `archive\notes_and_stuff\creds\claude-credentials.txt` (outside all repos; reference paths, never values).
