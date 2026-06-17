@@ -79,18 +79,20 @@ every write to canonical memory is receipted, gated, and rewindable.
   (working KV)   episodic Spinor KV,       promote-on-accept w/ receipt,
                  "hippocampus")            or REWIND)
                    ▲                          │ promote (gated)
-                   └── Ring 3 (adapter-compressed consolidated,
-                       "neocortex"; G-R3-LOSS bounded)        [DESIGN]
+                   └── Ring 3 (VSA/HRR gist consolidation;
+                       G-R3-LOSS bounded; R3.1–3.4 CLOSED in engine)
 ```
 
 This repo owns the substrate tiers: **Ring 1 + Ring 2** (the two-ring
 decode in `decode.c`, the ARM recall router, the abstract Ring-2 backend
 ABI), **Ring 2′** (the curator transaction in `tools/curator/`), and the
 `SP_REPLAY` seam that **NIGHTSHIFT** (the offline consolidation loop,
-RFC-XBAR §7) replays episodes through. **Ring 3** and NIGHTSHIFT proper
-are **[DESIGN]** (RFC-XBAR §3.1 / §7). The engine repo owns Exec's
-accelerated forwards, the Optane / QUIC Ring-2 stores, the `SP_XBAR_*`
-experiment harness, and the daemon tier.
+RFC-XBAR §7) replays episodes through. **Ring 3** (VSA/HRR Path A) is
+now **CLOSED** in the engine (R3.1–3.4 GREEN, host-numpy real-domain VSA;
+engine `tools/ring3/`); the Z_q/NTT native deployment port using this
+repo's `core/ntt_crt` + `core/poly_ring` is the deferred follow-on. The engine
+repo owns Exec's accelerated forwards, the Optane / QUIC Ring-2 stores, the
+`SP_XBAR_*` experiment harness, and the daemon tier.
 
 ---
 
@@ -153,6 +155,8 @@ The two-ring / replay / cold-evict gate harness lives in
 **Update 2026-06-16b — KAI-2 CLOSED + KAI-3 audio port GREEN (engine-side; status only).** **KAI-2 is now CLOSED** (engine `c5628e4`): the Phase-1 delivery seam `gemma4_kv_inject` is a GREEN/frozen verified asset (EMB control pivots the 12B 2/2, OK_Q4B / RTX 2060); the Phase-2 learned compressed single-event codec is **BOUNDED** (t10 packet k=16, cos 0.9913 @ τ=0.2, `val_KL` plateau 0.9157 → PACKET 1/2; wall = sequence-positional) — no more codec-compression cycles. **KAI-3 (audio port) is CLOSED GREEN** (engine `e35a227`): a sequence of N projected frames injected via the new `gemma4_kv_inject_seq` ABI (G-KAIROS-3-NULL 2/2 byte-identical to the inline EMB loop), per-position projector under `tools/audio_port/`, metal gate `SP_G4_KAI3` 8/8 semantic pivots. KAI-3 is the BRIDGE into the GNA audio "EAR" line (separate from but sharing the same `gemma4_kv_inject` seam as the KAIROS latent-memory work); NEXT = GNA Stage 2 (real audio front-end). No math-core change — recorded for cross-repo state.
 
 **Update 2026-06-17 — XBAR P3 CLOSED end-to-end + GNA "EAR" on silicon (engine-side; status only, no math-core change).** XBAR P3 is now closed end-to-end (P3.0→P3.4): the **`SP_REPLAY` episode-replay seam** this repo defines (`core/forward/decode.c` C1L.0b, `T_GENKV_REPLAY_NULL` 34/34) is now proven on the **Exec/gemma4-CUDA path** as **P3.3** — `G-P3-SHARED` 3-leg PASS on BOTH the 12B (48 owners) and E2B (owner-indirection): intact episode bit-identical to baseline, zeroed episode diverges 12/12. **P3.4 recall quality** (engine `G-P3-PPL`) deflects PPL +1.38% < the 2% gate. The `core/xbar/xbar_episode.c` owner-map manifest is the substrate the replay rides on. Separately, the **GNA "EAR" line is CLOSED on physical silicon** (real speech → 12B 7/8; POT GNA-native i16 = 0.877 full FP32 recovery; GNA_HW on the Intel GNA 2.0 = 0.877 == emu == FP32). All engine-side; recorded here for cross-repo state. Detail: lattice `papers/CONTRACT-XBAR-P3` + `CONTRACT-KAIROS-K0-K1` §7.4–§7.6.
+
+**Update 2026-06-17b — C2 Memo curator + #222 + Ring-3 Path A + EAR→Ring-2 organism bridge (engine-side; status only, no math-core change).** All work is parameter-free, on the 12B/E2B, null-floor env-gated. **C2 Memo curator CLOSED** (engine `tools/curator/`): autonomous Ring-2 recall loop above P3; discrete bit-collision resolver (256-bit LSH hash, integer Hamming TAU_BITS=168, r=256, reduction-order-immune); G-MEMO-{NULL,CUE,LOOP} GREEN on 12B (matched +0.000% / corrupted +40106% safety valve). **#222 CLOSED** (`gemma4_kv_replay` seam in engine `cuda_forward.cu`): SP_REPLAY ported into the persistent `gemma4_kv_*` ABI, O(1) bit-exact rewind; G-222 GREEN on E2B+12B (diffs=0) + G-222-WRAP GREEN (SWA-ring journal). **Ring-3 Path A CLOSED** (engine `tools/ring3/`): VSA/HRR parameter-free gist consolidation, R3.1 BIND → R3.2 LOSS → R3.3 DUALROUTE → R3.4 NIGHTSHIFT all GREEN (recall@1=1.0 to N=32; hit 0.000%/miss +8.04%; 349.8MB→16.3KB). The real-domain VSA is host-numpy; **the Z_q/NTT native deployment port using this repo's `core/ntt_crt` + `core/poly_ring` substrate is the natural next task for the math core**. **G-XBAR-ORGANISM step 1 GREEN**: EAR→Ring-2 write seam, engine commit `6600cf4`. No math-core change — recorded for cross-repo state. Detail: lattice `SESSION-HANDOFF.md`.
 
 **Update 2026-06-08.** The packed-weight arena moved to **layout v2** (formal migration: `core/arena/arena.c` pin + `sp/frobenius_lift.h` v2 note): the descriptor gains optional per-32-block f16 scales (`bscale`/`bs_nblk`) for the **OK_Q4B** codec — `bscale == NULL` preserves v1 semantics exactly (all producers audited zero-init). Migrated consumers: `sp_frob_packed_dequant_row` + `matmul_arena` per-block paths; new bridge builder `build_packed_q4b` (`.bscale` sibling; dtypes 13/14 in `sp/sp_model.h`). This format carries the gemma-4-12B sovereign artifact (GPU-gated PPL 5.12 vs the gold reference 4.6776 — lattice CONTRACT-SPEED + the public `GEMMA4-QUANT-FIX.md`).
 
