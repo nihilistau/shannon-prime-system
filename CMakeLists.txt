@@ -34,6 +34,7 @@ endif()
 
 set(SP_MODULES
     forward_kernels # L1 -- portable scalar reference forward kernels (dot/rmsnorm/rope/attn)
+    exact_islands   # BYTE-EXACT -- exact-integer fp32-island replacements (rmsnorm/softmax/gelu); reduction-order-immune
     io_hash         # L1 -- .sp-model hash primitives (CRC-32 / SHA-256 / XXH64)
     io_format       # L1 -- .sp-model mmap loader + accessors + L1 status-string impl
     weight_dtype    # L1 -- GGUF weight-dtype dequant (F16<->F32, F32/F16/Q8_0)
