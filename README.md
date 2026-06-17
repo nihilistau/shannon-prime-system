@@ -88,9 +88,16 @@ decode in `decode.c`, the ARM recall router, the abstract Ring-2 backend
 ABI), **Ring 2′** (the curator transaction in `tools/curator/`), and the
 `SP_REPLAY` seam that **NIGHTSHIFT** (the offline consolidation loop,
 RFC-XBAR §7) replays episodes through. **Ring 3** (VSA/HRR Path A) is
-now **CLOSED** in the engine (R3.1–3.4 GREEN, host-numpy real-domain VSA;
-engine `tools/ring3/`); the Z_q/NTT native deployment port using this
-repo's `core/ntt_crt` + `core/poly_ring` is the deferred follow-on. The engine
+**CLOSED** in the engine. **As of 2026-06-18 the whole XBAR memory stack is
+UNIFIED onto THIS repo's exact-integer O_K substrate** — the deferred
+"Z_q/NTT native port" is done: the Ring-3 VSA bind now runs on native
+`sp_pr_mul`/`ntt`/`sp_pr_score_kstore` (`core/ntt_crt` + `core/poly_ring`)
+**256/256 bit-identical** and reduction-order-immune, the Ring-2 episode
+store is a Frobenius (`core/frobenius`) π^k integer codec, and the full
+real-episode organism loop is GREEN. The drivers are host-Python on this
+repo's primitives (engine `tools/ring3/`, `tools/curator/frob_episode.py`); a
+native-C `core/`-resident port + the **T4 Frobenius π^k of the 9.4GB model
+weights** are the next core tasks. The engine
 repo owns Exec's accelerated forwards, the Optane / QUIC Ring-2 stores, the
 `SP_XBAR_*` experiment harness, and the daemon tier.
 
@@ -131,6 +138,8 @@ zero — the "unspecified" sentinel).
 ---
 
 ## 2. Current status
+
+**Update 2026-06-18 — XBAR memory UNIFIED onto THIS repo's exact-integer O_K substrate (engine-side drivers; the deferred Z_q/NTT native port is now done, no frozen-ABI change).** The whole XBAR memory stack was re-carried off generic float carriers onto this repo's primitives — the dual-prime negacyclic CRT-NTT (`core/ntt_crt` + `core/poly_ring`; frozen primes q1=1073738753 q2=1073732609 M=1152908312643096577), `O_K = Z[(1+√-163)/2]` arithmetic, and the Frobenius lift (`core/frobenius`). **G-R3-BIND-on-O_K** (engine `0019b86`): the Ring-3 VSA bind on native `sp_pr_mul`/`ntt`/`sp_pr_score_kstore` is **256/256 bit-identical** to the native path, ±1 carrier int==float, and **reduction-order-immune** (M byte-identical across permutations vs float 4.44e-15 drift) — the discrete-substrate payoff stated exactly. **G-R3-ORGANISM-NATIVE** (`1f0f6be`): the live dualroute+nightshift loop ported to native `sp_pr_mul` (D=1024 = two 512-blocks; CAP=32). **G-R2-FROB** (`dbe4103`/`d076797`): a Frobenius π^k INTEGER Ring-2 episode store (rank-2 O_K lattice, a16 ~lossless / a16b8 sub-ULP relL2 1.2e-7 @ 0.76× store) — honest: "lossless" is by reconstruction fidelity (the n=42 PPL gate is blind below ~1%). **G-XBAR-ORGANISM-FULL** (`15e7051`): the full real-episode loop (audio → C2 sig → native integer Ring-3 → Hamming verify → Frobenius store → 12B cache) GREEN. **Boundary thesis** the primitives bore out: O_K wins on EXACT ARITHMETIC (the container); every structure-on-*content* lever is measured-inert, kept as an honest negative — split-prime O_K Dirichlet carriers (`d7d96fe`), Möbius-on-M (`1e70763`), entropy-coding the Frob codes (`e6d17bb`), T2-Möbius on the real 12B embedding (`ac76c8e`). Period-6 rebase re-gated GREEN (`d2d7ceb`). The drivers are host-Python on this repo's primitives (engine `tools/ring3/`, `tools/curator/frob_episode.py`); a native-C `core/`-resident port + **T4 Frobenius π^k of the 9.4GB model WEIGHTS** are the next core tasks. No math-core source change this session — recorded for cross-repo state. Detail: lattice `SESSION-HANDOFF.md`.
 
 **Update 2026-06-10.** New since 06-08: the **per-layer-class geom API**
 (`sp_arm_*_geom`, commits `d118a92` + `64b698c` — gate `T_ARM_GEOM` 26/26,
