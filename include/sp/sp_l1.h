@@ -438,6 +438,47 @@ const sp_kvdecode_dispatch_fn *sp_session_kvdecode_backend_dt(const sp_session *
  * NULL floor: a handle on which it is never called (default sp_g4_kv.bx_on=0) is
  * byte-identical to the Stage-A float decode — no frozen surface renumbered. */
 
+/* ── §6d XBAR ring + episode-replay knobs on the kvdecode backend ──
+ * CONTRACT-CHAT-FULLSTACK B2 (lattice papers/CONTRACT-CHAT-FULLSTACK.md §3-B2).
+ *
+ * Like §6c these are NOT new frozen `sp_session` verbs — they are BACKEND-INTERNAL
+ * runtime knobs on the resident KV-decode handle (the `sp_g4_kv*` behind the §6b
+ * dispatch table), registered HERE (append-only, per the contract's ABI rule) but
+ * living as ENGINE backend symbols because they touch device-side CUDA-gemma4
+ * decode state the math-core does not model.
+ *
+ * (a) SWA W-slot RING (the O(1)-context KV win). The resident cache's SWA-owner
+ *     layers (the period-6 non-global layers) can be allocated as a `Wring=min(W,P)`
+ *     ring instead of a full Pmax cache; the decode writes slot=pos%Wring and
+ *     attends in POSITION order via k_attn_decode_ring (fp reduction byte-identical
+ *     to the full-window decode ⇒ a null-floor parity, KAI-1c). This is selected at
+ *     gemma4_kv_open time (the ring + its undo-journal are allocation-shaped), so it
+ *     is a DAEMON-STARTUP knob, not per-request: the daemon sets it before opening
+ *     the resident cache. Globals stay full-cache on the resident path (the compact
+ *     global slab + learned-LSH sparse global recall — SP_ARM_SLAB / SP_ARM_LSH,
+ *     CONTRACT-XBAR-P3 Phase C — is wired only on the one-shot gemma4_decode_cuda,
+ *     NOT yet on the resident gemma4_kv_* decode; porting it is a tracked follow-on).
+ *     Engine: gemma4_kv_open reads SP_G4_KV_RING_W / SP_G4_KV_JMAX (cuda_forward.cu);
+ *     daemon: SP_DAEMON_KVDECODE_RING_W / SP_DAEMON_KVDECODE_JMAX set that env at
+ *     startup. NULL floor: ring_W=0 (unset) = the full-cache Stage-A/B1 decode.
+ *
+ * (b) Episode REPLAY into a live turn (SP_REPLAY recall, C2 #222). Recall a stored
+ *     episode's owner K/V directly into the resident cache at [dpos,dpos+npos) and
+ *     advance dpos — so a prior memory rolls into the current chat turn; reject is
+ *     the O(1) gemma4_kv_rewind(npos) inverse (ring-aware journal). PER-REQUEST: the
+ *     chat path calls it under the cache Mutex before decode when the request names
+ *     an episode dir. Engine symbol:
+ *         int gemma4_kv_replay(sp_g4_kv *s, const char *epdir, int npos, int zero);
+ *     Daemon glue (sp_daemon_cuda_glue.c):
+ *         int sp_daemon_cuda_kvdecode_replay(void *handle, const char *epdir,
+ *                                            int npos, int zero);
+ *     NULL floor: a request that names no episode never calls it (byte-identical to
+ *     the B1/Stage-A path). When a future generic kvdecode backend needs replay it is
+ *     promoted to a dispatch-table row here (§6b struct grows append-only).
+ *
+ * Both default-off ⇒ a daemon with neither set is byte-identical to the B1 decode —
+ * no frozen surface renumbered. */
+
 #ifdef __cplusplus
 }
 #endif
