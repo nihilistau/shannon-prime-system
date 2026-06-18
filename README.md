@@ -45,6 +45,12 @@ lattice papers; **[WIRED]** = built + gated, off the headline path;
   `core/poly_ring/`), the frozen 63-byte **Spinor block** (`core/vht2/`,
   `0xA5` sentinel), **KSTE** packed-tree fingerprints (`core/kste/`),
   sieve / dominance, `O_K` integer arithmetic. **[PROVEN]**
+- **Exact-integer islands** (`core/exact_islands/`) — the 4 nonlinear fp32
+  islands (RMSNorm / softmax / GELU / RoPE) carried as **exact-integer
+  references** (RoPE via deterministic fixed-point CORDIC, no libm); gate
+  `T_EXACT_ISLANDS`. The math-core anchor for the engine's `SP_BYTEEXACT`
+  byte-exact (exact-integer / cross-machine-deterministic) forward — the
+  AUDITABILITY axis, NOT compression. **[PROVEN]**
 
 This library is consumed by [shannon-prime-system-engine](https://github.com/nihilistau/shannon-prime-system-engine)
 (as a Git submodule under `lib/shannon-prime-system/`). Every accelerated
@@ -109,7 +115,8 @@ The scalar reference forward here is the **bit-exact correctness anchor** — a 
 
 | Module | Header | Purpose |
 |--------|--------|---------|
-| **L1 ABI** | `include/sp/sp_l1.h` | The frozen session + forward + arch-query surface (PPT-LAT-L1-ABI-v0). Two-function forward (`sp_prefill_chunk` / `sp_decode_step`), clone/rewind, deterministic-mode anchor. |
+| **L1 ABI** | `include/sp/sp_l1.h` | The frozen session + forward + arch-query surface (PPT-LAT-L1-ABI-v0). Two-function forward (`sp_prefill_chunk` / `sp_decode_step`), clone/rewind, deterministic-mode anchor. **§6** = `sp_session_register_forward_backend` (prefill/full-forward hook); **§6b (additive)** = `sp_session_register_kvdecode_backend` — the persistent-KV decode verb (stateful session-resident KV; `sp_decode_step` routes the single token to the backend; the engine's `gemma4_kv_decode_logits` registers here to drive the 12B token-by-token from the daemon). |
+| **Exact-integer islands** | `include/sp/exact_islands.h` | The 4 nonlinear fp32 islands (RMSNorm / softmax / GELU / RoPE) as exact-integer references; RoPE via deterministic fixed-point CORDIC (no libm). The math-core anchor for the engine's `SP_BYTEEXACT` forward. Gate `T_EXACT_ISLANDS`. |
 | **Status** | `include/sp/sp_status.h` | `sp_status` enum (SP_OK, SP_ENOMEM, SP_ECANCEL, ..., SP_EHVX) + thread-local `sp_last_error()`. Frozen — values must not be renumbered. |
 | **Model loader** | `include/sp/sp_model.h` | `.sp-model` / `.sp-tokenizer` on-disk format. `sp_model_load` is pure `mmap` + header parse + tensor table pointer setup; zero malloc proportional to tensor data. |
 | **NTT-CRT** | `include/sp/ntt_crt.h` | Dual-prime negacyclic NTT over `Z_q[x]/(x^N+1)` with Barrett reduction. Frozen primes `q_1=1073738753`, `q_2=1073732609`, `M=q_1·q_2≈2^60`. `N ∈ {128, 256, 512}`. |
@@ -138,6 +145,8 @@ zero — the "unspecified" sentinel).
 ---
 
 ## 2. Current status
+
+**Update 2026-06-18 — the BYTE-EXACT FORWARD is COMPLETE on the 12B; this core carries the anchor (additive L1 §6b verb + `core/exact_islands/`).** Byte-exact = **exact-integer arithmetic / cross-machine determinism** (the AUDITABILITY mission), explicitly **NOT** compression. The dual-prime LINEAR algebra was already bit-exact-gated in the engine's universal L2 Rust crate `tools/sp_dsp_smoke` (Barrett, mod-q matmul, Garner CRT inv=894602413, NTT; frozen primes q1=1073738753 q2=1073732609, M=q1·q2≈2^60 fits u64 → no `__int128`). The genuinely-new piece lands in THIS core: **`core/exact_islands/`** — the 4 nonlinear fp32 islands (RMSNorm / softmax / GELU / RoPE) as **exact-integer references** (RoPE via deterministic fixed-point **CORDIC**, no libm), gate **`T_EXACT_ISLANDS`** — plus the L1 ABI **§6b** verb **`sp_session_register_kvdecode_backend`** in `include/sp/sp_l1.h` (additive persistent-KV decode hook: stateful session-resident KV; `sp_decode_step` routes the single token to the registered backend; `sp_kvdecode_dispatch_fn` = open/prefill/decode_step/rewind/position/close — append-only growth, no frozen surface renumbered). On the engine side these carry the `SP_BYTEEXACT` device-integer gemma4 forward + attention (`k_attn_decode_win_bx`, device CORDIC RoPE, dual-prime, no `__int128`): **G-BYTEEXACT-FORWARD-12B GREEN** (off = PPL 4.6665 == baseline byte-identical / null floor; on = 4.6569 parity; run-to-run **bit-identical** = the cross-machine proxy) and **G-WIRE-CUDA-DECODE-GEMMA4 GREEN** (the universal daemon registers the engine decode via §6b + `gemma4_kv_decode_logits` and drives the 12B token-by-token, 32/32 == oracle, VRAM O(1)). Math-core commit `d9d96f3`, engine `69c0588`. **HONEST:** the ONE remaining item is EXTERNAL — a true bit-identical logit check across two PHYSICAL GPUs (on-machine we have run-to-run determinism + reduction-order immunity as the proxy); PPL parity measured at n=42 (small-N, −0.21% within noise); the boundary thesis holds (O_K wins on exact arithmetic, structure-on-content is measured-inert). Detail: lattice `CONTRACT-BYTEEXACT` + `SESSION-HANDOFF.md`.
 
 **Update 2026-06-18 — XBAR memory UNIFIED onto THIS repo's exact-integer O_K substrate (engine-side drivers; the deferred Z_q/NTT native port is now done, no frozen-ABI change).** The whole XBAR memory stack was re-carried off generic float carriers onto this repo's primitives — the dual-prime negacyclic CRT-NTT (`core/ntt_crt` + `core/poly_ring`; frozen primes q1=1073738753 q2=1073732609 M=1152908312643096577), `O_K = Z[(1+√-163)/2]` arithmetic, and the Frobenius lift (`core/frobenius`). **G-R3-BIND-on-O_K** (engine `0019b86`): the Ring-3 VSA bind on native `sp_pr_mul`/`ntt`/`sp_pr_score_kstore` is **256/256 bit-identical** to the native path, ±1 carrier int==float, and **reduction-order-immune** (M byte-identical across permutations vs float 4.44e-15 drift) — the discrete-substrate payoff stated exactly. **G-R3-ORGANISM-NATIVE** (`1f0f6be`): the live dualroute+nightshift loop ported to native `sp_pr_mul` (D=1024 = two 512-blocks; CAP=32). **G-R2-FROB** (`dbe4103`/`d076797`): a Frobenius π^k INTEGER Ring-2 episode store (rank-2 O_K lattice, a16 ~lossless / a16b8 sub-ULP relL2 1.2e-7 @ 0.76× store) — honest: "lossless" is by reconstruction fidelity (the n=42 PPL gate is blind below ~1%). **G-XBAR-ORGANISM-FULL** (`15e7051`): the full real-episode loop (audio → C2 sig → native integer Ring-3 → Hamming verify → Frobenius store → 12B cache) GREEN. **Boundary thesis** the primitives bore out: O_K wins on EXACT ARITHMETIC (the container); every structure-on-*content* lever is measured-inert, kept as an honest negative — split-prime O_K Dirichlet carriers (`d7d96fe`), Möbius-on-M (`1e70763`), entropy-coding the Frob codes (`e6d17bb`), T2-Möbius on the real 12B embedding (`ac76c8e`). Period-6 rebase re-gated GREEN (`d2d7ceb`). The drivers are host-Python on this repo's primitives (engine `tools/ring3/`, `tools/curator/frob_episode.py`); a native-C `core/`-resident port + **T4 Frobenius π^k of the 9.4GB model WEIGHTS** are the next core tasks. No math-core source change this session — recorded for cross-repo state. Detail: lattice `SESSION-HANDOFF.md`.
 
@@ -209,6 +218,7 @@ the **Spinor per-vector KV codec ratio at bit-exact** (lossy 29/31 today) — se
 | `core/kste` — encoder + Tier-0/Tier-1 dominance | **shipped** |
 | `core/model` — Qwen3 / Qwen2.5 / Gemma3 / Gemma4 / Qwen3.6-35B-A3B MoE representation + GGUF load/free | **shipped** |
 | `core/ok_arith` — `O_K = Z[(1+√-163)/2]` integer arithmetic | **shipped** |
+| `core/exact_islands` — the 4 nonlinear fp32 islands (RMSNorm/softmax/GELU/RoPE) as exact-integer references (RoPE via fixed-point CORDIC, no libm); anchor for the engine's `SP_BYTEEXACT` forward | **shipped** (gate `T_EXACT_ISLANDS`) |
 | `core/arm` — Algebraic Resonance Memory (±1 Rademacher recall router + signature scan + Ring-2 backend ABI + hits telemetry + cold-evict + per-layer-class geom API) | **shipped** (gates `T_ARM`, `T_ARM_SIG`, `T_ARM_GEOM`, `T_ARM_GENKV`) |
 | `tools/curator` — Ring 2′ curator: propose→gate→promote/rewind transaction + episode persistence/replay | **shipped** (C1-lite complete; gates `G-C1L-1`, `T_GENKV_REPLAY_NULL`, `T_GENKV_COLD_EVICT`) |
 | `core/sieve` — Friedman-Kruskal dominance sieve | **in progress** |
@@ -691,7 +701,8 @@ gate (`T_*_BIT_EXACT`). Two registration shapes are supported:
 
 | Shape | API | Use when |
 |-------|-----|----------|
-| **Full forward** | `sp_session_register_forward_backend(s, handle, fn)` | Backend owns the entire forward pass (e.g. `gemma3_forward_hexagon` uploads the Q8 weight blob to cDSP once and runs the whole forward there). Activated for **prefill** only; decode keeps the math-core reference (no persistent-KV API across backends). |
+| **Full forward** | `sp_session_register_forward_backend(s, handle, fn)` | Backend owns the entire forward pass (e.g. `gemma3_forward_hexagon` uploads the Q8 weight blob to cDSP once and runs the whole forward there). Activated for **prefill** (§6). |
+| **Persistent-KV decode (§6b)** | `sp_session_register_kvdecode_backend(s, handle, dt)` | Backend owns a STATEFUL, session-resident KV decode (`sp_kvdecode_dispatch_fn` = open/prefill/decode_step/rewind/position/close). When registered, `sp_decode_step` routes the single-token call to the backend. The engine's CUDA `gemma4_kv_decode_logits` registers here so the universal daemon drives the 12B token-by-token (G-WIRE-CUDA-DECODE-GEMMA4: 32/32 == oracle, VRAM O(1)). Additive — no frozen surface renumbered. |
 | **NTT dispatch** | `sp_pr_bluestein_set_backend(ctx, handle, fwd_fn, inv_fn)` | Backend owns just the inner residue NTTs (e.g. cDSP runs `ntt_hvx_vtcm_oracle` + `intt_hvx_oracle` via FastRPC). Routes through the polynomial-ring attention overlay. |
 
 The L1 ABI §6 hook landed via sprint WIRE-HEX (2026-05-31). See
