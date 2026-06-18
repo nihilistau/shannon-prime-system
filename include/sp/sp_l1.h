@@ -410,6 +410,34 @@ sp_status sp_session_register_kvdecode_backend(
 sp_kvdecode_handle *sp_session_kvdecode_backend_handle(const sp_session *s);
 const sp_kvdecode_dispatch_fn *sp_session_kvdecode_backend_dt(const sp_session *s);
 
+/* ── §6c per-session byte-exact ("auditable mode") knob on the kvdecode backend ──
+ * CONTRACT-CHAT-FULLSTACK B1 (lattice papers/CONTRACT-CHAT-FULLSTACK.md §3).
+ *
+ * This is NOT a new frozen L1 verb on `sp_session` — it is a BACKEND-INTERNAL
+ * runtime knob on the resident KV-decode handle (the `sp_g4_kv*` behind the §6b
+ * dispatch table). It is registered HERE (append-only, per the contract's ABI
+ * rule: any new session-level knob registers in this header FIRST) but lives as
+ * an ENGINE backend symbol, not a math-core function, because it toggles a
+ * device-side flag specific to the CUDA gemma4 decode (`d_bx_flag` +
+ * k_attn_decode_win_bx) and the math-core has no such state.
+ *
+ * Engine symbol (sp_engine/cuda_backend.h):
+ *     int gemma4_kv_byteexact_set(sp_g4_kv *s, int on);
+ * Daemon glue (sp_daemon_cuda_glue.c):
+ *     int sp_daemon_cuda_kvdecode_byteexact(void *handle, int on);
+ *
+ * Semantics: on!=0 routes the resident decode through the exact-integer islands
+ * (RMSNorm/RoPE/GELU — d_bx_flag) + the dual-prime CRT-NTT exact-integer
+ * attention (k_attn_decode_win_bx) => run-to-run bit-identical (the AUDITABILITY
+ * / cross-machine-determinism axis). on==0 restores the float decode path =
+ * byte-identical null floor. Per-request callable under the resident-cache Mutex
+ * (the chat path sets on=1 at request start, on=0 at end). When a future fully
+ * generic kvdecode backend needs this, it is promoted to a dispatch-table row
+ * here (§6b struct grows append-only); for now the single CUDA backend owns it.
+ *
+ * NULL floor: a handle on which it is never called (default sp_g4_kv.bx_on=0) is
+ * byte-identical to the Stage-A float decode — no frozen surface renumbered. */
+
 #ifdef __cplusplus
 }
 #endif
