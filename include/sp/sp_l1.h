@@ -337,6 +337,79 @@ sp_forward_dispatch_fn sp_session_forward_backend_fn(const sp_session *s);
  * session's lifetime; caller MUST NOT free it. */
 const void *sp_session_qwen3_model(const sp_session *s);
 
+/* ── §6b persistent-KV decode backend registration (Sprint WIRE-CUDA-DECODE) ──
+ *
+ * Distinct from the §6 forward-backend hook, which is PREFILL-ONLY: it re-runs
+ * the WHOLE forward over the accumulated history per call (the engine's ppl-style
+ * usage). Token-by-token DECODE through that hook is two failures — O(N²) cost,
+ * and for a packed (OK_Q4B) model the tied full-vocab head is materialized only
+ * inside the engine's DECODE path, so driving decode through the prefill entry
+ * trips its head guard. This §6b verb binds a STATEFUL, session-resident KV
+ * handle + a step-wise dispatch table (a vtable of lifecycle ops over one
+ * device-resident cache), mirroring the engine's frozen gemma4_kv_* C ABI.
+ *
+ * When a kvdecode backend is registered, sp_decode_step routes the single-token
+ * forward through dt->decode_step on the session-resident handle instead of the
+ * math-core reference KV path (else current behaviour — the field is calloc-zero
+ * at create, so an unregistered session is byte-compatible with every existing
+ * consumer). The backend owns the device-resident cache across calls — that
+ * persistence is the whole point (the recompute tax the crossbar deletes).
+ *
+ * Lifetime: the handle + dt table are caller-owned; L1 stores the pointers as-is
+ * and re-emits the handle verbatim to the dispatch fns (never dereferenced by
+ * L1). They MUST stay valid until either re-registration (NULL dt unregisters)
+ * or sp_session_destroy returns. Thread-safety: caller-serialized with all &mut
+ * sp_session ops (the L2 Mutex<SpSession> guard); NOT safe concurrent with a
+ * decode on the session. */
+
+/* Opaque per-session KV-decode handle. On the CUDA backend this wraps an
+ * engine sp_g4_kv* (a resident KV cache). Owned by the backend; L1 never
+ * dereferences it — it only re-emits the pointer to the dispatch fns. */
+typedef struct sp_kvdecode_handle sp_kvdecode_handle;
+
+/* Step-wise persistent-KV decode dispatch table. Each fn returns 0 on success,
+ * non-zero on error (sp_last_error carries detail). The backend owns the
+ * device-resident cache across calls.
+ *
+ *   open    (qm_opaque, pmax, &handle)  : alloc resident KV (dpos=0). qm_opaque
+ *                                         is the session's borrowed qwen3_model*.
+ *   prefill (handle, tokens, n_tok)     : ingest history, store K/V, dpos+=n.
+ *   decode_step (handle, token, logits) : forward ONE token at the live dpos,
+ *                                         write full-vocab logits [vocab] for the
+ *                                         NEXT position, advance dpos.
+ *   rewind  (handle, n)                 : O(1) cold-evict dpos -= n.
+ *   position(handle)                    : current dpos (>=0), or -1 on NULL.
+ *   close   (handle)                    : free the resident cache (NULL-safe).
+ *
+ * sp_decode_step uses only decode_step (the others are the lifecycle the L2
+ * registrant drives directly: open at register, prefill/rewind/position as
+ * needed, close at unregister/destroy). */
+typedef struct sp_kvdecode_dispatch_fn {
+    int  (*open)       (const void *qm_opaque, int pmax, sp_kvdecode_handle **out);
+    int  (*prefill)    (sp_kvdecode_handle *h, const int32_t *tokens, int n_tok);
+    int  (*decode_step)(sp_kvdecode_handle *h, int32_t token, float *logits);
+    int  (*rewind)     (sp_kvdecode_handle *h, int n);
+    int  (*position)   (const sp_kvdecode_handle *h);
+    void (*close)      (sp_kvdecode_handle *h);
+} sp_kvdecode_dispatch_fn;
+
+/* Register a persistent-KV decode backend for this session. After registration,
+ * sp_decode_step routes through dt->decode_step on `handle` instead of the
+ * math-core reference decode. `handle` is the backend-opaque KV handle (created
+ * by the caller via dt->open before this call). Pass NULL dt to unregister
+ * (the session reverts to the reference KV path; L1 does NOT call dt->close —
+ * the caller owns the handle's lifetime).
+ *
+ * Returns SP_OK; SP_EBADARG on a NULL session. */
+sp_status sp_session_register_kvdecode_backend(
+    sp_session *s,
+    sp_kvdecode_handle *handle,
+    const sp_kvdecode_dispatch_fn *dt);
+
+/* Read-back accessors (NULL dt => no kvdecode backend; fall back to reference). */
+sp_kvdecode_handle *sp_session_kvdecode_backend_handle(const sp_session *s);
+const sp_kvdecode_dispatch_fn *sp_session_kvdecode_backend_dt(const sp_session *s);
+
 #ifdef __cplusplus
 }
 #endif
