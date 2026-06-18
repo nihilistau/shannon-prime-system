@@ -479,6 +479,47 @@ const sp_kvdecode_dispatch_fn *sp_session_kvdecode_backend_dt(const sp_session *
  * Both default-off ⇒ a daemon with neither set is byte-identical to the B1 decode —
  * no frozen surface renumbered. */
 
+/* ── §6e single latent entry seam on the kvdecode backend ──
+ * CONTRACT-CHAT-FULLSTACK B5 (lattice papers/CONTRACT-CHAT-FULLSTACK.md §6).
+ *
+ * The operator's single-entry-point architecture: the model has ONE true input — a
+ * stream of continuous latent vectors in its residual space — and EVERY modality
+ * enters through the one residual seam (gemma4_kv_inject* → the model mints K/V
+ * natively, RoPE + per-layer variance correct by construction). Three SOURCES feed
+ * that one entry: TEXT (BPE ids → embd[id]*sqrt(E) → seam), AUDIO (EAR/KAI-3
+ * projector frames → seam), and MEMORY (decoded episode residuals → seam; episodic
+ * K/V recall stays the §6d-b replay seam).
+ *
+ * Like §6c/§6d these are NOT new frozen `sp_session` verbs — they are BACKEND-INTERNAL
+ * runtime knobs on the resident KV-decode handle (the `sp_g4_kv*` behind the §6b
+ * dispatch table), registered HERE (append-only, per the contract's ABI rule) but
+ * living as ENGINE backend symbols because they touch device-side CUDA-gemma4 state
+ * the math-core does not model.
+ *
+ * (a) TEXT via the seam. Engine symbol (sp_engine/cuda_backend.h):
+ *         int gemma4_kv_inject_tokens(sp_g4_kv *s, const int32_t *toks, int n);
+ *     Daemon glue (sp_daemon_cuda_glue.c):
+ *         int sp_daemon_cuda_kvdecode_inject_tokens(void *handle, const int32_t *toks, int n);
+ *     Per token id, stages embd[id]*sqrt(E) into the inject buffer (the SAME arithmetic
+ *     the stock embed-at step runs) and steps the real id ⇒ the residual entering layer 0
+ *     is BIT-IDENTICAL to gemma4_kv_prefill(&id,1). PARITY by construction: text-via-seam
+ *     == text-via-prefill. PER-REQUEST: the chat path calls it under the cache Mutex when
+ *     `single_entry` is set, in place of prefill for the prompt head.
+ *
+ * (b) GENERIC residual-frame channel (audio/memory). Engine symbol (already in the engine):
+ *         int gemma4_kv_inject_seq(sp_g4_kv *s, const float *embs, int n_frames, int ph_token);
+ *     Daemon glue (sp_daemon_cuda_glue.c):
+ *         int sp_daemon_cuda_kvdecode_inject_frames(void *handle, const float *embs,
+ *                                                   int n_frames, int ph_token);
+ *     Injects n_frames raw E-float residual vectors at consecutive positions, each minted
+ *     at ph_token — the seam AUDIO (EAR/KAI-3) and MEMORY (decoded episode residuals) feed.
+ *
+ * NULL floor: a request that sets neither single_entry nor inject_frames never calls
+ * either ⇒ byte-identical to the §6d/B1 prefill decode. No frozen surface renumbered.
+ * When a future fully generic kvdecode backend needs these, they are promoted to
+ * dispatch-table rows here (§6b struct grows append-only); for now the CUDA backend owns
+ * them. */
+
 #ifdef __cplusplus
 }
 #endif
