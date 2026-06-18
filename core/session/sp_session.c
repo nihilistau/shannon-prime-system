@@ -64,6 +64,12 @@ struct sp_session {
      * Set via sp_session_register_forward_backend. Caller owns the handle. */
     void                       *forward_backend_handle;
     sp_forward_dispatch_fn      forward_backend_fn;
+    /* ── Sprint WIRE-CUDA-DECODE: optional persistent-KV decode backend (the
+     * engine's resident gemma4_kv_* cache, via the §6b dispatch table). NULL =
+     * math-core reference decode path. Set via
+     * sp_session_register_kvdecode_backend. Caller owns the handle + table. */
+    sp_kvdecode_handle             *kvdecode_handle;
+    const sp_kvdecode_dispatch_fn  *kvdecode_dt;
 };
 
 static int cancelled(const sp_session *s) { return (s->cancel && *s->cancel) ? 1 : 0; }
@@ -721,6 +727,24 @@ sp_status sp_decode_step(sp_session *s, int32_t token, float *logits, size_t log
     if (logits_capacity < s->n_vocab) { sp_set_error("sp_decode_step: logits_capacity < vocab_size"); return SP_EBADARG; }
     if (s->pos >= s->hist_cap) { sp_set_error("sp_decode_step: context full"); return SP_ECONTEXT_FULL; }
     if (cancelled(s)) return SP_ECANCEL;
+
+    /* ── §6b Sprint WIRE-CUDA-DECODE: route through the registered persistent-KV
+     * decode backend when present. The backend owns its OWN device-resident cache
+     * (its dpos tracks the same sequence position the caller drove via the
+     * dispatch table's prefill + prior decode_step calls), so the session's host
+     * KV path is bypassed entirely — we only record the token in hist[] and
+     * advance pos. The backend writes the full-vocab logits row directly. */
+    if (s->kvdecode_dt && s->kvdecode_dt->decode_step) {
+        const int kp = (int)s->pos;
+        s->hist[kp] = token;
+        if (s->kvdecode_dt->decode_step(s->kvdecode_handle, token, logits)) {
+            sp_set_error("sp_decode_step: kvdecode backend step failed");
+            return SP_EBADSTATE;
+        }
+        s->pos = (size_t)kp + 1;
+        return SP_OK;
+    }
+
     if (ensure_decode_bufs(s)) { sp_set_error("sp_decode_step: OOM (KV)"); return SP_ENOMEM; }
 
     const int p = (int)s->pos;
@@ -765,6 +789,14 @@ sp_status sp_session_clone(const sp_session *s, volatile int *cancel_flag, sp_se
     c->compute_backend_inverse = s->compute_backend_inverse;
     c->forward_backend_handle  = s->forward_backend_handle;
     c->forward_backend_fn      = s->forward_backend_fn;
+    /* WIRE-CUDA-DECODE §6b: do NOT propagate the kvdecode backend to a clone —
+     * the persistent-KV cache (sp_g4_kv) is a single device-resident handle the
+     * registrant owns; two sessions sharing one handle would corrupt each other's
+     * dpos. A forked session falls back to the math-core reference decode path
+     * (its own host KV, deep-copied below) until the caller explicitly registers
+     * a fresh kvdecode handle on it. */
+    c->kvdecode_handle = NULL;
+    c->kvdecode_dt     = NULL;
     if (s->kc || s->kcb) {   /* deep-copy the live KV so the fork doesn't re-prefill */
         if (ensure_decode_bufs(c)) { sp_session_destroy(c); *out = NULL; sp_set_error("sp_session_clone: OOM (KV)"); return SP_ENOMEM; }
         const qwen3_config *cf = &c->qm->cfg;
@@ -860,6 +892,36 @@ void *sp_session_forward_backend_handle(const sp_session *s) {
 
 sp_forward_dispatch_fn sp_session_forward_backend_fn(const sp_session *s) {
     return s ? s->forward_backend_fn : NULL;
+}
+
+/* ── §6b Sprint WIRE-CUDA-DECODE: persistent-KV decode-backend registration ───
+ *
+ * Plumbs a stateful, session-resident KV-decode backend (the engine's
+ * gemma4_kv_* resident cache via the §6b dispatch table) into sp_decode_step so
+ * the universal daemon can token-by-token decode through accelerator silicon on
+ * a persistent cache instead of the math-core reference KV path. See sp_l1.h §6b
+ * for the full ABI contract + lifetime rules.
+ *
+ * Validation: NULL session → SP_EBADARG. NULL dt is the "unregister" call
+ * (zeroes both fields; the caller — not L1 — owns the handle's close). Both
+ * fields are calloc-zeroed at session create, so a session that never registers
+ * keeps the existing math-core decode unchanged. */
+sp_status sp_session_register_kvdecode_backend(
+    sp_session *s,
+    sp_kvdecode_handle *handle,
+    const sp_kvdecode_dispatch_fn *dt) {
+    if (!s) { sp_set_error("sp_session_register_kvdecode_backend: null session"); return SP_EBADARG; }
+    s->kvdecode_handle = handle;
+    s->kvdecode_dt     = dt;
+    return SP_OK;
+}
+
+sp_kvdecode_handle *sp_session_kvdecode_backend_handle(const sp_session *s) {
+    return s ? s->kvdecode_handle : NULL;
+}
+
+const sp_kvdecode_dispatch_fn *sp_session_kvdecode_backend_dt(const sp_session *s) {
+    return s ? s->kvdecode_dt : NULL;
 }
 
 /* Borrowed accessor for the session's internal qwen3_model pointer. Returned
