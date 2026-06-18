@@ -42,6 +42,7 @@ set(SP_MODULES
     ok_arith        # 1A — O_K arithmetic over Q(sqrt-163)
     ntt_crt         # 1B — dual-prime CRT-NTT
     poly_ring       # 1C — R_q polynomial-ring attention
+    ring3           # XBAR — native-C Ring-3 VSA bind/unbind + NIGHTSHIFT consolidation (on poly_ring); deploy-enabler, no Python in the resident loop
     vht2            # 1D — VHT2 + Mobius reorder + 63-byte Spinor block
     frobenius       # 1E — Frobenius lift for Q8 weight storage
     kste            # 1F — KSTE encoder + Tier-0/Tier-1 dominance
