@@ -42,3 +42,27 @@ CONCLUSION       : STORAGE round-trip is byte-EXACT (0 diffs) and the spinor
                    the int8-decoded K). The persistence SUBSTRATE is proven; the
                    index-over-spinor is the convicted lever.
 DETERMINISM      : run-to-run bit-identical (sandbox gcc 11.4 == Windows MinGW).
+
+=== G-INT-1 HOT (revised, two-tier f32 payload) ===
+contract         : CONTRACT-PPT-ARM-LAT-INTEGRATION (amended, lattice ab8884e)
+tier             : HOT recall payload = LOSSLESS f32 K (no spinor); INDEX = exact 256-bit C2 sig
+episode dir      : D:\F\shannon-prime-repos\shannon-prime-system-engine\_needle_corpus_div\eps\ep_n_div_000
+ring2 dir        : C:\Users\Knack\AppData\Local\Temp\g_int_1_ring2_hot
+ep.k bytes       : 7569408  (f32=1892352, NL=48 HD=512)
+p_total (floor)  : 77
+npos             : 22
+n_global (L%6==5): 8
+gk vectors       : 176  ([ng=8][npos=22][HD=512])
+--- (a) PAYLOAD byte-identical (HOT f32 round-trip) ---
+payload floats   : 90112
+payload bytes    : 360448   (= ng*npos*512*4)
+memcmp result    : 0   (MUST be 0)
+byte diffs       : 0   (MUST be 0)
+first diff off   : -1   (-1 = none)
+--- (b) C2 sig Hamming (exact index) ---
+sig stored r/trip: 0 / 256   (MUST be 0)
+sig recompute    : 0 / 256   (recomputed from read-back f32; MUST be 0)
+sig_ingest       : 82848556cc315f61575d8cdce45595595c4e51729f4b1362d668925fffa97fd6
+sig_stored       : 82848556cc315f61575d8cdce45595595c4e51729f4b1362d668925fffa97fd6
+sig_recompute    : 82848556cc315f61575d8cdce45595595c4e51729f4b1362d668925fffa97fd6
+=== VERDICT : G-INT-1 HOT GREEN ===
