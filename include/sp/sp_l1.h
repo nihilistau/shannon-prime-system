@@ -129,6 +129,22 @@ typedef struct {
     uint32_t q36_rope_dim;           /* rope.dimension_count (64)        */
     float    q36_rope_base;          /* rope.freq_base (1e7)             */
     uint32_t q36_nextn_predict_layers;/* trailing NextN/MTP blocks (0)   */
+
+    /* ── appended Phase 5-DG (diffusion-gemma; reserved tail; 0 = unspecified) ──
+     * For arch_id == DIFFUSION_GEMMA the backbone geometry is carried in the base +
+     * g4_* + q36_n_expert(_used)/q36_n_ff_exp fields (the gemma4 MoE backbone); these
+     * carry the diffusion-specific surface. canvas_length is REQUIRED (the forward
+     * splits [prompt|canvas] on it). The eb_* entropy-bound sampler params are 0 when
+     * absent from the GGUF (this conversion wave omits them; sampler falls back to
+     * defaults at N4). All zero on non-diffusion models. sizeof(sp_arch_info) <= 256. */
+    uint32_t dg_canvas_length;        /* diffusion.canvas_length (256); REQUIRED      */
+    uint32_t dg_eb_max_steps;         /* diffusion.eb_max_steps; 0 = unspecified      */
+    float    dg_eb_t_min;             /* diffusion.eb_t_min                            */
+    float    dg_eb_t_max;             /* diffusion.eb_t_max                            */
+    float    dg_eb_entropy_bound;     /* diffusion.eb_entropy_bound (MI accept cutoff) */
+    float    dg_eb_stability_threshold;/* diffusion.eb_stability_threshold            */
+    float    dg_eb_confidence_threshold;/* diffusion.eb_confidence_threshold          */
+    uint32_t dg_shift_logits;         /* diffusion.shift_logits (canvas models: 0)    */
 } sp_arch_info;
 
 /* Populate *out from the loaded model's header arch_struct. Caller-stack-allocated.
