@@ -23,7 +23,24 @@ lattice papers; **[WIRED]** = built + gated, off the headline path;
   jagged-geometry models — gate `T_ARM_GEOM` 26/26, uniform-null
   bit-identical; the legacy uniform entry points delegate to the geom
   bodies. This is the G-P3-GEOM substrate for porting the ring to
-  gemma4's per-layer-class NKV/HD. **[PROVEN]**
+  gemma4's per-layer-class NKV/HD. **As of 2026-06-20 this two-ring
+  memory has a DEPLOYED autonomous recall head running live on the served
+  Gemma-4-12B chat** — a learned **W_c** selector (logsumexp-mean
+  relevance through HD=512→r=32, (E+1)-NULL argmax over [episodes, s0],
+  bounded M=42 replay). The selector is **host-side in the engine daemon
+  (`recall.rs`/`routes.rs`); NO frozen-ABI change and NO `.sp-model`
+  format change** — the L1 §6b `sp_session_register_kvdecode_backend`
+  verb and the OK_Q4 container are untouched. The recall-relevance
+  problem the ARM contract posed (which episode is load-bearing for this
+  query?) is SOLVED by a curator (mint novel needles) + a teacher-forced
+  ablation labeler (`SP_B3_SECRET`: cudaMemset-ablate the secret's source
+  KV rows → novel −33.56 vs parametric −0.15, TAU=−8.0) + the learned
+  head. Gate **G-CHAT-B3-WC-DIV2** = 360/361 recall + 50/50 foreign-reject
+  (int16==f32, s0=+0.102); LIVE **G-CHAT-B3-WC-DEPLOY**. Engine commit
+  `edc8079`. **Boundary thesis:** the win is a LEARNED selector on a
+  DIVERSE corpus, not a hand-designed number-theoretic signal (every one
+  measured-inert; corpus diversity — not machinery — was the binding
+  constraint, instance recall 34%→100%). **[PROVEN]**
 - **Curator tools** (`tools/curator/`) — the Ring 2′ shadow mechanism:
   `curator_core.c` (clone-isolate → gate → atomic-promote / rewind, with
   append-only receipts) and `curator_replay.c` (episode persistence
@@ -107,6 +124,19 @@ weights** are the next core tasks. The engine
 repo owns Exec's accelerated forwards, the Optane / QUIC Ring-2 stores, the
 `SP_XBAR_*` experiment harness, and the daemon tier.
 
+**As of 2026-06-20 the recall side of Ring 2 is autonomous on the served
+12B.** The "recall from BOTH" arrow above is now driven by a DEPLOYED
+learned **W_c** selector (logsumexp-mean relevance, (E+1)-NULL argmax over
+[episodes, s0], bounded M=42 replay): given a query it picks the
+load-bearing episode or rejects to NULL (clean prompt). It rides entirely
+on this repo's two-ring substrate but lives **host-side in the engine
+daemon** (`recall.rs`/`routes.rs`, commit `edc8079`) — **NO frozen-ABI
+change and NO `.sp-model` format change**. This core continues to own the
+episode store (`core/arm/` Ring-2 + ARM router) and the exact-integer
+substrate it sits on; the selector is an engine-side rider, not a math-core
+surface. Detail: lattice `CONTRACT-CHAT-FULLSTACK` + `SESSION-HANDOFF.md
+§0d`.
+
 ---
 
 ## 1. What's in here
@@ -145,6 +175,8 @@ zero — the "unspecified" sentinel).
 ---
 
 ## 2. Current status
+
+**Update 2026-06-20 — the two-ring episodic memory this core provides now has a DEPLOYED autonomous recall head live on the served Gemma-4-12B chat (host-side; NO frozen-ABI change, NO `.sp-model` format change).** The `core/arm/` Ring-2 store + ARM recall router now carries a learned **W_c** selector that does autonomous, instance-level episodic recall on the served 12B: logsumexp-mean relevance through an HD=512→r=32 projection, an (E+1)-way **NULL argmax** over [episodes, s0], and a **bounded M=42 replay** of the winner (or rejection to a clean prompt). The recall-relevance problem the ARM contract posed — *which stored episode is load-bearing for this query?* — is SOLVED by three host-side pieces in the engine: a **curator** (mints novel, non-parametric needles), a **teacher-forced ablation labeler** (`SP_B3_SECRET` cudaMemset-ablates the secret's source KV rows and re-scores the secret's NLL: novel needle collapse **−33.56** vs parametric control **−0.15**, ~16-nat gap, pinned **TAU=−8.0** — a perfect ground-truth labeler), and the **learned head** trained on those labels. Gate **G-CHAT-B3-WC-DIV2** = 360/361 recall + 50/50 foreign-reject, **int16==f32 lossless**, s0=+0.102; LIVE **G-CHAT-B3-WC-DEPLOY** (matched → RECALL, foreign → NULL → clean answer). **This is entirely engine-side** (`recall.rs`/`routes.rs`, engine commit `edc8079`): the L1 §6b `sp_session_register_kvdecode_backend` verb and the OK_Q4 `.sp-model` container are **untouched**. This core continues to own the episode store (`core/arm/`) + the exact-integer substrate; the selector is a host-side rider on top of it. **Boundary thesis:** the win is a LEARNED selector on a DIVERSE corpus, not a hand-designed number-theoretic signal — every such signal (6 verifiers + 4 Disposer signals + cosine-qK + ΔLL-polarity) was measured-inert open-world, and corpus diversity (not machinery) was the binding constraint that took instance recall **34% → 100%**. Detail: lattice `CONTRACT-CHAT-FULLSTACK` + `SESSION-HANDOFF.md §0d`.
 
 **Update 2026-06-18 — the BYTE-EXACT FORWARD is COMPLETE on the 12B; this core carries the anchor (additive L1 §6b verb + `core/exact_islands/`).** Byte-exact = **exact-integer arithmetic / cross-machine determinism** (the AUDITABILITY mission), explicitly **NOT** compression. The dual-prime LINEAR algebra was already bit-exact-gated in the engine's universal L2 Rust crate `tools/sp_dsp_smoke` (Barrett, mod-q matmul, Garner CRT inv=894602413, NTT; frozen primes q1=1073738753 q2=1073732609, M=q1·q2≈2^60 fits u64 → no `__int128`). The genuinely-new piece lands in THIS core: **`core/exact_islands/`** — the 4 nonlinear fp32 islands (RMSNorm / softmax / GELU / RoPE) as **exact-integer references** (RoPE via deterministic fixed-point **CORDIC**, no libm), gate **`T_EXACT_ISLANDS`** — plus the L1 ABI **§6b** verb **`sp_session_register_kvdecode_backend`** in `include/sp/sp_l1.h` (additive persistent-KV decode hook: stateful session-resident KV; `sp_decode_step` routes the single token to the registered backend; `sp_kvdecode_dispatch_fn` = open/prefill/decode_step/rewind/position/close — append-only growth, no frozen surface renumbered). On the engine side these carry the `SP_BYTEEXACT` device-integer gemma4 forward + attention (`k_attn_decode_win_bx`, device CORDIC RoPE, dual-prime, no `__int128`): **G-BYTEEXACT-FORWARD-12B GREEN** (off = PPL 4.6665 == baseline byte-identical / null floor; on = 4.6569 parity; run-to-run **bit-identical** = the cross-machine proxy) and **G-WIRE-CUDA-DECODE-GEMMA4 GREEN** (the universal daemon registers the engine decode via §6b + `gemma4_kv_decode_logits` and drives the 12B token-by-token, 32/32 == oracle, VRAM O(1)). Math-core commit `d9d96f3`, engine `69c0588`. **HONEST:** the ONE remaining item is EXTERNAL — a true bit-identical logit check across two PHYSICAL GPUs (on-machine we have run-to-run determinism + reduction-order immunity as the proxy); PPL parity measured at n=42 (small-N, −0.21% within noise); the boundary thesis holds (O_K wins on exact arithmetic, structure-on-content is measured-inert). Detail: lattice `CONTRACT-BYTEEXACT` + `SESSION-HANDOFF.md`.
 
@@ -219,7 +251,7 @@ the **Spinor per-vector KV codec ratio at bit-exact** (lossy 29/31 today) — se
 | `core/model` — Qwen3 / Qwen2.5 / Gemma3 / Gemma4 / Qwen3.6-35B-A3B MoE representation + GGUF load/free | **shipped** |
 | `core/ok_arith` — `O_K = Z[(1+√-163)/2]` integer arithmetic | **shipped** |
 | `core/exact_islands` — the 4 nonlinear fp32 islands (RMSNorm/softmax/GELU/RoPE) as exact-integer references (RoPE via fixed-point CORDIC, no libm); anchor for the engine's `SP_BYTEEXACT` forward | **shipped** (gate `T_EXACT_ISLANDS`) |
-| `core/arm` — Algebraic Resonance Memory (±1 Rademacher recall router + signature scan + Ring-2 backend ABI + hits telemetry + cold-evict + per-layer-class geom API) | **shipped** (gates `T_ARM`, `T_ARM_SIG`, `T_ARM_GEOM`, `T_ARM_GENKV`) |
+| `core/arm` — Algebraic Resonance Memory (±1 Rademacher recall router + signature scan + Ring-2 backend ABI + hits telemetry + cold-evict + per-layer-class geom API); the two-ring store now carries a DEPLOYED learned **W_c** autonomous recall head live on the 12B (host-side in the engine daemon, no ABI/format change) | **shipped** (gates `T_ARM`, `T_ARM_SIG`, `T_ARM_GEOM`, `T_ARM_GENKV`; live selector G-CHAT-B3-WC-DEPLOY, engine `edc8079`) |
 | `tools/curator` — Ring 2′ curator: propose→gate→promote/rewind transaction + episode persistence/replay | **shipped** (C1-lite complete; gates `G-C1L-1`, `T_GENKV_REPLAY_NULL`, `T_GENKV_COLD_EVICT`) |
 | `core/sieve` — Friedman-Kruskal dominance sieve | **in progress** |
 | `core/dominance` — componentwise dominance helpers | **shipped** |
