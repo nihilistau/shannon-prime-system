@@ -93,6 +93,33 @@ int sp_dequant_row(const void *src, uint32_t type, int n, float *dst) {
             }
             return 0;
         }
+        case SP_WDT_Q5_0: {
+            /* block_q5_0 = { f16 d; u8 qh[4]; u8 qs[16]; } = 22 bytes / 32 elems.
+             * GGML layout: qh is a 32-bit field of high bits; byte j of qs holds
+             * elem j (LOW nibble) and elem j+16 (HIGH nibble); the 5th bit for elem i
+             * is bit i of qh. value = ((nib | (bit<<4)) - 16) * d. Source type of the
+             * diffusion-gemma self_cond_down.weight (Q5_0). */
+            if (n % 32 != 0) return 1;
+            const uint8_t *p = (const uint8_t *)src;
+            int nb = n / 32;
+            for (int b = 0; b < nb; b++) {
+                uint16_t d16; memcpy(&d16, p, 2);
+                float d = sp_f16_to_f32(d16);
+                uint32_t qh; memcpy(&qh, p + 2, 4);
+                const uint8_t *qs = p + 6;
+                float *y = dst + (size_t)b * 32;
+                for (int j = 0; j < 16; j++) {
+                    int xh0 = (int)((qh >> (j))      & 1) << 4;
+                    int xh1 = (int)((qh >> (j + 16)) & 1) << 4;
+                    int x0  = ((int)(qs[j] & 0x0F) | xh0) - 16;
+                    int x1  = ((int)(qs[j] >>   4) | xh1) - 16;
+                    y[j]      = (float)x0 * d;
+                    y[j + 16] = (float)x1 * d;
+                }
+                p += 22;
+            }
+            return 0;
+        }
         case SP_WDT_Q8_0: {
             /* block_q8_0 = { f16 d; int8 qs[32]; } = 34 bytes / 32 elems */
             if (n % 32 != 0) return 1;
