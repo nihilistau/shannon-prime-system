@@ -1005,3 +1005,213 @@ fail6:
     free(ats); free(nsrc); free(nbuf); free(layers); free(synth);
     return NULL;
 }
+
+/* DiffusionGemma (arch_id == DIFFUSION_GEMMA, SP_ARCH_DIFFUSION_GEMMA) bridge:
+ * const sp_model* -> runnable q36-style MoE qwen3_model. The backbone is the dense
+ * gemma4 attention path (per-layer SWA/global geometry via g4_*, V-less global
+ * layers omit attn_v, sandwich norms, layer_output_scale, rope_freqs); the FFN is a
+ * DENSE shared MLP (ffn_gate/up/down) PLUS a 128-expert MoE (router ffn_gate_inp +
+ * FUSED ffn_gate_up_exps rank-3 + ffn_down_exps rank-3, with F32 scale sidecars) and
+ * the MoE sandwich norms (pre_ffw_norm_2, post_ffw_norm_1, post_ffw_norm_2). Model-
+ * global diffusion surface: the self-conditioning block (self_cond_pre_norm/gate/up/
+ * down) + the per-layer encoder output scalar (enc_layer_output_scale). NO AltUp/PLE
+ * (g4_n_embd_per_layer == 0). N1a LOADER ONLY: maps every tensor with no missing/shape
+ * error; the forward is N1b (deferred, blocked on a CUDA MoE backbone). */
+struct qwen3_model *sp_model_to_diffusion_gemma(const sp_model *sm) {
+    gguf_tensor       *synth  = NULL;
+    qwen3_layer       *layers = NULL;
+    sp_arena_tensor   *ats    = NULL;
+    const gguf_tensor **nsrc  = NULL;
+    float            **nbuf   = NULL;
+    sp_arena          *arena  = NULL;
+    qwen3_model       *qm     = NULL;
+    int si = 0, ari = 0, ni = 0, embd_syn = 0, onorm_syn = 0, out_syn = 0;
+    int scp_syn = 0, scg_syn = 0, scu_syn = 0, scd_syn = 0, rf_syn = 0;
+    char nm[96];
+
+    if (!sm) { sp_set_error("sp_model_to_diffusion_gemma: null handle"); return NULL; }
+    sp_arch_info ai;
+    if (sp_model_arch(sm, &ai) != SP_OK) { sp_set_error("sp_model_to_diffusion_gemma: arch query failed"); return NULL; }
+    if (ai.arch_id != (uint32_t)SP_ARCH_ID_DIFFUSION_GEMMA) { sp_set_error("sp_model_to_diffusion_gemma: model is not DiffusionGemma"); return NULL; }
+    const uint32_t NL = ai.n_layers;
+    if (NL == 0) { sp_set_error("sp_model_to_diffusion_gemma: zero layers"); return NULL; }
+
+    uint32_t n_ff = ai.n_ff;
+    if (n_ff == 0) {
+        const sp_tensor_entry *fg = sp_model_find_tensor(sm, "blk.0.ffn_gate.weight");
+        if (!fg || fg->n_dims < 2) { sp_set_error("sp_model_to_diffusion_gemma: n_ff unknown"); return NULL; }
+        n_ff = (uint32_t)fg->dims[1];
+    }
+
+    const int has_output_w = (sp_model_find_tensor(sm, "output.weight") != NULL) ? 1 : 0;
+    const int has_rfreq    = (sp_model_find_tensor(sm, "rope_freqs.weight") != NULL) ? 1 : 0;
+    const int has_selfcond = (sp_model_find_tensor(sm, "self_cond_pre_norm.weight") != NULL) ? 1 : 0;
+
+    /* Generous upper bounds (calloc-zeroed over-allocation is harmless; the actual
+     * ari/ni counts drive the arena adoption). Per layer: <= 9 arena (4 attn incl
+     * optional V + 3 dense MLP + 2 MoE expert) + <= 14 norms (6 backbone + 3 MoE-F32
+     * [router + 2 scale sidecars] + 3 sandwich + 2 scalars). Globals: 4 arena
+     * (token_embd + 3 self_cond) + 3 norms (output_norm + rope_freqs + self_cond_pre_norm). */
+    const int NSYN   = 4 + has_output_w + 4 + 24 * (int)NL;
+    const int NARENA = 4 + has_output_w + 9  * (int)NL;
+    const int NNORM  = 3 + 14 * (int)NL;
+    synth  = (gguf_tensor *)calloc((size_t)NSYN, sizeof(gguf_tensor));
+    layers = (qwen3_layer *)calloc((size_t)NL, sizeof(qwen3_layer));
+    ats    = (sp_arena_tensor *)calloc((size_t)NARENA, sizeof(sp_arena_tensor));
+    nsrc   = (const gguf_tensor **)calloc((size_t)NNORM, sizeof(*nsrc));
+    nbuf   = (float **)calloc((size_t)NNORM, sizeof(*nbuf));
+    if (!synth || !layers || !ats || !nsrc || !nbuf) { sp_set_error("sp_model_to_diffusion_gemma: out of memory"); goto faildg; }
+
+    #define SYNTH_NAME(idx, str) do { \
+        snprintf(synth[(idx)].name, sizeof synth[(idx)].name, "%s", (str)); \
+        const sp_tensor_entry *e_ = sp_model_find_tensor(sm, (str)); \
+        if (e_) { synth[(idx)].n_dims = e_->n_dims; \
+            for (uint32_t d_ = 0; d_ < e_->n_dims && d_ < 8u; d_++) synth[(idx)].dims[d_] = e_->dims[d_]; } \
+    } while (0)
+    #define ARENA(wname) do { \
+        if (build_packed(sm, (wname), &ats[ari].pt)) { \
+            char eb_[128]; snprintf(eb_, sizeof eb_, "sp_model_to_diffusion_gemma: bad weight %s", (wname)); \
+            sp_set_error(eb_); goto faildg; } \
+        snprintf(ats[ari].name, sizeof ats[ari].name, "%s", (wname)); ari++; \
+    } while (0)
+
+    embd_syn = si; SYNTH_NAME(si, "token_embd.weight"); si++; ARENA("token_embd.weight");
+    out_syn = embd_syn;
+    if (has_output_w) { out_syn = si; SYNTH_NAME(si, "output.weight"); si++; ARENA("output.weight"); }
+
+    /* model-global self-conditioning block (arena gate/up/down + an F32 pre-norm) */
+    if (has_selfcond) {
+        scp_syn = si; SYNTH_NAME(si, "self_cond_pre_norm.weight"); si++;
+        if (copy_norm(sm, "self_cond_pre_norm.weight", &nbuf[ni])) { sp_set_error("sp_model_to_diffusion_gemma: bad self_cond_pre_norm"); goto faildg; }
+        nsrc[ni] = &synth[scp_syn]; ni++;
+        scg_syn = si; SYNTH_NAME(si, "self_cond_gate.weight"); si++; ARENA("self_cond_gate.weight");
+        scu_syn = si; SYNTH_NAME(si, "self_cond_up.weight");   si++; ARENA("self_cond_up.weight");
+        scd_syn = si; SYNTH_NAME(si, "self_cond_down.weight"); si++; ARENA("self_cond_down.weight");
+    }
+    if (has_rfreq) {
+        rf_syn = si; SYNTH_NAME(si, "rope_freqs.weight"); si++;
+        if (copy_norm(sm, "rope_freqs.weight", &nbuf[ni])) { sp_set_error("sp_model_to_diffusion_gemma: bad rope_freqs"); goto faildg; }
+        nsrc[ni] = &synth[rf_syn]; ni++;
+    }
+
+    for (uint32_t L = 0; L < NL; L++) {
+        qwen3_layer *ly = &layers[L];
+        #define MM(field, suffix) do { \
+            snprintf(nm, sizeof nm, "blk.%u." suffix, L); \
+            SYNTH_NAME(si, nm); ly->field = &synth[si]; si++; ARENA(nm); \
+        } while (0)
+        #define NORM(field, suffix) do { \
+            snprintf(nm, sizeof nm, "blk.%u." suffix, L); \
+            SYNTH_NAME(si, nm); ly->field = &synth[si]; \
+            if (copy_norm(sm, nm, &nbuf[ni])) { sp_set_error("sp_model_to_diffusion_gemma: bad norm " suffix); goto faildg; } \
+            nsrc[ni] = &synth[si]; si++; ni++; \
+        } while (0)
+
+        /* attention (gemma4 backbone; V-less global layers omit attn_v) */
+        NORM(attn_norm,      "attn_norm.weight");
+        MM  (attn_q,         "attn_q.weight");
+        MM  (attn_k,         "attn_k.weight");
+        snprintf(nm, sizeof nm, "blk.%u.attn_v.weight", L);
+        if (sp_model_find_tensor(sm, nm)) MM(attn_v, "attn_v.weight");   /* else ly->attn_v stays NULL */
+        MM  (attn_output,    "attn_output.weight");
+        NORM(attn_q_norm,    "attn_q_norm.weight");
+        NORM(attn_k_norm,    "attn_k_norm.weight");
+        NORM(post_attn_norm, "post_attention_norm.weight");
+
+        /* dense shared MLP */
+        NORM(ffn_norm,       "ffn_norm.weight");
+        MM  (ffn_gate,       "ffn_gate.weight");
+        MM  (ffn_up,         "ffn_up.weight");
+        MM  (ffn_down,       "ffn_down.weight");
+        NORM(post_ffw_norm,  "post_ffw_norm.weight");
+
+        /* MoE FFN: F32 router + scale sidecars (read via sp_as_f32) + FUSED rank-3
+         * gate|up experts + rank-3 down experts + per-expert down scale */
+        NORM(ffn_gate_inp,        "ffn_gate_inp.weight");
+        NORM(ffn_gate_inp_scale,  "ffn_gate_inp.scale");
+        MM  (ffn_gate_up_exps,    "ffn_gate_up_exps.weight");
+        MM  (ffn_down_exps,       "ffn_down_exps.weight");
+        NORM(ffn_down_exps_scale, "ffn_down_exps.scale");
+
+        /* MoE sandwich norms + the per-layer encoder output scalar */
+        NORM(pre_ffw_norm_2,  "pre_ffw_norm_2.weight");
+        NORM(post_ffw_norm_1, "post_ffw_norm_1.weight");
+        NORM(post_ffw_norm_2, "post_ffw_norm_2.weight");
+        NORM(out_scale,       "layer_output_scale.weight");
+        NORM(enc_out_scale,   "enc_layer_output_scale.weight");
+        #undef MM
+        #undef NORM
+    }
+
+    onorm_syn = si; SYNTH_NAME(si, "output_norm.weight"); si++;
+    if (copy_norm(sm, "output_norm.weight", &nbuf[ni])) { sp_set_error("sp_model_to_diffusion_gemma: bad output_norm"); goto faildg; }
+    nsrc[ni] = &synth[onorm_syn]; ni++;
+    #undef SYNTH_NAME
+    #undef ARENA
+
+    {
+        int arena_prec = (ari > 0 && ats[0].pt.rows > 0 && ats[0].pt.row_prec[0] == 4u) ? 4 : 8;
+        arena = sp_arena_from_packed(ats, ari, arena_prec);
+    }
+    if (!arena) { sp_set_error("sp_model_to_diffusion_gemma: arena adoption failed"); goto faildg; }
+    free(ats); ats = NULL; ari = 0;
+
+    qm = (qwen3_model *)calloc(1, sizeof(*qm));
+    if (!qm) { sp_set_error("sp_model_to_diffusion_gemma: out of memory (model)"); sp_arena_free(arena); arena = NULL; goto faildg; }
+
+    qwen3_config *c = &qm->cfg;
+    c->arch           = SP_ARCH_DIFFUSION_GEMMA;
+    c->n_layers       = NL;
+    c->n_embd         = ai.hidden_dim;
+    c->n_ff           = n_ff;
+    c->n_head         = ai.n_heads;      /* GLOBAL geometry */
+    c->n_head_kv      = ai.n_kv_heads;
+    c->head_dim       = ai.head_dim;
+    c->n_vocab        = ai.vocab_size;
+    c->context_length = ai.max_context;
+    c->sliding_window = ai.swa_window;
+    c->rope_freq_base = ai.rope_freq_base;
+    c->rms_eps        = (ai.rms_eps != 0.0f) ? ai.rms_eps : 1e-6f;
+    c->has_qk_norm    = 1;
+    c->tied_embedding = has_output_w ? 0 : 1;
+    /* gemma4 backbone extras */
+    c->g4_hd_swa           = ai.g4_hd_swa;
+    c->g4_nh_swa           = ai.g4_nh_swa;
+    c->g4_nkv_swa          = ai.g4_nkv_swa;
+    c->g4_rope_base_swa    = ai.g4_rope_base_swa;
+    c->g4_n_embd_per_layer = 0u;         /* DiffusionGemma: NO AltUp/PLE */
+    c->g4_n_kv_from_start  = ai.g4_n_kv_from_start ? ai.g4_n_kv_from_start : NL;
+    c->g4_logit_softcap    = ai.g4_logit_softcap;
+    c->g4_swa_period       = ai.g4_swa_period ? ai.g4_swa_period : 6u;
+    /* MoE expert counts (reused q36_* fields) + the diffusion canvas split */
+    c->q36_n_expert      = ai.q36_n_expert;
+    c->q36_n_expert_used = ai.q36_n_expert_used;
+    c->q36_n_ff_exp      = ai.q36_n_ff_exp;
+    c->dg_canvas_length  = ai.dg_canvas_length;
+
+    qm->gguf          = NULL;
+    qm->layers        = layers;
+    qm->synth_tensors = synth;
+    qm->arena         = arena;
+    qm->released      = 1;
+    qm->norm_src      = nsrc;
+    qm->norm_buf      = nbuf;
+    qm->n_norm        = ni;
+    qm->token_embd    = &synth[embd_syn];
+    qm->output_norm   = &synth[onorm_syn];
+    qm->output        = has_output_w ? &synth[out_syn] : qm->token_embd;
+    if (has_rfreq)    qm->rope_freqs = &synth[rf_syn];
+    if (has_selfcond) {
+        qm->self_cond_pre_norm = &synth[scp_syn];
+        qm->self_cond_gate     = &synth[scg_syn];
+        qm->self_cond_up       = &synth[scu_syn];
+        qm->self_cond_down     = &synth[scd_syn];
+    }
+    return qm;
+
+faildg:
+    if (ats) { for (int i = 0; i < ari; i++) sp_frob_packed_free(&ats[i].pt); }
+    for (int i = 0; i < ni; i++) free(nbuf[i]);
+    free(ats); free(nsrc); free(nbuf); free(layers); free(synth);
+    return NULL;
+}
