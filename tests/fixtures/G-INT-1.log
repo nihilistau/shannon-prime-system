@@ -1,0 +1,44 @@
+=== G-INT-1 : NIGHTSHIFT episode K  spinor -> Ring-2 -> reload ===
+episode dir      : D:\F\shannon-prime-repos\shannon-prime-system-engine\_needle_corpus_div\eps\ep_n_div_000
+ring2 dir        : C:\Users\Knack\AppData\Local\Temp\g_int_1_ring2
+ep.k bytes       : 7569408  (f32=1892352, NL=48 HD=512)
+p_total (floor)  : 77
+npos             : 22
+n_global (L%6==5): 8
+gk vectors       : 176  ([ng=8][npos=22][HD=512])
+blocks / vector  : 10  (sp_spinor_blocks_for(512))
+packed block     : 63 bytes
+--- (a) STORAGE byte-exact ---
+storage diffs    : 0   (read-vs-written memcmp; MUST be 0)
+unpack diffs     : 0   (unpack(pack(b))!=b; MUST be 0)
+--- (b) COMPRESSION C2-index survival ---
+sig Hamming      : 1 / 256   (MUST be 0)
+sig_orig         : 82848556cc315f61575d8cdce45595595c4e51729f4b1362d668925fffa97fd6
+sig_recon        : 82848576cc315f61575d8cdce45595595c4e51729f4b1362d668925fffa97fd6
+--- honest compression cost ---
+mean recon relL2 : 7.232510e-03   (per-vector lossy cost)
+f32 store bytes  : 360448
+spinor store     : 110880 bytes
+shrink (f32/spin): 3.2508x
+=== VERDICT : HONEST NEGATIVE ===
+
+--- DIAGNOSIS (honest negative) ---
+flipped bit      : 229  (sig_orig nibble ..8556.. -> sig_recon ..8576..)
+bit 229 mean_orig: -3.317493e-05   (mean of R[229].K over all 176 (layer,pos) vectors)
+bit 229 mean_recn: +7.403223e-04   (after int8 spinor round-trip)
+|mean_orig| rank : 2nd-SMALLEST of 256 rows; smallest five |mean| =
+                   3.125e-05  3.317e-05  5.263e-04  6.487e-04  1.446e-03
+ROOT CAUSE       : the int8 quantization noise (relL2 7.2e-3) is far below the
+                   margin of every projection row EXCEPT the ~2 whose mean sits
+                   within ~3e-5 of zero. Bit 229's mean is a razor-thin near-zero
+                   sign crossing; the recon flips it. All 255 other bits survive.
+CONCLUSION       : STORAGE round-trip is byte-EXACT (0 diffs) and the spinor
+                   compression is near-lossless (relL2 0.7%, 3.25x shrink), but
+                   the C2 sign-projection index is NOT robust to int8 quantization
+                   when a projection mean is near zero. Per CONTRACT-PPT-ARM-LAT-
+                   INTEGRATION the Ring-2 index must use a sign-robust / higher-
+                   precision representation (e.g. store the f32 projection mean,
+                   or a per-row dead-zone, rather than re-deriving the sign from
+                   the int8-decoded K). The persistence SUBSTRATE is proven; the
+                   index-over-spinor is the convicted lever.
+DETERMINISM      : run-to-run bit-identical (sandbox gcc 11.4 == Windows MinGW).
