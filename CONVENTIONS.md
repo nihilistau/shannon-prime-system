@@ -1,3 +1,16 @@
+---
+type: convention
+title: shannon-prime-system — module conventions
+description: Read this before adding a Phase-1 module.
+tags: [convention]
+timestamp: 2026-06-06T08:11:43Z
+resource: ./CONVENTIONS.md
+sp_status: ACTIVE
+sp_gate: none
+sp_commit: TBD
+sp_repro: none
+---
+
 # shannon-prime-system — module conventions
 
 Read this before adding a Phase-1 module. Every `core/<module>/` looks the
