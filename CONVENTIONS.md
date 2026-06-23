@@ -3,11 +3,11 @@ type: convention
 title: shannon-prime-system — module conventions
 description: Read this before adding a Phase-1 module.
 tags: [convention]
-timestamp: 2026-06-06T08:11:43Z
+timestamp: 2026-06-24T00:00:00Z
 resource: ./CONVENTIONS.md
 sp_status: ACTIVE
 sp_gate: none
-sp_commit: TBD
+sp_commit: 2d7376d
 sp_repro: none
 ---
 
@@ -42,6 +42,38 @@ A module agent for module `<m>` may create/edit ONLY:
 `core/<other>/` directory or `include/sp/<other>*.h`. The root CMake already
 references every module behind an `EXISTS` guard — you do not register
 yourself anywhere.
+
+## Public headers + the frozen L1 ABI (append-only)
+
+The L1 ABI in `include/sp/sp_l1.h` is **frozen** (tag
+`lat-phase2-contract-frozen`). When a module adds a public verb, **grow it
+append-only** — never renumber an existing value or surface, append fields in
+reserved tails, and a calloc-zero (unregistered) session must stay
+byte-compatible with every existing consumer. Two current exemplars to copy:
+
+- **`include/sp/sp_l1.h` §6b — `sp_session_register_kvdecode_backend`** (commit
+  `d9d96f3`): the additive persistent-KV decode verb (`sp_kvdecode_dispatch_fn`
+  = open / prefill / decode_step / rewind / position / close). Registered here
+  but engine-resident — the engine's CUDA `gemma4_kv_decode_logits` registers
+  against it so the daemon drives the 12B token-by-token. §6 (the full-forward
+  hook) is untouched; no frozen surface renumbered.
+- **`include/sp/exact_islands.h` — the 4 exact-integer nonlinear islands** (commit
+  `c9d94ab`): RMSNorm / softmax / GELU / RoPE as exact-integer references (RoPE
+  via deterministic fixed-point CORDIC, **no libm**), gate `T_EXACT_ISLANDS`. The
+  math-core anchor for the engine's default-off `SP_BYTEEXACT` byte-exact forward
+  (engine gate `G-BYTEEXACT-FORWARD-12B` GREEN: off PPL 4.6665 byte-identical /
+  on 4.6569 parity / run-to-run bit-identical). Byte-exact = exact-integer
+  arithmetic / cross-machine determinism (the **auditability** axis), **not**
+  compression.
+
+A host-side rider on this substrate needs **no** ABI change at all: the live
+`W_c` autonomous recall selector over `core/arm/`'s two-ring memory lives entirely
+in the engine daemon (engine commit `edc8079`; gate `G-CHAT-B3-WC-DIV2` 360/361
+recall + 50/50 foreign-reject, int16==f32) — **no frozen-ABI change, no
+`.sp-model` format change.** The recall-relevance problem the ARM contract posed
+is solved by a learned selector on a diverse corpus, not a hand-designed
+number-theoretic signal (boundary thesis: `O_K` wins on exact arithmetic, the
+container; every structure-on-content lever is a measured honest-negative).
 
 Module agents do **not** run git. Integration commits are done by the
 coordinator after the module's tests are green.
