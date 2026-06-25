@@ -1,5 +1,7 @@
 # CLAUDE.md — shannon-prime-system (the math core)
 
+> ★ **CURRENT STATE — KEYSTONE (tag `keystone-1`, 2026-06-25).** Canonical map: **`shannon-prime-lattice/papers/PPT-LAT-KEYSTONE.md`** + **`PPT-LAT-KEYSTONE-API.md`**. This core's place: O_K substrate, dual-prime NTT-CRT, `core/exact_islands/`, ARM two-ring, the frozen L1 ABI (`include/sp/sp_l1.h` §6/§6b). FIVE repos now (added **shannon-prime-harness**). Read the foundation doc before trusting the "Current edge" notes below (session history).
+
 **This is Shannon-Prime's math core. The canonical session bootstrap is `D:\F\shannon-prime-repos\shannon-prime-lattice\prompt.md` — read it first** (project, current state, methodology, machine, doc map, operator). This file is the short version + this repo's specifics.
 
 **Repo role:** the clean math core, no engine deps. Key surfaces:
