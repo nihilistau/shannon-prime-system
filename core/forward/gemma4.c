@@ -56,7 +56,8 @@ static void g4_rmsnorm_noweight(float *v, int d, float eps) {
     for (int i = 0; i < d; i++) v[i] *= inv;
 }
 
-int gemma4_forward(const qwen3_model *m, const int32_t *tokens, int n_tok, float *logits) {
+static int gemma4_forward_impl(const qwen3_model *m, const int32_t *tokens, int n_tok,
+                               float *logits, float *feat_out) {
     const qwen3_config *c = &m->cfg;
     const int   E  = (int)c->n_embd, FF = (int)c->n_ff, V = (int)c->n_vocab;
     const int   NL = (int)c->n_layers;
@@ -260,6 +261,10 @@ int gemma4_forward(const qwen3_model *m, const int32_t *tokens, int n_tok, float
         for (size_t i = 0; i < (size_t)n_tok * V; i++)
             logits[i] = tanhf(logits[i] / softcap) * softcap;
 
+    /* EAGLE/MTP feature tap (step 2b): nx is the post-output_norm hidden that produced
+     * `logits` (the LM head consumes it). Copy it out byte-identically when requested. */
+    if (feat_out) memcpy(feat_out, nx, (size_t)n_tok * (size_t)E * sizeof(float));
+
     rc = 0;
 done:
     free(x); free(nx); free(q); free(ao); free(ap); free(g); free(up); free(dn); free(sc);
@@ -267,6 +272,22 @@ done:
     if (Vst) { for (int L = 0; L < NL; L++) free(Vst[L]); free(Vst); }
     free(ipl); free(pgate); free(pproj); free(ple);
     return rc;
+}
+
+/* Public entry: standard forward (logits only). */
+int gemma4_forward(const qwen3_model *m, const int32_t *tokens, int n_tok, float *logits) {
+    return gemma4_forward_impl(m, tokens, n_tok, logits, NULL);
+}
+
+/* EAGLE/MTP FEATURE TAP (step 2b): standard forward PLUS the post-output_norm hidden
+ * (the "feature" the LM head consumes = embedding_length_out) for every token. The
+ * gemma4-assistant draft seeds inp_h from the LAST token's row (feat_out + (n_tok-1)*E).
+ * feat_out must hold n_tok * hidden_dim floats; NULL == gemma4_forward. The copied buffer
+ * is byte-identical to the nx that produced `logits` => feature<->logits consistent by
+ * construction (one compute path, no divergence). */
+int gemma4_forward_feat(const qwen3_model *m, const int32_t *tokens, int n_tok,
+                        float *logits, float *feat_out) {
+    return gemma4_forward_impl(m, tokens, n_tok, logits, feat_out);
 }
 
 /* NTT.5c-style backend-aware wrapper. Gemma4 has no NTT-attention overlay yet
