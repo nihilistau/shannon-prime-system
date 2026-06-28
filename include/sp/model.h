@@ -219,6 +219,13 @@ int gemma3_forward(const qwen3_model *m, const int32_t *tokens, int n_tokens,
 int gemma4_forward(const qwen3_model *m, const int32_t *tokens, int n_tokens,
                    float *logits);
 
+/* EAGLE/MTP feature tap (step 2b): as gemma4_forward, but also writes the
+ * post-output_norm hidden (feature the LM head consumes, = embedding_length_out)
+ * for every token into feat_out (n_tokens * hidden_dim floats). The gemma4-assistant
+ * draft seeds inp_h from the last token's row. Byte-identical to the nx feeding logits. */
+int gemma4_forward_feat(const qwen3_model *m, const int32_t *tokens, int n_tokens,
+                        float *logits, float *feat_out);
+
 /* Qwen2.5 f32 reference forward pass (prefill, causal). Same logits layout/return
  * as qwen3_forward. Requires a model loaded with arch == SP_ARCH_QWEN25. Deltas
  * vs Qwen3: no embedding scale, no QK norms, QKV biases added after projection,
