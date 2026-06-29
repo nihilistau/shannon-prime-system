@@ -226,6 +226,20 @@ int gemma4_forward(const qwen3_model *m, const int32_t *tokens, int n_tokens,
 int gemma4_forward_feat(const qwen3_model *m, const int32_t *tokens, int n_tokens,
                         float *logits, float *feat_out);
 
+/* EAGLE/MTP KV tap (serving piece 1): the gemma4-assistant draft owns no K/V and
+ * attends the TARGET's stored KV for the trunk's last full layer (n_layers-1) and
+ * last SWA layer (n_layers-2) (llama.cpp PR #23398). gemma4_forward_kvtap runs the
+ * normal forward and additionally copies out the post-RoPE K and V (resolving the
+ * shared-KV indirection) for those two layers, all positions. The callee malloc's the
+ * four buffers and fills the sizes; the CALLER frees k_full/v_full/k_swa/v_swa. */
+typedef struct {
+    float *k_full, *v_full;          /* layer n_layers-1 (full): [n_pos * kvd_full] */
+    float *k_swa,  *v_swa;           /* layer n_layers-2 (SWA):  [n_pos * kvd_swa]  */
+    int    kvd_full, kvd_swa, n_pos; /* kvd = n_kv_heads(layer) * head_dim(layer)   */
+} g4_kv_tap;
+int gemma4_forward_kvtap(const qwen3_model *m, const int32_t *tokens, int n_tokens,
+                         float *logits, float *feat_out, g4_kv_tap *kv);
+
 /* Qwen2.5 f32 reference forward pass (prefill, causal). Same logits layout/return
  * as qwen3_forward. Requires a model loaded with arch == SP_ARCH_QWEN25. Deltas
  * vs Qwen3: no embedding scale, no QK norms, QKV biases added after projection,
