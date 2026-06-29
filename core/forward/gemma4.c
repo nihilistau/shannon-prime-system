@@ -57,7 +57,7 @@ static void g4_rmsnorm_noweight(float *v, int d, float eps) {
 }
 
 static int gemma4_forward_impl(const qwen3_model *m, const int32_t *tokens, int n_tok,
-                               float *logits, float *feat_out) {
+                               float *logits, float *feat_out, g4_kv_tap *kv) {
     const qwen3_config *c = &m->cfg;
     const int   E  = (int)c->n_embd, FF = (int)c->n_ff, V = (int)c->n_vocab;
     const int   NL = (int)c->n_layers;
@@ -104,6 +104,10 @@ static int gemma4_forward_impl(const qwen3_model *m, const int32_t *tokens, int 
     float  *sc  = (float *)malloc((size_t)n_tok       * sizeof(float));
     float **Kst = (float **)calloc((size_t)NL, sizeof(float *)); /* per-owner K (shared idx stay NULL) */
     float **Vst = (float **)calloc((size_t)NL, sizeof(float *));
+    /* EAGLE/MTP KV-tap (serving piece 1): capture the actual Kuse/Vuse for the trunk's
+     * last full (NL-1) and last SWA (NL-2) layers during the layer loop; copied out below. */
+    float *cap_kf = NULL, *cap_vf = NULL, *cap_ks = NULL, *cap_vs = NULL;
+    int    cap_kvdf = 0, cap_kvds = 0;
     /* AltUp scratch */
     float  *ipl   = PL ? (float *)malloc((size_t)n_tok * NL * PL * sizeof(float)) : NULL;
     float  *pgate = PL ? (float *)malloc((size_t)n_tok * PL * sizeof(float)) : NULL;
@@ -205,6 +209,11 @@ static int gemma4_forward_impl(const qwen3_model *m, const int32_t *tokens, int 
             if (!Kuse || !Vuse) goto done;
         }
 
+        if (kv) {   /* EAGLE/MTP KV-tap: grab the actual KV the last full/SWA layers attend */
+            if (L == NL - 1) { cap_kf = Kuse; cap_vf = Vuse; cap_kvdf = kvd; }
+            if (L == NL - 2) { cap_ks = Kuse; cap_vs = Vuse; cap_kvds = kvd; }
+        }
+
         for (int t = 0; t < n_tok; t++)
             for (int h = 0; h < nh; h++)
                 sp_attn_head(q + (size_t)t * qd + (size_t)h * hd, Kuse, Vuse, t, kvd,
@@ -265,6 +274,17 @@ static int gemma4_forward_impl(const qwen3_model *m, const int32_t *tokens, int 
      * `logits` (the LM head consumes it). Copy it out byte-identically when requested. */
     if (feat_out) memcpy(feat_out, nx, (size_t)n_tok * (size_t)E * sizeof(float));
 
+    if (kv) {   /* copy the captured target KV out BEFORE the Kst/Vst free at done: */
+        kv->n_pos = n_tok; kv->kvd_full = cap_kvdf; kv->kvd_swa = cap_kvds;
+        size_t bf = (size_t)n_tok * (size_t)cap_kvdf, bs = (size_t)n_tok * (size_t)cap_kvds;
+        kv->k_full = (float *)malloc(bf * sizeof(float)); kv->v_full = (float *)malloc(bf * sizeof(float));
+        kv->k_swa  = (float *)malloc(bs * sizeof(float)); kv->v_swa  = (float *)malloc(bs * sizeof(float));
+        if (cap_kf && kv->k_full) memcpy(kv->k_full, cap_kf, bf * sizeof(float));
+        if (cap_vf && kv->v_full) memcpy(kv->v_full, cap_vf, bf * sizeof(float));
+        if (cap_ks && kv->k_swa)  memcpy(kv->k_swa,  cap_ks, bs * sizeof(float));
+        if (cap_vs && kv->v_swa)  memcpy(kv->v_swa,  cap_vs, bs * sizeof(float));
+    }
+
     rc = 0;
 done:
     free(x); free(nx); free(q); free(ao); free(ap); free(g); free(up); free(dn); free(sc);
@@ -276,7 +296,7 @@ done:
 
 /* Public entry: standard forward (logits only). */
 int gemma4_forward(const qwen3_model *m, const int32_t *tokens, int n_tok, float *logits) {
-    return gemma4_forward_impl(m, tokens, n_tok, logits, NULL);
+    return gemma4_forward_impl(m, tokens, n_tok, logits, NULL, NULL);
 }
 
 /* EAGLE/MTP FEATURE TAP (step 2b): standard forward PLUS the post-output_norm hidden
@@ -287,7 +307,14 @@ int gemma4_forward(const qwen3_model *m, const int32_t *tokens, int n_tok, float
  * construction (one compute path, no divergence). */
 int gemma4_forward_feat(const qwen3_model *m, const int32_t *tokens, int n_tok,
                         float *logits, float *feat_out) {
-    return gemma4_forward_impl(m, tokens, n_tok, logits, feat_out);
+    return gemma4_forward_impl(m, tokens, n_tok, logits, feat_out, NULL);
+}
+
+/* EAGLE/MTP KV tap (serving piece 1): forward + feature + the target KV (last full /
+ * last SWA layer) the draft attends. Callee malloc's kv->{k,v}_{full,swa}; caller frees. */
+int gemma4_forward_kvtap(const qwen3_model *m, const int32_t *tokens, int n_tok,
+                         float *logits, float *feat_out, g4_kv_tap *kv) {
+    return gemma4_forward_impl(m, tokens, n_tok, logits, feat_out, kv);
 }
 
 /* NTT.5c-style backend-aware wrapper. Gemma4 has no NTT-attention overlay yet
