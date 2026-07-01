@@ -1,0 +1,45 @@
+G-KSTE-SIEVE-REVERIFY — fresh re-gate of the KSTE encoder + Friedman/PoUW sieve CPU primitives
+date: 2026-07-01
+repo: shannon-prime-system @ 15698b0 (main)
+toolchain: gcc 11.4.0 (Ubuntu), -O2 -std=c11 -Wall  (portable CPU C; no CUDA/Hexagon/clang-cl needed)
+why: STATE line 69 tagged "KSTE encoder + Friedman sieve | E_CPU_6 | [PROVEN]" but the reference
+     was stale (dated E_CPU_6) and the fancier sieve application numbers (720x speedup, 93.86%
+     eviction, T4_RES_PROBE AUC) had NO on-disk receipt. This re-gate proves the CORE PRIMITIVES
+     build clean and pass on the metal today; it does NOT reproduce those application-perf numbers
+     (still paper-claimed in the archived Paper III sec 11.6 — separate probes, logs not found).
+
+REPRO (from repo root):
+  S=.   # shannon-prime-system
+  gcc -O2 -std=c11 -Wall -I"$S/include" \
+      "$S/core/kste/kste_encode.c" "$S/core/kste/kste_dominance.c" "$S/core/kste/kste_test.c" \
+      -o kste_test -lm && ./kste_test
+  gcc -O2 -std=c11 -Wall -I"$S/include" \
+      "$S/core/sieve/sp_sieve.c" "$S/core/kste/kste_encode.c" "$S/core/kste/kste_dominance.c" \
+      "$S/core/io_hash/sp_hash.c" "$S/core/sieve/sieve_test.c" \
+      -o sieve_test -lm && ./sieve_test
+
+BUILD: T_KSTE rc=0 ; T_SIEVE rc=0  (both compiled clean, no warnings surfaced)
+
+############ RUN T_KSTE ############
+[T_KSTE_1] PASS
+[T_KSTE_2] PASS
+[T_KSTE_3] PASS
+[T_KSTE_4] PASS
+[T_KSTE_5] PASS
+---- checks=22 fails=0 ----
+KSTE exit=0
+
+############ RUN T_SIEVE ############
+[T_POUW_1] PASS
+[T_POUW_2] PASS
+[T_POUW_3] PASS
+[T_POUW_4] PASS
+[T_POUW_5] PASS
+[T_POUW_6] PASS
+---- checks=37 fails=0 ----
+SIEVE exit=0
+
+VERDICT: GREEN — KSTE encoder (5 cases / 22 checks) + Friedman-sieve/PoUW dominance
+(6 cases / 37 checks) build clean and pass, fresh @ 15698b0 on 2026-07-01.
+SCOPE (honest): confirms encoder correctness + dominance/Pareto-frontier + PoUW-sieve invariants.
+Does NOT re-measure eviction-rate / wall-time speedup / T4_RES_PROBE AUC (paper-claimed only).
