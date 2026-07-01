@@ -1,0 +1,48 @@
+G-REP-LAYER-L5 — the input-representation sweep: layer-5 selection cracks the paraphrase wall
+date: 2026-07-01
+repo: shannon-prime-system @ 15698b0 ; harnesses tests/{rep_sweep.py, rep_layer.py, kste_md_confirm.c, rep_hybrid.py}
+data: real gemma-4-12B captures — 61 exact-query + 61 paraphrase-query last-token global-Q [8,16,512],
+      61 episode global-K [8,10,512] (engine _faithful_corpus/qdump[_para]); facts.json (61 conflicts).
+premise (operator): the encoder amplifies input separability -> find the representation that separates
+      facts, then change the pipeline to feed THAT. "The tradeoff is easy."
+
+REPRO:
+  python tests/rep_sweep.py  <eng>/_faithful_corpus/qdump <eng>/_faithful_corpus/qdump_para
+  python tests/rep_layer.py  <eng>/_faithful_corpus/qdump <eng>/_faithful_corpus/qdump_para
+  gcc -O2 -std=c11 -Iinclude tests/kste_md_confirm.c core/kste_md/kste_md.c -o kc -lm
+  ./kc /tmp/spgate/L_exact.i32 /tmp/spgate/L_para.i32
+  python tests/rep_hybrid.py <eng>/_faithful_corpus/qdump <eng>/_faithful_corpus/qdump_para <eng>/_faithful_corpus/facts.json
+
+FINDING 1 — the signal is LAYER-LOCALIZED (per-layer exact->paraphrase recall@1, mean over heads):
+  L0 1.6%  L1 1.6%  L2 4.9%  L3 6.6%  L4 19.7%  L5 85.2%  L6 78.7%  L7 8.2%
+  -> global layer 5 = 85.2% (gap +0.086); the ALL-LAYER average dilutes to 11.5%. Greedy subset picks
+     L5 ALONE (extra layers add noise). The LN-1 "last-token global-Q is content-poor" conclusion was
+     HALF WRONG: content is present but concentrated in L5-6; averaging destroyed it.
+
+FINDING 2 — KSTE-MD is the WRONG tool for this signal (directional, not magnitude-shape):
+  on the L5 representation: cosine recall 85.2% vs KSTE-MD (sig L1) 3.3%, would-dedup ratio 1.43x.
+  The L5 fact signal is DIRECTIONAL/angular (cosine sees it); KSTE-MD reads magnitude-profile shape
+  (orthogonal geometry) -> blind to it. KSTE-MD was the catalyst that prompted the sweep, not the fix.
+
+FINDING 3 — Q-vs-K cosine is floor at every layer (E2b all 1.6%): query and key are different subspaces;
+  matching across them needs the learned W_c projection / attention, not cosine. The 85% is QUERY-space
+  (exact-query vs paraphrase-query), i.e. query-to-query fact clustering.
+
+FINDING 4 (DEPLOYABLE) — L5 query-key recall on the real 61 fact-conflicts (incoming -> its fact):
+                     Jaccard(deployed)   L5-cosine   naive z-sum hybrid
+    EXACT incoming        100.0%           100.0%          100.0%
+    PARA  incoming          8.2%            88.5%           49.2%
+  L5-cosine alone = 100% exact / 88.5% paraphrase, dominating Jaccard (100%/8.2%). The naive z-sum
+  hybrid is WORSE than L5 alone (blending near-random Jaccard paraphrase scores dilutes L5) -> combine
+  by GATE/max, not sum.
+
+VERDICT: GREEN, and it CORRECTS a major prior conclusion. The deployable method change: use the
+global-layer-5 (mean-over-heads, 512-d) query embedding as the recall key, matched by cosine
+(query-to-query). This cracks the faithfulness paraphrase wall (8% -> 88.5%) with data ALREADY in the
+capture (read_global_q emits all 8 global layers; the selector just indexes L5). KSTE-MD stays a
+magnitude-shape dedup primitive; it is NOT the recall tool.
+
+HONEST SCOPE: n=61 (small); 88.5% needs a scale confirm. L5 index is within the captured 8 global
+layers (period-6 set); confirm the live read_global_q layer ordering matches offline index 5 before
+wiring. Q->K still needs a learned projection (W_c fed L5) if matching against stored K rather than
+stored L5 query-keys.
