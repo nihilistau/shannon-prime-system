@@ -1,0 +1,37 @@
+G-KSTE-MD-REALDATA — does the v2 encoder's 37.6x synthetic win transfer to REAL model vectors?
+date: 2026-07-01
+repo: shannon-prime-system @ 15698b0 ; harness tests/kste_md_realdata.c (fresh, anti-contamination)
+data: real gemma-4-12B captures — 61 exact-query global-Q + 61 paraphrase-query global-Q (65536 floats each),
+      from the faithfulness episodes (engine _faithful_corpus/qdump + qdump_para). Same data as LN-1.
+toolchain: gcc 11.4.0 -O2 -std=c11
+
+REPRO:
+  gcc -O2 -std=c11 -Wall -Iinclude tests/kste_md_realdata.c core/kste_md/kste_md.c \
+      core/kste/kste_encode.c core/kste/kste_dominance.c -o rd -lm
+  ./rd <engine>/_faithful_corpus/qdump <engine>/_faithful_corpus/qdump_para
+
+RESULT:
+  RECALL@1 (exact query i -> its own paraphrase i, over 61 candidates):
+    raw cosine  : 7/61 = 11.5%
+    KSTE-MD (v2): 1/61 = 1.6%   (== random floor 1.6%)
+  cosine separation: same-fact mean=0.8723  diff-fact mean=0.8344  gap=0.0379
+  KSTE-MD would-dedup ratio: intra 0.131 / inter 0.131 = 1.00x
+  KSTE v1  would-dedup ratio: intra 0.869 / inter 0.843 = 1.03x
+
+VERDICT: HONEST NEGATIVE (the win is INPUT-GATED, not universal).
+  The synthetic 37.6x (G-KSTE-MD, well-separated Gaussian clusters) does NOT transfer to real
+  last-token global-Q. Ratio collapses to 1.00x; recall@1 = random floor. ROOT CAUSE is the DATA:
+  the raw cosine gap between same-fact and different-fact global-Q is only 0.038 (0.872 vs 0.834) —
+  the vectors are nearly indistinguishable, so even the dense gold-standard (cosine) is near-floor
+  (11.5%). KSTE-MD faithfully amplifies whatever separability the input HAS; last-token global-Q has
+  almost none. This re-confirms the LN-1 finding with an independent method: the input representation
+  is the wall, not the selector.
+
+CONSEQUENCE (where KSTE-MD may/may-not be used):
+  - NOT on the global-Q memory path (recall selection / episodic consolidation / semantic bloom
+    filters keyed on episode global-Q): all inherit this floor. A consolidation wire here runs at 1.00x.
+  - Its discrimination is real ONLY on content-bearing vectors where cosine already separates
+    (e.g. the pooled sentence embedding, TELE-1 retrieval@1=1.000). There it is a cheap, exact-integer,
+    Dickson-bounded discrete dedup KEY (its edge over cosine), not a magic discriminator.
+  - Kept as a proven, gated CPU primitive (G-KSTE-MD + T_KMD). Do NOT claim real-world semantic
+    discrimination on last-token global-Q.
