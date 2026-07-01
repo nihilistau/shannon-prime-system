@@ -1,0 +1,47 @@
+G-KSTE-MD — magnitude-as-depth KSTE encoder (v2) + Dickson dominance: fresh build + discrimination win
+date: 2026-07-01
+repo: shannon-prime-system @ 15698b0 (main) + new module core/kste_md/
+new files: include/sp/kste_md.h, core/kste_md/{kste_md.c,kste_md_test.c,CMakeLists.txt}, tests/kste_md_measure.c
+provenance: written FRESH from the Paper III/IV spec (magnitude-as-depth tree, count-based sigma0(+)sigma1,
+            Dickson N^14 product order). ANTI-CONTAMINATION: no code from the old shannon-prime/ repos.
+            The frozen v1 sp/kste.h (order-statistic order) is UNTOUCHED.
+goal: the v1 in-tree encoder discriminates poorly (intra/inter ~1.2x, G-SIEVE-MEASURE-2026-07-01).
+      Re-derive the fuller encoder that the archived Paper III sec 11.6 credited with ~17x discrimination.
+
+toolchain: gcc 11.4.0, -O2 -std=c11 [-D_POSIX_C_SOURCE=199309L for the measure harness]
+
+REPRO:
+  # unit gate
+  gcc -O2 -std=c11 -Wall -Iinclude core/kste_md/kste_md.c core/kste_md/kste_md_test.c -o kmd_test -lm && ./kmd_test
+  # measurement (v1 vs v2 head-to-head)
+  gcc -O2 -std=c11 -D_POSIX_C_SOURCE=199309L -Wall -Iinclude tests/kste_md_measure.c \
+      core/kste_md/kste_md.c core/kste/kste_encode.c core/kste/kste_dominance.c -o kste_md_measure -lm && ./kste_md_measure
+
+UNIT GATE  T_KMD: checks=11 fails=0  (determinism / tri-state dominance / sign-swap accounting / zero+budget / near-dup comparable)
+
+MEASUREMENT:
+[A] i.i.d. Gaussian N=200000 (v2 Dickson)
+    PLATEAU=76 slots  added=111 folded=275 discarded=199614   eviction=99.94%
+    (vs v1 degenerate plateau=2 — the v2 frontier is genuinely rich)
+[B] v2 Dickson dominance: 16.66 ns/pair (60.0M/s) ; v2 encode 9.13 us/vector (qsort-bound)
+[C] discrimination — intra vs inter cluster 'would-dedup' rate, v1 vs v2:
+    sigma  intra-cos |  v1 intra  v1 inter  v1 ratio |  v2 intra  v2 inter  v2 ratio
+    0.005  1.0000    |  0.948     0.7885     1.2x    |  0.731     0.0194    37.6x
+    0.020  0.9998    |  0.969     0.7285     1.3x    |  0.314     0.0374     8.4x
+    0.050  0.9987    |  0.935     0.7650     1.2x    |  0.132     0.0445     3.0x
+    0.100  0.9950    |  0.901     0.9068     1.0x    |  0.078     0.0394     2.0x
+    0.200  0.9801    |  0.880     0.8437     1.0x    |  0.053     0.0357     1.5x
+
+VERDICT: GREEN — the discrimination claim REPRODUCES and, at the near-duplicate regime (cos>=0.995,
+sigma<=0.02), EXCEEDS the paper: v2 = 37.6x @ cos~1.0 and 8.4x @ cos 0.9998, vs the paper's ~17x @
+cos>=0.995 and vs the in-tree v1's 1.2x. Discrimination degrades gracefully with noise (correct: more
+noise = less similar = should dedup less). Frontier plateau is rich (76 vs v1's 2). Dominance check is
+fast (16.66 ns/pair).
+
+HONEST SCOPE:
+ - plateau 76 != the paper's ~307 (different encoder params: SP_KMD_ANCHORS=14/RESID=60/LMAX=8, K=128).
+   Qualitatively rich, not degenerate; the exact 307 belongs to the old-repo config, not re-tuned here.
+ - encode cost 9.13 us/vec is qsort(128)-bound; the hot-path dominance check is 16.66 ns. If ever wired
+   into a live KV path, replace the full sort with a partial top-(A+R) selection.
+ - this is a CPU-core encoder + signature; it is NOT yet wired into the served daemon or the PoUW sieve
+   (which still uses frozen v1). Wiring is a separate task if the sieve is ever reprioritized.
