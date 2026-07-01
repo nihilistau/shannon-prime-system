@@ -1,0 +1,49 @@
+G-SIEVE-MEASURE — fresh re-derivation of the Friedman-sieve APPLICATION numbers on the CURRENT core
+date: 2026-07-01
+repo: shannon-prime-system @ 15698b0 (main)
+harness: tests/sieve_measure.c  (written from scratch; anti-contamination — no code from old shannon-prime/ repos)
+toolchain: gcc 11.4.0, -O2 -std=c11 -D_POSIX_C_SOURCE=199309L -Wall
+why: archived Paper III sec 11.6 claimed 720x speedup / 93.86% eviction / ~307-slot plateau / 17x
+     discrimination (proven in the anti-contaminate-gated OLD repos, which must NOT be copied).
+     This re-derives those application numbers against the CURRENT in-tree encoder (core/kste v1,
+     fixed 13-node T_{60,3} shape, 6 order-statistic labels, componentwise dominance).
+
+REPRO (from repo root, S=shannon-prime-system):
+  gcc -O2 -std=c11 -D_POSIX_C_SOURCE=199309L -Wall -I"$S/include" "$S/tests/sieve_measure.c" \
+    "$S/core/sieve/sp_sieve.c" "$S/core/kste/kste_encode.c" "$S/core/kste/kste_dominance.c" \
+    "$S/core/io_hash/sp_hash.c" -o sieve_measure -lm && ./sieve_measure
+
+RAW OUTPUT:
+[A] i.i.d. Gaussian stream, N=200000
+    final frontier (PLATEAU) = 2 slots
+    added(novel/incomp)=14  folded(strict-dom)=14  discarded(dominated/equiv)=199972
+    EVICTION RATE (folded+discarded)/N = 99.99%   (kept-as-new = 0.01%)
+    frontier stopped growing (~20k steps no change) around i=36998
+[B] wall-time
+    raw tier0+tier1 dominance: 16.77 ns/pair  (59.6M pairs/s)
+    per-candidate sieve vs frontier=3: mean=0.032 us  p50=0.032 us  p99=0.063 us  (Q=20000)
+    50us-gate: CLEAR (p99 0.063 us)
+[C] discrimination (intra-cluster vs inter-cluster 'would-dedup' rate)
+    sigma=0.005  intra-cos=1.0000  intra-dedup=0.948  inter-dedup=0.7885  ratio=1.2x
+    sigma=0.020  intra-cos=0.9998  intra-dedup=0.969  inter-dedup=0.7285  ratio=1.3x
+    sigma=0.050  intra-cos=0.9987  intra-dedup=0.935  inter-dedup=0.7650  ratio=1.2x
+    sigma=0.100  intra-cos=0.9950  intra-dedup=0.901  inter-dedup=0.9068  ratio=1.0x
+
+VERDICT (split, honest):
+  [A] TERMINATION  = CONFIRMED (Dickson wqo: frontier saturates, sieve terminates) — BUT plateau=2
+      slots, NOT the paper's ~307/512. The current v1 encoder over-collapses i.i.d. input.
+  [B] SPEED        = CONFIRMED and exceeded: 16.77 ns/pair raw dominance; per-candidate p99 0.063us;
+      50us wall-time gate CLEAR by ~800x. (Caveat: the intended vs-4096 frontier could not be built —
+      the encoder collapses to ~2-3 antichain elements — so per-candidate time is vs a ~3-elt frontier;
+      the raw-pair 16.77 ns is the frontier-independent number.)
+  [C] DISCRIMINATION = HONEST NEGATIVE on the current v1 encoder: intra/inter ratio only 1.0-1.3x
+      (vs the paper's 17x). The fixed-13-node, 6-order-statistic, componentwise order is magnitude-
+      dominated -> most pairs comparable (inter-dedup ~0.73-0.91), so same-meaning vs different-meaning
+      is barely separated.
+
+CONCLUSION: the FOUNDATIONAL claims (wqo termination + constant-time dominance + speed) reproduce on
+the current core. The APPLICATION-QUALITY claims (rich ~307 plateau, 17x semantic discrimination) DO
+NOT reproduce on this in-tree "Phase 1" encoder; they were proven on the anti-contaminate-gated old
+repos with the fuller 60-node magnitude-as-depth encoder that is deliberately NOT in these repos.
+To get the paper's discrimination here, the v1 encoder would need the fuller shape re-derived natively
+(a real build task), not a copy.
