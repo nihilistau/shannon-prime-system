@@ -73,26 +73,24 @@ static int expert_mm(const qwen3_model *m, const gguf_tensor *W, int e,
     if (m->arena) {
         const sp_arena_tensor *at = sp_arena_find(m->arena, W->name);
         if (at) {
+            /* brick 5: dequant-FREE row dot (sp_arena_row_dot: unpack-if-Q4 into the
+             * per-thread int8 scratch + SIMD dot + scales) — skips writing the f32
+             * dequant row entirely. */
             int fail = 0;
 #ifdef _OPENMP
 #pragma omp parallel
 #endif
             {
-                float *wrow = (float *)malloc((size_t)in * sizeof(float));
-                if (!wrow) {
+                int8_t *unp = (int8_t *)malloc((size_t)in);
+                if (!unp) {
                     fail = 1;
                 } else {
 #ifdef _OPENMP
 #pragma omp for schedule(dynamic, 8)
 #endif
-                    for (int o = 0; o < out; o++) {
-                        if (fail) continue;
-                        if (sp_frob_packed_dequant_row(&at->pt, e * out + o, wrow)) { fail = 1; continue; }
-                        float acc = 0.0f;
-                        for (int i = 0; i < in; i++) acc += wrow[i] * X[i];
-                        Y[o] = acc;
-                    }
-                    free(wrow);
+                    for (int o = 0; o < out; o++)
+                        Y[o] = sp_arena_row_dot(&at->pt, e * out + o, X, in, unp);
+                    free(unp);
                 }
             }
             return fail;
