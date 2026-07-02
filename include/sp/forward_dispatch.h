@@ -39,6 +39,18 @@ typedef int (*sp_matmul_ext_fn)(void *ctx, const char *wname, const float *X,
                                 int n_tok, int in, int out, float *Y);
 void sp_matmul_register_ext(sp_matmul_ext_fn fn, void *ctx);
 
+/* GPU-2: routed-MoE external hook. Called by moe_ffn AFTER the (never-quantized)
+ * f32 router top-k, keyed by the gate-experts tensor NAME, with the selected
+ * expert indices + renormalized weights; returns 0 = y[] filled with the weighted
+ * routed-expert sum (the CPU routed block is skipped; the shared expert still
+ * runs on CPU), nonzero = not-mine (e.g. layer not resident) -> CPU path runs.
+ * Unregistered = null floor. */
+typedef int (*sp_moe_ext_fn)(void *ctx, const char *gate_name, const int *idx,
+                             const float *wt, int NU, const float *x, int E, int FF,
+                             float *y);
+void sp_moe_register_ext(sp_moe_ext_fn fn, void *ctx);
+sp_moe_ext_fn sp_moe_ext(void **ctx_out);
+
 /* NORTHSTAR brick 5: single-row packed dot (dequant-free). Unpacks a Q4 row into
  * caller scratch `unp` (>= in bytes; untouched for Q8 rows), dots against x, and
  * applies the row/block scales — the MoE expert row loops skip the f32 dequant-row

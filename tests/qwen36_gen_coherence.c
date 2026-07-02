@@ -30,8 +30,19 @@ extern void *sp_q36gpu_new(void);
 extern int   sp_q36gpu_upload(void *h, const char *name, const sp_frob_packed_tensor *pt);
 extern int   sp_q36gpu_matmul(void *h, const char *name, const float *X,
                               int n_tok, int in, int out, float *Y);
+extern int   sp_q36gpu_upload_experts(void *h, const char *tag,
+                                      const sp_frob_packed_tensor *ptg,
+                                      const sp_frob_packed_tensor *ptu,
+                                      const sp_frob_packed_tensor *ptd,
+                                      int NE, int FF, int E);
+extern int   sp_q36gpu_moe(void *h, const char *tag, const int *idx, const float *wt,
+                           int NU, const float *x, int E, int FF, float *y);
 static int q36_gpu_ext(void *ctx, const char *n, const float *X, int nt, int in, int out, float *Y) {
     return sp_q36gpu_matmul(ctx, n, X, nt, in, out, Y);
+}
+static int q36_moe_ext(void *ctx, const char *gate_name, const int *idx, const float *wt,
+                       int NU, const float *x, int E, int FF, float *y) {
+    return sp_q36gpu_moe(ctx, gate_name, idx, wt, NU, x, E, FF, y);
 }
 static int q36_gpu_up(void *h, const qwen3_model *m, const gguf_tensor *W, size_t *bytes) {
     if (!W || !m->arena) return 0;
@@ -88,6 +99,36 @@ int main(int argc, char **argv) {
         if (q36_gpu_up(gh, m, m->output, &bytes)) return 1;
         sp_matmul_register_ext(q36_gpu_ext, gh);
         printf("GPU-1: dense weights resident on device: %.1f MB packed\n", bytes / 1048576.0);
+        /* GPU-2: resident EXPERTS for as many layers as the budget allows (default
+         * 8.5 GB, QWEN36_GPU_MOE_GB overrides). Router stays on CPU; a non-resident
+         * layer's hook returns not-mine -> CPU experts (partial residency). */
+        {
+            double gb = getenv("QWEN36_GPU_MOE_GB") ? atof(getenv("QWEN36_GPU_MOE_GB")) : 8.5;
+            size_t budget = (size_t)(gb * 1073741824.0), mbytes = 0;
+            int mlayers = 0;
+            int NE = (int)m->cfg.q36_n_expert, FF = (int)m->cfg.q36_n_ff_exp,
+                E2 = (int)m->cfg.n_embd;
+            for (uint32_t il = 0; il < m->cfg.n_layers; il++) {
+                const qwen3_layer *L = &m->layers[il];
+                const sp_arena_tensor *ag = sp_arena_find(m->arena, L->ffn_gate_exps->name);
+                const sp_arena_tensor *au = sp_arena_find(m->arena, L->ffn_up_exps->name);
+                const sp_arena_tensor *ad = sp_arena_find(m->arena, L->ffn_down_exps->name);
+                if (!ag || !au || !ad) continue;
+                size_t lb = ag->pt.codes_bytes + au->pt.codes_bytes + ad->pt.codes_bytes;
+                if (mbytes + lb > budget) break;
+                if (sp_q36gpu_upload_experts(gh, L->ffn_gate_exps->name,
+                                             &ag->pt, &au->pt, &ad->pt, NE, FF, E2)) {
+                    printf("GPU-2: expert upload FAIL at layer %u — stopping residency there\n", il);
+                    break;
+                }
+                mbytes += lb; mlayers++;
+            }
+            if (mlayers > 0) {
+                sp_moe_register_ext(q36_moe_ext, gh);
+                printf("GPU-2: experts resident for %d/%u layers: %.1f MB packed\n",
+                       mlayers, m->cfg.n_layers, mbytes / 1048576.0);
+            }
+        }
     }
 #endif
     const int V = (int)m->cfg.n_vocab;
