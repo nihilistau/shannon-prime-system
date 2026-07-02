@@ -260,6 +260,19 @@ int qwen25_forward(const qwen3_model *m, const int32_t *tokens, int n_tokens,
 int qwen36_forward(const qwen3_model *m, const int32_t *tokens, int n_tokens,
                    float *logits);
 
+/* Persistent-STATE decode for qwen35moe (NORTHSTAR brick 3, 2026-07-02). The
+ * stateless qwen36_forward recomputes all positions per call (O(n^2) decode);
+ * qwen36_state carries the per-GDN-layer gated delta-rule recurrent state S
+ * (O(1) by construction) + (conv_k-1) pre-conv rows, and the post-RoPE K/V
+ * windows for the full-attn layers only. qwen36_step(token) appends one token
+ * and returns the logits row; greedy step-decode is gated to reproduce the
+ * stateless self-feed sequence exactly (G-MOE-STATE-PARITY). */
+typedef struct qwen36_state qwen36_state;
+qwen36_state *qwen36_state_new(const qwen3_model *m, int max_pos);
+void          qwen36_state_free(qwen36_state *st);
+int           qwen36_step(const qwen3_model *m, qwen36_state *st, int32_t token,
+                          float *logits /* [n_vocab] */);
+
 /* As qwen3_forward, but if `kv_trees` is non-NULL it additionally KSTE-encodes
  * every cached K head-vector (the KSTE KV-cache overlay, gated in production by
  * SP_KSTE_KV=1; E_CPU_6). Each post-norm/post-RoPE K head-vector is quantized to
