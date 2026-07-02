@@ -69,7 +69,33 @@ int main(int argc, char **argv) {
     float *lg = (float *)malloc((size_t)cap * (size_t)V * sizeof(float));
     if (!seq || !lg) { printf("oom\n"); return 1; }
 
+    /* STEP mode (QWEN36_STEP=1): persistent-state decode via qwen36_step — the
+     * NORTHSTAR brick-3 path. Prefill by stepping the prompt, then greedy
+     * generate; the G-MOE-STATE-PARITY gate = this sequence must equal the
+     * stateless self-feed sequence. */
+    const int step_mode = getenv("QWEN36_STEP") && *getenv("QWEN36_STEP") == '1';
     double t_all = now_s();
+    if (step_mode) {
+        qwen36_state *st = qwen36_state_new(m, cap + 1);
+        if (!st) { printf("state_new FAIL\n"); return 1; }
+        double t_pf = now_s();
+        for (int t = 0; t < base; t++)
+            if (qwen36_step(m, st, seq[t], lg)) { printf("step FAIL (prefill %d)\n", t); return 1; }
+        printf("PREFILL %d tokens in %.2fs\n", base, now_s() - t_pf);
+        t_all = now_s();
+        for (int k = 0; k < n_gen; k++) {
+            int am = 0; float best = lg[0];
+            for (int i = 1; i < V; i++) if (lg[i] > best) { best = lg[i]; am = i; }
+            seq[base + k] = am;
+            double t0 = now_s();
+            if (k + 1 < n_gen || 1) {
+                if (qwen36_step(m, st, am, lg)) { printf("step FAIL at %d\n", k); return 1; }
+            }
+            printf("TOK %d %d %.2fs\n", k, am, now_s() - t0);
+            fflush(stdout);
+        }
+        qwen36_state_free(st);
+    } else {
     for (int k = 0; k < n_gen; k++) {
         int len = base + k;
         double t0 = now_s();
@@ -80,6 +106,7 @@ int main(int argc, char **argv) {
         seq[len] = am;
         printf("TOK %d %d %.2fs\n", k, am, now_s() - t0);
         fflush(stdout);
+    }
     }
     double dt = now_s() - t_all;
     printf("SEQ:");

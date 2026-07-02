@@ -9,8 +9,12 @@
  * the last-token column) matching the llama.cpp g35moe_oracle_dbg format, for
  * block-by-block localization (relative, not bit-exact: oracle Q4 vs SP f32).
  *
- * STATUS: GDN block implemented + validated. Full-attn (Stage 2b) and MoE FFN
- * (Stage 2c) are pass-through stubs in this revision. */
+ * STATUS: COMPLETE — GDN + gated full-attn/IMRoPE + MoE FFN all implemented;
+ * M_QWEN36 gate = top-1 bit-exact to the llama.cpp oracle (3/3; re-verified
+ * 2026-07-02, G-MOE-FORWARD-35B). Persistent-STATE decode (qwen36_state /
+ * qwen36_step, end of file) added 2026-07-02 for NORTHSTAR brick 3: the GDN
+ * recurrence is O(1)-state by construction; only the 10 full-attn layers carry
+ * a KV window. (The former "Stage 2b/2c stubs" note here was stale.) */
 #define _CRT_SECURE_NO_WARNINGS
 #include "sp/model.h"
 #include "sp/forward_dispatch.h"   /* sp_matmul / sp_embed_row / sp_as_f32 / sp_kernels_read_env */
@@ -393,5 +397,250 @@ int qwen36_forward(const qwen3_model *m, const int32_t *tokens, int n_tok, float
 done:
     free(x); free(nx); free(blk); free(moe); free(qkv); free(zg); free(cs); free(bet);
     free(alp); free(od); free(fno); free(St); free(skv); free(dlt);
+    return rc;
+}
+
+/* ===================== persistent-STATE decode (NORTHSTAR brick 3) =====================
+ * What the stateless forward recomputes per call, carried across calls instead:
+ *   - per GDN layer:   the gated delta-rule recurrent state S [Hv][Sd*Sd] (O(1) by
+ *                      construction) + the (CK-1) most-recent PRE-conv qkv rows (the
+ *                      causal depthwise conv tail);
+ *   - per full-attn layer: the post-RoPE K and V rows [pos][KVD];
+ *   - the position counter (RoPE + causal length).
+ * The inner math below is copied VERBATIM from qwen36_forward (same op order, same
+ * accumulation order) so a greedy step-decode reproduces the stateless self-feed
+ * sequence exactly — that identity is the gate (G-MOE-STATE-PARITY). */
+
+struct qwen36_state {
+    int pos, max_pos, n_layers;
+    int *ord;          /* [n_layers] ordinal within its class (gdn / attn) */
+    float **S;         /* [n_gdn]  -> Hv*Sd*Sd   recurrent state          */
+    float **tail;      /* [n_gdn]  -> (CK-1)*convC  pre-conv rows, oldest first */
+    float **K, **Vv;   /* [n_attn] -> max_pos*KVD  post-RoPE K / V         */
+    int n_gdn, n_attn;
+};
+
+void qwen36_state_free(qwen36_state *st) {
+    if (!st) return;
+    if (st->S)    { for (int i = 0; i < st->n_gdn; i++)  free(st->S[i]);    free(st->S); }
+    if (st->tail) { for (int i = 0; i < st->n_gdn; i++)  free(st->tail[i]); free(st->tail); }
+    if (st->K)    { for (int i = 0; i < st->n_attn; i++) free(st->K[i]);    free(st->K); }
+    if (st->Vv)   { for (int i = 0; i < st->n_attn; i++) free(st->Vv[i]);   free(st->Vv); }
+    free(st->ord); free(st);
+}
+
+qwen36_state *qwen36_state_new(const qwen3_model *m, int max_pos) {
+    const qwen3_config *c = &m->cfg;
+    const int Sd = (int)c->q36_gdn_state, Hk = (int)c->q36_gdn_n_k_heads,
+              Hv = (int)c->q36_gdn_n_v_heads, Vdim = (int)c->q36_gdn_inner;
+    const int Kdim = Hk * Sd, convC = Kdim * 2 + Vdim, CK = (int)c->q36_gdn_conv_k;
+    const int KVD = (int)c->n_head_kv * (int)c->head_dim;
+    qwen36_state *st = (qwen36_state *)calloc(1, sizeof(*st));
+    if (!st) return NULL;
+    st->max_pos = max_pos; st->n_layers = (int)c->n_layers;
+    st->ord = (int *)malloc((size_t)st->n_layers * sizeof(int));
+    if (!st->ord) { qwen36_state_free(st); return NULL; }
+    for (int il = 0; il < st->n_layers; il++)
+        st->ord[il] = m->layers[il].q36_is_recurrent ? st->n_gdn++ : st->n_attn++;
+    st->S    = (float **)calloc((size_t)st->n_gdn, sizeof(float *));
+    st->tail = (float **)calloc((size_t)st->n_gdn, sizeof(float *));
+    st->K    = (float **)calloc((size_t)st->n_attn, sizeof(float *));
+    st->Vv   = (float **)calloc((size_t)st->n_attn, sizeof(float *));
+    if (!st->S || !st->tail || !st->K || !st->Vv) { qwen36_state_free(st); return NULL; }
+    for (int i = 0; i < st->n_gdn; i++) {
+        st->S[i]    = (float *)calloc((size_t)Hv * Sd * Sd, sizeof(float));
+        st->tail[i] = (float *)calloc((size_t)(CK - 1) * convC, sizeof(float));
+        if (!st->S[i] || !st->tail[i]) { qwen36_state_free(st); return NULL; }
+    }
+    for (int i = 0; i < st->n_attn; i++) {
+        st->K[i]  = (float *)malloc((size_t)max_pos * KVD * sizeof(float));
+        st->Vv[i] = (float *)malloc((size_t)max_pos * KVD * sizeof(float));
+        if (!st->K[i] || !st->Vv[i]) { qwen36_state_free(st); return NULL; }
+    }
+    return st;
+}
+
+int qwen36_step(const qwen3_model *m, qwen36_state *st, int32_t token, float *logits) {
+    const qwen3_config *c = &m->cfg;
+    const int E = (int)c->n_embd, V = (int)c->n_vocab;
+    const float eps = c->rms_eps;
+    const int Sd = (int)c->q36_gdn_state, Hk = (int)c->q36_gdn_n_k_heads,
+              Hv = (int)c->q36_gdn_n_v_heads, Vdim = (int)c->q36_gdn_inner;
+    const int Kdim = Hk * Sd, convC = Kdim * 2 + Vdim, CK = (int)c->q36_gdn_conv_k;
+    const int pos = st->pos;
+    if (pos >= st->max_pos) return 1;
+
+    int rc = 1;
+    float *x   = (float *)malloc((size_t)E * sizeof(float));
+    float *nx  = (float *)malloc((size_t)E * sizeof(float));
+    float *blk = (float *)malloc((size_t)E * sizeof(float));
+    float *moe = (float *)malloc((size_t)E * sizeof(float));
+    float *qkv = (float *)malloc((size_t)convC * sizeof(float));   /* pre-conv row */
+    float *zg  = (float *)malloc((size_t)Vdim * sizeof(float));
+    float *cs  = (float *)malloc((size_t)convC * sizeof(float));   /* conv+silu row */
+    float *bet = (float *)malloc((size_t)Hv * sizeof(float));
+    float *alp = (float *)malloc((size_t)Hv * sizeof(float));
+    float *od  = (float *)malloc((size_t)(Vdim > (int)c->n_head * (int)c->head_dim
+                                          ? Vdim : (int)c->n_head * (int)c->head_dim) * sizeof(float));
+    float *fno = (float *)malloc((size_t)Vdim * sizeof(float));
+    float *skv = (float *)malloc((size_t)Sd * sizeof(float));
+    float *dlt = (float *)malloc((size_t)Sd * sizeof(float));
+    if (!x || !nx || !blk || !moe || !qkv || !zg || !cs || !bet || !alp || !od || !fno || !skv || !dlt)
+        goto done;
+
+    sp_kernels_read_env();
+    if (sp_embed_row(m, token, E, x)) goto done;
+
+    for (uint32_t il = 0; il < c->n_layers; il++) {
+        const qwen3_layer *L = &m->layers[il];
+        sp_rmsnorm(x, sp_as_f32(m, L->attn_norm), E, eps, nx);
+
+        if (L->q36_is_recurrent) {
+            const int g = st->ord[il];
+            float *S    = st->S[g];
+            float *tail = st->tail[g];
+            if (sp_matmul(m, L->gdn_qkv,  nx, 1, E, convC, qkv)) goto done;
+            if (sp_matmul(m, L->gdn_gate, nx, 1, E, Vdim,  zg))  goto done;
+            if (sp_matmul(m, L->gdn_beta, nx, 1, E, Hv,    bet)) goto done;
+            if (sp_matmul(m, L->gdn_alpha,nx, 1, E, Hv,    alp)) goto done;
+            const float *cw = sp_as_f32(m, L->gdn_conv1d);
+            const float *aA = sp_as_f32(m, L->gdn_a);
+            const float *dB = sp_as_f32(m, L->gdn_dt_bias);
+
+            /* causal depthwise conv over [tail(CK-1 rows), current]; row j<CK-1 is
+             * global time pos-(CK-1)+j -> tail[j] (zero-initialized covers pos<CK-1,
+             * matching the stateless zero-padding). Same j-ascending accumulation. */
+            for (int ch = 0; ch < convC; ch++) {
+                float acc = 0.0f;
+                for (int j = 0; j < CK; j++) {
+                    int tt = pos - (CK - 1) + j;
+                    if (tt < 0) continue;
+                    const float *row = (j == CK - 1) ? qkv : tail + (size_t)j * convC;
+                    acc += row[ch] * cw[ch * CK + j];
+                }
+                cs[ch] = silu_f(acc);
+            }
+            /* advance the pre-conv tail (oldest-first) */
+            memmove(tail, tail + convC, (size_t)(CK - 2) * convC * sizeof(float));
+            memcpy(tail + (size_t)(CK - 2) * convC, qkv, (size_t)convC * sizeof(float));
+
+            float *qb = cs, *kb = cs + Kdim;
+            for (int h = 0; h < Hk; h++) { l2norm(qb + h * Sd, Sd, eps); l2norm(kb + h * Sd, Sd, eps); }
+
+            const float qscale = 1.0f / sqrtf((float)Sd);
+            for (int h = 0; h < Hv; h++) {
+                int hk = h % Hk;
+                float *St_ = S + (size_t)h * Sd * Sd;
+                const float *qh = cs + (size_t)hk * Sd;
+                const float *kh = cs + Kdim + (size_t)hk * Sd;
+                const float *vh = cs + 2 * Kdim + (size_t)h * Sd;
+                float gh = expf(aA[h] * softplus_f(alp[h] + dB[h]));
+                float bh = sigmoid_f(bet[h]);
+                for (int i = 0; i < Sd * Sd; i++) St_[i] *= gh;
+                for (int j = 0; j < Sd; j++) {
+                    float s = 0.0f;
+                    for (int i = 0; i < Sd; i++) s += St_[(size_t)i * Sd + j] * kh[i];
+                    skv[j] = s;
+                    dlt[j] = bh * (vh[j] - s);
+                }
+                for (int i = 0; i < Sd; i++) {
+                    float ki = kh[i];
+                    float *Si = St_ + (size_t)i * Sd;
+                    for (int j = 0; j < Sd; j++) Si[j] += ki * dlt[j];
+                }
+                float *oh = od + (size_t)h * Sd;
+                for (int j = 0; j < Sd; j++) {
+                    float s = 0.0f;
+                    for (int i = 0; i < Sd; i++) s += St_[(size_t)i * Sd + j] * (qh[i] * qscale);
+                    oh[j] = s;
+                }
+            }
+            {
+                const float *gn = sp_as_f32(m, L->gdn_norm);
+                for (int h = 0; h < Hv; h++) {
+                    float *o_in  = od  + (size_t)h * Sd;
+                    float *o_out = fno + (size_t)h * Sd;
+                    float tmp[256];
+                    memcpy(tmp, o_in, (size_t)Sd * sizeof(float));
+                    sp_rmsnorm_head(tmp, gn, Sd, eps);
+                    const float *zh = zg + (size_t)h * Sd;
+                    for (int d = 0; d < Sd; d++) o_out[d] = tmp[d] * silu_f(zh[d]);
+                }
+            }
+            if (sp_matmul(m, L->gdn_out, fno, 1, Vdim, E, blk)) goto done;
+        } else {
+            const int a = st->ord[il];
+            const int NH = (int)c->n_head, NKV = (int)c->n_head_kv, HD = (int)c->head_dim;
+            const int QD = NH * HD, KVD = NKV * HD, group = NH / NKV;
+            const int nrot = (int)c->q36_rope_dim;
+            const float rbase = c->q36_rope_base;
+            const float ascale = 1.0f / sqrtf((float)HD);
+            const int QD2 = NH * HD * 2;
+            float *qf = qkv;                                    /* QD2 == convC */
+            float *kk = st->K[a]  + (size_t)pos * KVD;
+            float *vv = st->Vv[a] + (size_t)pos * KVD;
+            float *qq = fno;                                    /* reuse: QD <= Vdim */
+            float *gt = zg;                                     /* reuse: QD <= Vdim */
+            float *sc = (float *)malloc((size_t)(pos + 1) * sizeof(float));
+            if (!sc) goto done;
+            if (sp_matmul(m, L->attn_q, nx, 1, E, QD2, qf) ||
+                sp_matmul(m, L->attn_k, nx, 1, E, KVD, kk) ||
+                sp_matmul(m, L->attn_v, nx, 1, E, KVD, vv)) { free(sc); goto done; }
+            const float *qnw = sp_as_f32(m, L->attn_q_norm);
+            const float *knw = sp_as_f32(m, L->attn_k_norm);
+            for (int h = 0; h < NH; h++) {
+                const float *src = qf + (size_t)h * HD * 2;
+                float *qh = qq + (size_t)h * HD;
+                float *gh = gt + (size_t)h * HD;
+                memcpy(qh, src,      (size_t)HD * sizeof(float));
+                memcpy(gh, src + HD, (size_t)HD * sizeof(float));
+                sp_rmsnorm_head(qh, qnw, HD, eps);
+                sp_rope_neox(qh, nrot, pos, rbase);
+            }
+            for (int h = 0; h < NKV; h++) {
+                float *kh = kk + (size_t)h * HD;
+                sp_rmsnorm_head(kh, knw, HD, eps);
+                sp_rope_neox(kh, nrot, pos, rbase);
+            }
+            for (int h = 0; h < NH; h++) {
+                int kvh = h / group;
+                const float *qh = qq + (size_t)h * HD;
+                float maxs = -INFINITY;
+                for (int s = 0; s <= pos; s++) {
+                    const float *kh = st->K[a] + (size_t)s * KVD + (size_t)kvh * HD;
+                    float acc = 0.0f;
+                    for (int i = 0; i < HD; i++) acc += qh[i] * kh[i];
+                    float d = acc * ascale; sc[s] = d; if (d > maxs) maxs = d;
+                }
+                float sum = 0.0f;
+                for (int s = 0; s <= pos; s++) { sc[s] = expf(sc[s] - maxs); sum += sc[s]; }
+                float inv = 1.0f / sum;
+                const float *gh = gt + (size_t)h * HD;
+                float *aout = od + (size_t)h * HD;
+                for (int i = 0; i < HD; i++) aout[i] = 0.0f;
+                for (int s = 0; s <= pos; s++) {
+                    float w = sc[s] * inv;
+                    const float *vh = st->Vv[a] + (size_t)s * KVD + (size_t)kvh * HD;
+                    for (int i = 0; i < HD; i++) aout[i] += w * vh[i];
+                }
+                for (int i = 0; i < HD; i++) aout[i] *= sigmoid_f(gh[i]);
+            }
+            free(sc);
+            if (sp_matmul(m, L->attn_output, od, 1, QD, E, blk)) goto done;
+        }
+
+        for (int i = 0; i < E; i++) x[i] += blk[i];
+        sp_rmsnorm(x, sp_as_f32(m, L->post_attn_norm), E, eps, nx);
+        if (moe_ffn(m, L, c, nx, 1, moe)) goto done;
+        for (int i = 0; i < E; i++) x[i] += moe[i];
+    }
+
+    sp_rmsnorm(x, sp_as_f32(m, m->output_norm), E, eps, nx);
+    if (sp_matmul(m, m->output, nx, 1, E, V, logits)) goto done;
+    st->pos++;
+    rc = 0;
+done:
+    free(x); free(nx); free(blk); free(moe); free(qkv); free(zg); free(cs);
+    free(bet); free(alp); free(od); free(fno); free(skv); free(dlt);
     return rc;
 }
