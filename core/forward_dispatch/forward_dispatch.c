@@ -116,8 +116,10 @@ static int matmul_arena(const sp_arena_tensor *at, const float *X,
     const sp_frob_packed_tensor *pt = &at->pt;
     if (pt->rows != out || pt->cols != in) return 1;
     int fail = 0;
+    /* brick 6: skip the fork-join entirely for tiny matmuls (gdn beta/alpha are 32
+     * rows) — serial is faster than spawning a team there. */
 #ifdef _OPENMP
-#pragma omp parallel
+#pragma omp parallel if(out >= 64)
 #endif
     {
         int8_t *unp = (int8_t *)malloc((size_t)in);   /* Q4 unpack scratch (per thread) */

@@ -174,16 +174,77 @@ static int moe_ffn(const qwen3_model *m, const qwen3_layer *L, const qwen3_confi
             used[best] = 1; idx[k] = best; wt[k] = bv; wsum += bv;
         }
         for (int k = 0; k < NU; k++) wt[k] = (wt[k] / wsum) * wscale;
-        /* routed experts (SwiGLU), accumulate weighted */
+        /* routed experts (SwiGLU), accumulate weighted.
+         * brick 6 (arena fast path): the per-expert expert_mm calls cost ~3*NU
+         * OpenMP fork-joins per layer over SMALL row counts — batch ALL experts'
+         * gate+up rows into ONE parallel region and all down rows into a second
+         * (per-element math identical to expert_mm; yo accumulation stays in
+         * k-order => sequence-identical). Falls back to the per-expert loop when
+         * the arena tensors are absent (GGUF-direct path). */
         memset(yo, 0, (size_t)E * sizeof(float));
-        for (int k = 0; k < NU; k++) {
-            int e = idx[k];
-            if (expert_mm(m, L->ffn_gate_exps, e, x, E, FF, g)) goto done;
-            if (expert_mm(m, L->ffn_up_exps,   e, x, E, FF, u)) goto done;
-            for (int i = 0; i < FF; i++) hh[i] = silu_f(g[i]) * u[i];
-            if (expert_mm(m, L->ffn_down_exps, e, hh, FF, E, de)) goto done;
-            float w = wt[k];
-            for (int i = 0; i < E; i++) yo[i] += w * de[i];
+        const sp_arena_tensor *atg = m->arena ? sp_arena_find(m->arena, L->ffn_gate_exps->name) : NULL;
+        const sp_arena_tensor *atu = m->arena ? sp_arena_find(m->arena, L->ffn_up_exps->name)   : NULL;
+        const sp_arena_tensor *atd = m->arena ? sp_arena_find(m->arena, L->ffn_down_exps->name) : NULL;
+        if (atg && atu && atd) {
+            float *G = (float *)malloc((size_t)NU * FF * sizeof(float));
+            float *U = (float *)malloc((size_t)NU * FF * sizeof(float));
+            float *H = (float *)malloc((size_t)NU * FF * sizeof(float));
+            float *D = (float *)malloc((size_t)NU * E  * sizeof(float));
+            if (!G || !U || !H || !D) { free(G); free(U); free(H); free(D); goto done; }
+            const int scr = E > FF ? E : FF;
+            int fail = 0;
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+            {
+                int8_t *unp = (int8_t *)malloc((size_t)scr);
+                if (!unp) {
+                    fail = 1;
+                } else {
+                    const int nGU = NU * FF;
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic, 16)
+#endif
+                    for (int r = 0; r < 2 * nGU; r++) {
+                        int which = r / nGU, rr = r % nGU;
+                        int k = rr / FF, o = rr % FF;
+                        const sp_arena_tensor *at = which ? atu : atg;
+                        float v = sp_arena_row_dot(&at->pt, idx[k] * FF + o, x, E, unp);
+                        (which ? U : G)[rr] = v;
+                    }
+                    /* silu(g)*u — cheap, inside the region on the team's shares */
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+                    for (int r = 0; r < nGU; r++) H[r] = silu_f(G[r]) * U[r];
+                    const int nD = NU * E;
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic, 16)
+#endif
+                    for (int r = 0; r < nD; r++) {
+                        int k = r / E, o = r % E;
+                        D[r] = sp_arena_row_dot(&atd->pt, idx[k] * E + o, H + (size_t)k * FF, FF, unp);
+                    }
+                    free(unp);
+                }
+            }
+            if (fail) { free(G); free(U); free(H); free(D); goto done; }
+            for (int k = 0; k < NU; k++) {      /* k-order accumulation preserved */
+                float w = wt[k];
+                const float *dk = D + (size_t)k * E;
+                for (int i = 0; i < E; i++) yo[i] += w * dk[i];
+            }
+            free(G); free(U); free(H); free(D);
+        } else {
+            for (int k = 0; k < NU; k++) {
+                int e = idx[k];
+                if (expert_mm(m, L->ffn_gate_exps, e, x, E, FF, g)) goto done;
+                if (expert_mm(m, L->ffn_up_exps,   e, x, E, FF, u)) goto done;
+                for (int i = 0; i < FF; i++) hh[i] = silu_f(g[i]) * u[i];
+                if (expert_mm(m, L->ffn_down_exps, e, hh, FF, E, de)) goto done;
+                float w = wt[k];
+                for (int i = 0; i < E; i++) yo[i] += w * de[i];
+            }
         }
         /* shared expert (always on), sigmoid-gated */
         if (sp_matmul(m, L->ffn_gate_shexp, x, 1, E, FS, g)) goto done;
