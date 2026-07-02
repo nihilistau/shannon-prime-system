@@ -18,6 +18,31 @@
 #include <string.h>
 #include <time.h>
 
+/* NORTHSTAR GPU-1 hybrid (compile-gated: /DQ36_GPU + link the CUDA backend lib +
+ * cudart/cublas): upload the DENSE weight tensors (gdn projections, full-attn
+ * projections, LM head) once to VRAM and register the dp4a GEMV service as the
+ * sp_matmul external hook. GDN recurrence, conv, MoE routing/experts stay on CPU.
+ * QWEN36_GPU=1 enables at runtime. */
+#ifdef Q36_GPU
+#include "sp/forward_dispatch.h"   /* sp_matmul_register_ext */
+#include "sp/arena.h"              /* sp_arena_find */
+extern void *sp_q36gpu_new(void);
+extern int   sp_q36gpu_upload(void *h, const char *name, const sp_frob_packed_tensor *pt);
+extern int   sp_q36gpu_matmul(void *h, const char *name, const float *X,
+                              int n_tok, int in, int out, float *Y);
+static int q36_gpu_ext(void *ctx, const char *n, const float *X, int nt, int in, int out, float *Y) {
+    return sp_q36gpu_matmul(ctx, n, X, nt, in, out, Y);
+}
+static int q36_gpu_up(void *h, const qwen3_model *m, const gguf_tensor *W, size_t *bytes) {
+    if (!W || !m->arena) return 0;
+    const sp_arena_tensor *at = sp_arena_find(m->arena, W->name);
+    if (!at) return 0;
+    if (sp_q36gpu_upload(h, W->name, &at->pt)) { printf("gpu upload FAIL: %s\n", W->name); return 1; }
+    *bytes += at->pt.codes_bytes;
+    return 0;
+}
+#endif
+
 static double now_s(void) {
     struct timespec t; timespec_get(&t, TIME_UTC);
     return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
@@ -42,6 +67,29 @@ int main(int argc, char **argv) {
         if (!m) { printf("sp_model_to_qwen36 FAIL: %s\n", sp_last_error()); return 1; }
     }
     if (m->cfg.arch != SP_ARCH_QWEN36) { printf("arch != QWEN36\n"); return 1; }
+#ifdef Q36_GPU
+    if (getenv("QWEN36_GPU") && *getenv("QWEN36_GPU") == '1') {
+        void *gh = sp_q36gpu_new();
+        if (!gh) { printf("sp_q36gpu_new FAIL\n"); return 1; }
+        size_t bytes = 0;
+        for (uint32_t il = 0; il < m->cfg.n_layers; il++) {
+            const qwen3_layer *L = &m->layers[il];
+            if (L->q36_is_recurrent) {
+                if (q36_gpu_up(gh, m, L->gdn_qkv,  &bytes) ||
+                    q36_gpu_up(gh, m, L->gdn_gate, &bytes) ||
+                    q36_gpu_up(gh, m, L->gdn_out,  &bytes)) return 1;
+            } else {
+                if (q36_gpu_up(gh, m, L->attn_q,      &bytes) ||
+                    q36_gpu_up(gh, m, L->attn_k,      &bytes) ||
+                    q36_gpu_up(gh, m, L->attn_v,      &bytes) ||
+                    q36_gpu_up(gh, m, L->attn_output, &bytes)) return 1;
+            }
+        }
+        if (q36_gpu_up(gh, m, m->output, &bytes)) return 1;
+        sp_matmul_register_ext(q36_gpu_ext, gh);
+        printf("GPU-1: dense weights resident on device: %.1f MB packed\n", bytes / 1048576.0);
+    }
+#endif
     const int V = (int)m->cfg.n_vocab;
     printf("mode=%s V=%d n_gen=%d (stateless forward — O(n^2) proxy, not production tok/s)\n",
            mode, V, n_gen);

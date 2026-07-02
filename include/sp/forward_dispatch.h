@@ -29,6 +29,16 @@ extern "C" {
 int sp_matmul(const qwen3_model *m, const gguf_tensor *W,
               const float *X, int n_tok, int in, int out, float *Y);
 
+/* NORTHSTAR GPU-1: external matmul hook. A backend (e.g. the CUDA hybrid GEMV
+ * service) registers a function that gets FIRST LOOK at every sp_matmul call by
+ * weight-tensor NAME; return 0 = handled (Y filled), nonzero = not-mine -> the
+ * normal CPU path runs. Nothing registered (the default) = byte-identical null
+ * floor. Registration is process-global and not thread-safe: register once at
+ * startup before any forward. */
+typedef int (*sp_matmul_ext_fn)(void *ctx, const char *wname, const float *X,
+                                int n_tok, int in, int out, float *Y);
+void sp_matmul_register_ext(sp_matmul_ext_fn fn, void *ctx);
+
 /* NORTHSTAR brick 5: single-row packed dot (dequant-free). Unpacks a Q4 row into
  * caller scratch `unp` (>= in bytes; untouched for Q8 rows), dots against x, and
  * applies the row/block scales — the MoE expert row loops skip the f32 dequant-row

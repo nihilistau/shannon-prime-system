@@ -162,8 +162,19 @@ static int matmul_arena(const sp_arena_tensor *at, const float *X,
     return fail;
 }
 
+/* NORTHSTAR GPU-1: external matmul hook (first look, by name). Unregistered =
+ * byte-identical null floor. */
+static sp_matmul_ext_fn g_mm_ext_fn = NULL;
+static void            *g_mm_ext_ctx = NULL;
+void sp_matmul_register_ext(sp_matmul_ext_fn fn, void *ctx) {
+    g_mm_ext_fn = fn; g_mm_ext_ctx = ctx;
+}
+
 int sp_matmul(const qwen3_model *m, const gguf_tensor *W,
               const float *X, int n_tok, int in, int out, float *Y) {
+    if (g_mm_ext_fn &&
+        g_mm_ext_fn(g_mm_ext_ctx, W->name, X, n_tok, in, out, Y) == 0)
+        return 0;                              /* handled externally (GPU-resident weight) */
     if (m->arena) {                            /* packed-weight arena (§4.8) takes precedence */
         const sp_arena_tensor *at = sp_arena_find(m->arena, W->name);
         if (at) return matmul_arena(at, X, n_tok, in, out, Y);
