@@ -170,6 +170,17 @@ void sp_matmul_register_ext(sp_matmul_ext_fn fn, void *ctx) {
     g_mm_ext_fn = fn; g_mm_ext_ctx = ctx;
 }
 
+/* GPU-2: routed-MoE hook (see header). */
+static sp_moe_ext_fn g_moe_ext_fn = NULL;
+static void         *g_moe_ext_ctx = NULL;
+void sp_moe_register_ext(sp_moe_ext_fn fn, void *ctx) {
+    g_moe_ext_fn = fn; g_moe_ext_ctx = ctx;
+}
+sp_moe_ext_fn sp_moe_ext(void **ctx_out) {
+    if (ctx_out) *ctx_out = g_moe_ext_ctx;
+    return g_moe_ext_fn;
+}
+
 int sp_matmul(const qwen3_model *m, const gguf_tensor *W,
               const float *X, int n_tok, int in, int out, float *Y) {
     if (g_mm_ext_fn &&

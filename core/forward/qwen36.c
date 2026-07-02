@@ -182,7 +182,16 @@ static int moe_ffn(const qwen3_model *m, const qwen3_layer *L, const qwen3_confi
          * k-order => sequence-identical). Falls back to the per-expert loop when
          * the arena tensors are absent (GGUF-direct path). */
         memset(yo, 0, (size_t)E * sizeof(float));
-        const sp_arena_tensor *atg = m->arena ? sp_arena_find(m->arena, L->ffn_gate_exps->name) : NULL;
+        /* GPU-2: resident-expert hook first (router stays f32 on CPU, above). 0 =
+         * yo filled with the weighted routed sum -> skip the CPU routed block. */
+        int routed_done = 0;
+        {
+            void *mctx = NULL;
+            sp_moe_ext_fn mfn = sp_moe_ext(&mctx);
+            if (mfn && mfn(mctx, L->ffn_gate_exps->name, idx, wt, NU, x, E, FF, yo) == 0)
+                routed_done = 1;
+        }
+        const sp_arena_tensor *atg = (!routed_done && m->arena) ? sp_arena_find(m->arena, L->ffn_gate_exps->name) : NULL;
         const sp_arena_tensor *atu = m->arena ? sp_arena_find(m->arena, L->ffn_up_exps->name)   : NULL;
         const sp_arena_tensor *atd = m->arena ? sp_arena_find(m->arena, L->ffn_down_exps->name) : NULL;
         if (atg && atu && atd) {
@@ -235,7 +244,7 @@ static int moe_ffn(const qwen3_model *m, const qwen3_layer *L, const qwen3_confi
                 for (int i = 0; i < E; i++) yo[i] += w * dk[i];
             }
             free(G); free(U); free(H); free(D);
-        } else {
+        } else if (!routed_done) {
             for (int k = 0; k < NU; k++) {
                 int e = idx[k];
                 if (expert_mm(m, L->ffn_gate_exps, e, x, E, FF, g)) goto done;
