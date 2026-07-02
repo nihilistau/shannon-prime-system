@@ -27,6 +27,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
+#include <time.h>   /* timespec_get (SP_Q36_PROF section timers) */
 
 static float silu_f(float x)     { return x / (1.0f + expf(-x)); }
 static float sigmoid_f(float x)  { return 1.0f / (1.0f + expf(-x)); }
@@ -66,35 +67,66 @@ static int expert_mm(const qwen3_model *m, const gguf_tensor *W, int e,
                      const float *X, int in, int out, float *Y) {
     /* .sp-model path: no GGUF — read expert e's slice from the packed arena tensor
      * (rank-3 packed as (rows*n_expert) rows; expert e = rows [e*out, (e+1)*out)). */
+    /* NORTHSTAR brick 4: rows independent -> OpenMP over o, per-thread wrow scratch;
+     * per-row math untouched = bit-identical to serial (parity re-gated). Serial null
+     * floor when compiled without /openmp. */
     if (m->arena) {
         const sp_arena_tensor *at = sp_arena_find(m->arena, W->name);
         if (at) {
-            float *wrow = (float *)malloc((size_t)in * sizeof(float));
-            if (!wrow) return 1;
-            for (int o = 0; o < out; o++) {
-                if (sp_frob_packed_dequant_row(&at->pt, e * out + o, wrow)) { free(wrow); return 1; }
-                float acc = 0.0f;
-                for (int i = 0; i < in; i++) acc += wrow[i] * X[i];
-                Y[o] = acc;
+            int fail = 0;
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+            {
+                float *wrow = (float *)malloc((size_t)in * sizeof(float));
+                if (!wrow) {
+                    fail = 1;
+                } else {
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic, 8)
+#endif
+                    for (int o = 0; o < out; o++) {
+                        if (fail) continue;
+                        if (sp_frob_packed_dequant_row(&at->pt, e * out + o, wrow)) { fail = 1; continue; }
+                        float acc = 0.0f;
+                        for (int i = 0; i < in; i++) acc += wrow[i] * X[i];
+                        Y[o] = acc;
+                    }
+                    free(wrow);
+                }
             }
-            free(wrow);
-            return 0;
+            return fail;
         }
     }
     /* GGUF-direct path */
     const uint8_t *base = (const uint8_t *)gguf_tensor_data(m->gguf, W);
     size_t rb = q36_rb(W->type, in);
     if (!base || rb == 0) return 1;
-    float *wrow = (float *)malloc((size_t)in * sizeof(float));
-    if (!wrow) return 1;
-    for (int o = 0; o < out; o++) {
-        if (sp_dequant_row(base + ((size_t)e * out + o) * rb, W->type, in, wrow)) { free(wrow); return 1; }
-        float acc = 0.0f;
-        for (int i = 0; i < in; i++) acc += wrow[i] * X[i];
-        Y[o] = acc;
+    {
+        int fail = 0;
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+        {
+            float *wrow = (float *)malloc((size_t)in * sizeof(float));
+            if (!wrow) {
+                fail = 1;
+            } else {
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic, 8)
+#endif
+                for (int o = 0; o < out; o++) {
+                    if (fail) continue;
+                    if (sp_dequant_row(base + ((size_t)e * out + o) * rb, W->type, in, wrow)) { fail = 1; continue; }
+                    float acc = 0.0f;
+                    for (int i = 0; i < in; i++) acc += wrow[i] * X[i];
+                    Y[o] = acc;
+                }
+                free(wrow);
+            }
+        }
+        return fail;
     }
-    free(wrow);
-    return 0;
 }
 
 /* MoE FFN: f32 softmax/top-k/renorm router (NEVER quantized — top-k is a discrete
@@ -460,9 +492,20 @@ qwen36_state *qwen36_state_new(const qwen3_model *m, int max_pos) {
     return st;
 }
 
+/* SP_Q36_PROF=1: per-section wall-time accumulators printed each step (brick-4
+ * profile-before-believing). Sections: gdn_mm (qkv/gate/beta/alpha/out matmuls),
+ * conv+recurrence, attn (full-attn layers), moe (routed+shared experts), head. */
+static double q36_prof[5];
+static double q36_now(void) {
+    struct timespec t; timespec_get(&t, TIME_UTC);
+    return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
+}
+
 int qwen36_step(const qwen3_model *m, qwen36_state *st, int32_t token, float *logits) {
     const qwen3_config *c = &m->cfg;
     const int E = (int)c->n_embd, V = (int)c->n_vocab;
+    const int prof = getenv("SP_Q36_PROF") != NULL;
+    double tp = 0.0;
     const float eps = c->rms_eps;
     const int Sd = (int)c->q36_gdn_state, Hk = (int)c->q36_gdn_n_k_heads,
               Hv = (int)c->q36_gdn_n_v_heads, Vdim = (int)c->q36_gdn_inner;
@@ -499,10 +542,12 @@ int qwen36_step(const qwen3_model *m, qwen36_state *st, int32_t token, float *lo
             const int g = st->ord[il];
             float *S    = st->S[g];
             float *tail = st->tail[g];
+            if (prof) tp = q36_now();
             if (sp_matmul(m, L->gdn_qkv,  nx, 1, E, convC, qkv)) goto done;
             if (sp_matmul(m, L->gdn_gate, nx, 1, E, Vdim,  zg))  goto done;
             if (sp_matmul(m, L->gdn_beta, nx, 1, E, Hv,    bet)) goto done;
             if (sp_matmul(m, L->gdn_alpha,nx, 1, E, Hv,    alp)) goto done;
+            if (prof) { q36_prof[0] += q36_now() - tp; tp = q36_now(); }
             const float *cw = sp_as_f32(m, L->gdn_conv1d);
             const float *aA = sp_as_f32(m, L->gdn_a);
             const float *dB = sp_as_f32(m, L->gdn_dt_bias);
@@ -567,8 +612,11 @@ int qwen36_step(const qwen3_model *m, qwen36_state *st, int32_t token, float *lo
                     for (int d = 0; d < Sd; d++) o_out[d] = tmp[d] * silu_f(zh[d]);
                 }
             }
+            if (prof) { q36_prof[1] += q36_now() - tp; tp = q36_now(); }
             if (sp_matmul(m, L->gdn_out, fno, 1, Vdim, E, blk)) goto done;
+            if (prof) q36_prof[0] += q36_now() - tp;
         } else {
+            if (prof) tp = q36_now();
             const int a = st->ord[il];
             const int NH = (int)c->n_head, NKV = (int)c->n_head_kv, HD = (int)c->head_dim;
             const int QD = NH * HD, KVD = NKV * HD, group = NH / NKV;
@@ -627,16 +675,25 @@ int qwen36_step(const qwen3_model *m, qwen36_state *st, int32_t token, float *lo
             }
             free(sc);
             if (sp_matmul(m, L->attn_output, od, 1, QD, E, blk)) goto done;
+            if (prof) q36_prof[2] += q36_now() - tp;
         }
 
         for (int i = 0; i < E; i++) x[i] += blk[i];
         sp_rmsnorm(x, sp_as_f32(m, L->post_attn_norm), E, eps, nx);
+        if (prof) tp = q36_now();
         if (moe_ffn(m, L, c, nx, 1, moe)) goto done;
+        if (prof) q36_prof[3] += q36_now() - tp;
         for (int i = 0; i < E; i++) x[i] += moe[i];
     }
 
     sp_rmsnorm(x, sp_as_f32(m, m->output_norm), E, eps, nx);
+    if (prof) tp = q36_now();
     if (sp_matmul(m, m->output, nx, 1, E, V, logits)) goto done;
+    if (prof) {
+        q36_prof[4] += q36_now() - tp;
+        fprintf(stderr, "[q36_prof cum] gdn_mm=%.2fs conv+recur=%.2fs attn=%.2fs moe=%.2fs head=%.2fs\n",
+                q36_prof[0], q36_prof[1], q36_prof[2], q36_prof[3], q36_prof[4]);
+    }
     st->pos++;
     rc = 0;
 done:

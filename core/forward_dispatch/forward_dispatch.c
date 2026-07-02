@@ -54,47 +54,63 @@ static size_t row_bytes(uint32_t type, int n) {
     }
 }
 
-/* Arena matmul: inline-lift the packed Q8/Q4 codes (the §4.8 production path). Pure
- * scalar; the per-row scale is applied once after the integer-code accumulation. */
+/* Arena matmul: inline-lift the packed Q8/Q4 codes (the §4.8 production path). The
+ * per-row scale is applied once after the integer-code accumulation.
+ * NORTHSTAR brick 4 (2026-07-02): rows are independent — OpenMP over j with a
+ * PER-THREAD unpack scratch. Each row's accumulation order is untouched, so the
+ * result is BIT-IDENTICAL to the serial loop (parity re-gated, G-MOE-STATE-PARITY).
+ * Compiled without /openmp the pragmas are inert = the serial null floor. */
 static int matmul_arena(const sp_arena_tensor *at, const float *X,
                         int n_tok, int in, int out, float *Y) {
     const sp_frob_packed_tensor *pt = &at->pt;
     if (pt->rows != out || pt->cols != in) return 1;
-    int8_t *unp = (int8_t *)malloc((size_t)in);   /* Q4 unpack scratch */
-    if (!unp) return 1;
-    for (int j = 0; j < out; j++) {
-        const uint8_t *rc = pt->codes + pt->row_off[j];
-        const int8_t *cp;
-        float inv;
-        if (pt->row_prec[j] != 8 && pt->bscale) {
-            /* OK_Q4B row (arena v2): per-32-block f16 scales — accumulate per block,
-             * apply each block's scale, no trailing row scale. */
-            sp_frob_q4_unpack(rc, in, unp); cp = unp;
-            const uint16_t *bs = pt->bscale + (size_t)j * (size_t)pt->bs_nblk;
-            for (int t = 0; t < n_tok; t++) {
-                const float *x = X + (size_t)t * in;
-                float facc = 0.0f;
-                for (int b = 0; b * 32 < in; b++) {
-                    int i0 = b * 32, i1 = i0 + 32 < in ? i0 + 32 : in;
-                    float acc = 0.0f;
-                    for (int i = i0; i < i1; i++) acc += (float)cp[i] * x[i];
-                    facc += acc * sp_f16_to_f32(bs[b]);
+    int fail = 0;
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+    {
+        int8_t *unp = (int8_t *)malloc((size_t)in);   /* Q4 unpack scratch (per thread) */
+        if (!unp) {
+            fail = 1;
+        } else {
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic, 16)
+#endif
+            for (int j = 0; j < out; j++) {
+                const uint8_t *rc = pt->codes + pt->row_off[j];
+                const int8_t *cp;
+                float inv;
+                if (pt->row_prec[j] != 8 && pt->bscale) {
+                    /* OK_Q4B row (arena v2): per-32-block f16 scales — accumulate per block,
+                     * apply each block's scale, no trailing row scale. */
+                    sp_frob_q4_unpack(rc, in, unp); cp = unp;
+                    const uint16_t *bs = pt->bscale + (size_t)j * (size_t)pt->bs_nblk;
+                    for (int t = 0; t < n_tok; t++) {
+                        const float *x = X + (size_t)t * in;
+                        float facc = 0.0f;
+                        for (int b = 0; b * 32 < in; b++) {
+                            int i0 = b * 32, i1 = i0 + 32 < in ? i0 + 32 : in;
+                            float acc = 0.0f;
+                            for (int i = i0; i < i1; i++) acc += (float)cp[i] * x[i];
+                            facc += acc * sp_f16_to_f32(bs[b]);
+                        }
+                        Y[(size_t)t * out + j] = facc;
+                    }
+                    continue;
                 }
-                Y[(size_t)t * out + j] = facc;
+                if (pt->row_prec[j] == 8) { cp = (const int8_t *)rc; inv = pt->row_scale[j] / 127.0f; }
+                else { sp_frob_q4_unpack(rc, in, unp); cp = unp; inv = pt->row_scale[j] / 7.0f; }
+                for (int t = 0; t < n_tok; t++) {
+                    const float *x = X + (size_t)t * in;
+                    float acc = 0.0f;
+                    for (int i = 0; i < in; i++) acc += (float)cp[i] * x[i];
+                    Y[(size_t)t * out + j] = acc * inv;
+                }
             }
-            continue;
-        }
-        if (pt->row_prec[j] == 8) { cp = (const int8_t *)rc; inv = pt->row_scale[j] / 127.0f; }
-        else { sp_frob_q4_unpack(rc, in, unp); cp = unp; inv = pt->row_scale[j] / 7.0f; }
-        for (int t = 0; t < n_tok; t++) {
-            const float *x = X + (size_t)t * in;
-            float acc = 0.0f;
-            for (int i = 0; i < in; i++) acc += (float)cp[i] * x[i];
-            Y[(size_t)t * out + j] = acc * inv;
+            free(unp);
         }
     }
-    free(unp);
-    return 0;
+    return fail;
 }
 
 int sp_matmul(const qwen3_model *m, const gguf_tensor *W,
