@@ -40,9 +40,25 @@ extern int   sp_q36gpu_moe(void *h, const char *tag, const int *idx, const float
 static int q36_gpu_ext(void *ctx, const char *n, const float *X, int nt, int in, int out, float *Y) {
     return sp_q36gpu_matmul(ctx, n, X, nt, in, out, Y);
 }
+extern int   sp_q36gpu_moe_stream(void *h,
+                                  const sp_frob_packed_tensor *ptg,
+                                  const sp_frob_packed_tensor *ptu,
+                                  const sp_frob_packed_tensor *ptd,
+                                  const int *idx, const float *wt, int NU,
+                                  const float *x, int E, int FF, float *y);
+/* GPU-3: host-side table of every layer's expert tensors so non-resident layers can
+ * STREAM their selected experts instead of falling back to CPU (QWEN36_GPU_STREAM=1). */
+static struct { const char *gname; const sp_frob_packed_tensor *g, *u, *d; } q36_tbl[64];
+static int q36_tbl_n = 0, q36_stream_on = 0;
 static int q36_moe_ext(void *ctx, const char *gate_name, const int *idx, const float *wt,
                        int NU, const float *x, int E, int FF, float *y) {
-    return sp_q36gpu_moe(ctx, gate_name, idx, wt, NU, x, E, FF, y);
+    if (sp_q36gpu_moe(ctx, gate_name, idx, wt, NU, x, E, FF, y) == 0) return 0;
+    if (!q36_stream_on) return -1;
+    for (int i = 0; i < q36_tbl_n; i++)
+        if (strcmp(q36_tbl[i].gname, gate_name) == 0)
+            return sp_q36gpu_moe_stream(ctx, q36_tbl[i].g, q36_tbl[i].u, q36_tbl[i].d,
+                                        idx, wt, NU, x, E, FF, y);
+    return -1;
 }
 static int q36_gpu_up(void *h, const qwen3_model *m, const gguf_tensor *W, size_t *bytes) {
     if (!W || !m->arena) return 0;
@@ -108,25 +124,36 @@ int main(int argc, char **argv) {
             int mlayers = 0;
             int NE = (int)m->cfg.q36_n_expert, FF = (int)m->cfg.q36_n_ff_exp,
                 E2 = (int)m->cfg.n_embd;
+            int budget_hit = 0;
             for (uint32_t il = 0; il < m->cfg.n_layers; il++) {
                 const qwen3_layer *L = &m->layers[il];
                 const sp_arena_tensor *ag = sp_arena_find(m->arena, L->ffn_gate_exps->name);
                 const sp_arena_tensor *au = sp_arena_find(m->arena, L->ffn_up_exps->name);
                 const sp_arena_tensor *ad = sp_arena_find(m->arena, L->ffn_down_exps->name);
                 if (!ag || !au || !ad) continue;
+                /* GPU-3 stream table covers EVERY layer (fallback for non-resident) */
+                if (q36_tbl_n < 64) {
+                    q36_tbl[q36_tbl_n].gname = L->ffn_gate_exps->name;
+                    q36_tbl[q36_tbl_n].g = &ag->pt;
+                    q36_tbl[q36_tbl_n].u = &au->pt;
+                    q36_tbl[q36_tbl_n].d = &ad->pt;
+                    q36_tbl_n++;
+                }
                 size_t lb = ag->pt.codes_bytes + au->pt.codes_bytes + ad->pt.codes_bytes;
-                if (mbytes + lb > budget) break;
+                if (budget_hit || mbytes + lb > budget) { budget_hit = 1; continue; }
                 if (sp_q36gpu_upload_experts(gh, L->ffn_gate_exps->name,
                                              &ag->pt, &au->pt, &ad->pt, NE, FF, E2)) {
                     printf("GPU-2: expert upload FAIL at layer %u — stopping residency there\n", il);
-                    break;
+                    budget_hit = 1; continue;
                 }
                 mbytes += lb; mlayers++;
             }
-            if (mlayers > 0) {
+            q36_stream_on = getenv("QWEN36_GPU_STREAM") && *getenv("QWEN36_GPU_STREAM") == '1';
+            if (mlayers > 0 || q36_stream_on) {
                 sp_moe_register_ext(q36_moe_ext, gh);
-                printf("GPU-2: experts resident for %d/%u layers: %.1f MB packed\n",
-                       mlayers, m->cfg.n_layers, mbytes / 1048576.0);
+                printf("GPU-2: experts resident for %d/%u layers: %.1f MB packed%s\n",
+                       mlayers, m->cfg.n_layers, mbytes / 1048576.0,
+                       q36_stream_on ? " (+GPU-3 streaming for the rump)" : "");
             }
         }
     }
