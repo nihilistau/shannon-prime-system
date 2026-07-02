@@ -50,15 +50,31 @@ extern int   sp_q36gpu_moe_stream(void *h,
  * STREAM their selected experts instead of falling back to CPU (QWEN36_GPU_STREAM=1). */
 static struct { const char *gname; const sp_frob_packed_tensor *g, *u, *d; } q36_tbl[64];
 static int q36_tbl_n = 0, q36_stream_on = 0;
+/* GPU-4: routing-locality telemetry — decides streaming-vs-LRU with data. Counts how
+ * many of a layer's selected experts repeat from the SAME layer's previous token. */
+static int  q36_loc_prev[64][16], q36_loc_seen[64];
+static long q36_loc_hits = 0, q36_loc_tot = 0;
+static void q36_loc_track(int li, const int *idx, int NU) {
+    if (li < 0 || li >= 64 || NU > 16) return;
+    if (q36_loc_seen[li]) {
+        for (int a = 0; a < NU; a++)
+            for (int b = 0; b < NU; b++)
+                if (idx[a] == q36_loc_prev[li][b]) { q36_loc_hits++; break; }
+        q36_loc_tot += NU;
+    }
+    for (int a = 0; a < NU; a++) q36_loc_prev[li][a] = idx[a];
+    q36_loc_seen[li] = 1;
+}
 static int q36_moe_ext(void *ctx, const char *gate_name, const int *idx, const float *wt,
                        int NU, const float *x, int E, int FF, float *y) {
-    if (sp_q36gpu_moe(ctx, gate_name, idx, wt, NU, x, E, FF, y) == 0) return 0;
-    if (!q36_stream_on) return -1;
+    int li = -1;
     for (int i = 0; i < q36_tbl_n; i++)
-        if (strcmp(q36_tbl[i].gname, gate_name) == 0)
-            return sp_q36gpu_moe_stream(ctx, q36_tbl[i].g, q36_tbl[i].u, q36_tbl[i].d,
-                                        idx, wt, NU, x, E, FF, y);
-    return -1;
+        if (strcmp(q36_tbl[i].gname, gate_name) == 0) { li = i; break; }
+    q36_loc_track(li, idx, NU);
+    if (sp_q36gpu_moe(ctx, gate_name, idx, wt, NU, x, E, FF, y) == 0) return 0;
+    if (!q36_stream_on || li < 0) return -1;
+    return sp_q36gpu_moe_stream(ctx, q36_tbl[li].g, q36_tbl[li].u, q36_tbl[li].d,
+                                idx, wt, NU, x, E, FF, y);
 }
 static int q36_gpu_up(void *h, const qwen3_model *m, const gguf_tensor *W, size_t *bytes) {
     if (!W || !m->arena) return 0;
@@ -225,6 +241,11 @@ int main(int argc, char **argv) {
     }
     }
     double dt = now_s() - t_all;
+#ifdef Q36_GPU
+    if (q36_loc_tot > 0)
+        printf("LOCALITY: %ld/%ld = %.1f%% of selected experts repeat from the same layer's previous token\n",
+               q36_loc_hits, q36_loc_tot, 100.0 * q36_loc_hits / q36_loc_tot);
+#endif
     printf("SEQ:");
     for (int i = 0; i < base + n_gen; i++) printf(" %d", seq[i]);
     printf("\nTOTAL %d tokens in %.1fs = %.3f tok/s (stateless proxy)\n", n_gen, dt, n_gen / dt);
