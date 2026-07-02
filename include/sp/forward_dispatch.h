@@ -29,6 +29,16 @@ extern "C" {
 int sp_matmul(const qwen3_model *m, const gguf_tensor *W,
               const float *X, int n_tok, int in, int out, float *Y);
 
+/* NORTHSTAR brick 5: single-row packed dot (dequant-free). Unpacks a Q4 row into
+ * caller scratch `unp` (>= in bytes; untouched for Q8 rows), dots against x, and
+ * applies the row/block scales — the MoE expert row loops skip the f32 dequant-row
+ * write entirely. SIMD (AVX2+FMA) when the TU carries the flags; scalar null floor
+ * otherwise. SIMD changes accumulation order: gate = top-1/sequence, not bit-parity.
+ * (sp_frob_packed_tensor is an anonymous-struct typedef -> include its header.) */
+#include "sp/frobenius_lift.h"
+float sp_arena_row_dot(const sp_frob_packed_tensor *pt, int row,
+                       const float *x, int in, signed char *unp);
+
 /* Embedding lookup for token `tok` -> dst[E] (from the arena if the embedding is
  * packed, else dequantized from the GGUF mapping). Returns 0 on success. */
 int sp_embed_row(const qwen3_model *m, int32_t tok, int E, float *dst);

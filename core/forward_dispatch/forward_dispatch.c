@@ -54,6 +54,57 @@ static size_t row_bytes(uint32_t type, int n) {
     }
 }
 
+/* NORTHSTAR brick 5 (2026-07-02): SIMD i8*f32 dot for the arena row loops. AVX2+FMA
+ * when compiled with /arch:AVX2 (the perf build); scalar fallback otherwise = the
+ * null floor. NOTE: SIMD changes the ACCUMULATION ORDER, so the gate for builds
+ * carrying this flag is top-1/sequence equivalence (G-MOE-SIMD-TOKS), not
+ * bit-parity — the N1b rule applied within-path. */
+#if defined(__AVX2__) && defined(__FMA__)
+#include <immintrin.h>
+static float q36_dot_i8xf32(const int8_t *cp, const float *x, int n) {
+    __m256 acc = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m128i b  = _mm_loadl_epi64((const __m128i *)(cp + i));
+        __m256  vf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b));
+        acc = _mm256_fmadd_ps(vf, _mm256_loadu_ps(x + i), acc);
+    }
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+    s = _mm_hadd_ps(s, s); s = _mm_hadd_ps(s, s);
+    float r = _mm_cvtss_f32(s);
+    for (; i < n; i++) r += (float)cp[i] * x[i];
+    return r;
+}
+#else
+static float q36_dot_i8xf32(const int8_t *cp, const float *x, int n) {
+    float r = 0.0f;
+    for (int i = 0; i < n; i++) r += (float)cp[i] * x[i];
+    return r;
+}
+#endif
+
+/* Exported single-row packed dot (dequant-free): unpack-if-Q4 into caller scratch,
+ * SIMD dot, apply the row/block scales. Used by expert_mm (qwen36 MoE) instead of
+ * sp_frob_packed_dequant_row -> f32 dot (skips writing the f32 row entirely). */
+float sp_arena_row_dot(const sp_frob_packed_tensor *pt, int j, const float *x,
+                       int in, int8_t *unp) {
+    const uint8_t *rc = pt->codes + pt->row_off[j];
+    if (pt->row_prec[j] != 8 && pt->bscale) {
+        sp_frob_q4_unpack(rc, in, unp);
+        const uint16_t *bs = pt->bscale + (size_t)j * (size_t)pt->bs_nblk;
+        float facc = 0.0f;
+        for (int b = 0; b * 32 < in; b++) {
+            int i0 = b * 32, i1 = i0 + 32 < in ? i0 + 32 : in;
+            facc += q36_dot_i8xf32(unp + i0, x + i0, i1 - i0) * sp_f16_to_f32(bs[b]);
+        }
+        return facc;
+    }
+    if (pt->row_prec[j] == 8)
+        return q36_dot_i8xf32((const int8_t *)rc, x, in) * (pt->row_scale[j] / 127.0f);
+    sp_frob_q4_unpack(rc, in, unp);
+    return q36_dot_i8xf32(unp, x, in) * (pt->row_scale[j] / 7.0f);
+}
+
 /* Arena matmul: inline-lift the packed Q8/Q4 codes (the §4.8 production path). The
  * per-row scale is applied once after the integer-code accumulation.
  * NORTHSTAR brick 4 (2026-07-02): rows are independent — OpenMP over j with a
@@ -90,9 +141,7 @@ static int matmul_arena(const sp_arena_tensor *at, const float *X,
                         float facc = 0.0f;
                         for (int b = 0; b * 32 < in; b++) {
                             int i0 = b * 32, i1 = i0 + 32 < in ? i0 + 32 : in;
-                            float acc = 0.0f;
-                            for (int i = i0; i < i1; i++) acc += (float)cp[i] * x[i];
-                            facc += acc * sp_f16_to_f32(bs[b]);
+                            facc += q36_dot_i8xf32(cp + i0, x + i0, i1 - i0) * sp_f16_to_f32(bs[b]);
                         }
                         Y[(size_t)t * out + j] = facc;
                     }
@@ -102,9 +151,7 @@ static int matmul_arena(const sp_arena_tensor *at, const float *X,
                 else { sp_frob_q4_unpack(rc, in, unp); cp = unp; inv = pt->row_scale[j] / 7.0f; }
                 for (int t = 0; t < n_tok; t++) {
                     const float *x = X + (size_t)t * in;
-                    float acc = 0.0f;
-                    for (int i = 0; i < in; i++) acc += (float)cp[i] * x[i];
-                    Y[(size_t)t * out + j] = acc * inv;
+                    Y[(size_t)t * out + j] = q36_dot_i8xf32(cp, x, in) * inv;
                 }
             }
             free(unp);
