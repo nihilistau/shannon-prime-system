@@ -622,7 +622,11 @@ int qwen36_step(const qwen3_model *m, qwen36_state *st, int32_t token, float *lo
 
             /* causal depthwise conv over [tail(CK-1 rows), current]; row j<CK-1 is
              * global time pos-(CK-1)+j -> tail[j] (zero-initialized covers pos<CK-1,
-             * matching the stateless zero-padding). Same j-ascending accumulation. */
+             * matching the stateless zero-padding). Same j-ascending accumulation.
+             * GPU-3: channels independent -> OMP (bit-exact per channel). */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
             for (int ch = 0; ch < convC; ch++) {
                 float acc = 0.0f;
                 for (int j = 0; j < CK; j++) {
@@ -640,8 +644,14 @@ int qwen36_step(const qwen3_model *m, qwen36_state *st, int32_t token, float *lo
             float *qb = cs, *kb = cs + Kdim;
             for (int h = 0; h < Hk; h++) { l2norm(qb + h * Sd, Sd, eps); l2norm(kb + h * Sd, Sd, eps); }
 
+            /* GPU-3: v-heads independent (per-head state slice + per-head scratch on
+             * the stack) -> OMP; per-head math order unchanged = bit-exact. */
             const float qscale = 1.0f / sqrtf((float)Sd);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
             for (int h = 0; h < Hv; h++) {
+                float skv_l[256], dlt_l[256];   /* Sd <= 256 (checked at load: Sd=128) */
                 int hk = h % Hk;
                 float *St_ = S + (size_t)h * Sd * Sd;
                 const float *qh = cs + (size_t)hk * Sd;
@@ -653,13 +663,14 @@ int qwen36_step(const qwen3_model *m, qwen36_state *st, int32_t token, float *lo
                 for (int j = 0; j < Sd; j++) {
                     float s = 0.0f;
                     for (int i = 0; i < Sd; i++) s += St_[(size_t)i * Sd + j] * kh[i];
-                    skv[j] = s;
-                    dlt[j] = bh * (vh[j] - s);
+                    skv_l[j] = s;
+                    dlt_l[j] = bh * (vh[j] - s);
                 }
+                (void)skv_l;
                 for (int i = 0; i < Sd; i++) {
                     float ki = kh[i];
                     float *Si = St_ + (size_t)i * Sd;
-                    for (int j = 0; j < Sd; j++) Si[j] += ki * dlt[j];
+                    for (int j = 0; j < Sd; j++) Si[j] += ki * dlt_l[j];
                 }
                 float *oh = od + (size_t)h * Sd;
                 for (int j = 0; j < Sd; j++) {
@@ -670,6 +681,9 @@ int qwen36_step(const qwen3_model *m, qwen36_state *st, int32_t token, float *lo
             }
             {
                 const float *gn = sp_as_f32(m, L->gdn_norm);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
                 for (int h = 0; h < Hv; h++) {
                     float *o_in  = od  + (size_t)h * Sd;
                     float *o_out = fno + (size_t)h * Sd;
