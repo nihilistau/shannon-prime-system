@@ -219,6 +219,13 @@ int gemma3_forward(const qwen3_model *m, const int32_t *tokens, int n_tokens,
 int gemma4_forward(const qwen3_model *m, const int32_t *tokens, int n_tokens,
                    float *logits);
 
+/* ADR-011 CPU LAYER OFFLOAD: run ONE layer's FFN residual block on the CPU for a single token,
+ * in place on x[n_embd] (weights read from the OK_Q4B arena in host DRAM). The FFN is ~90% of a
+ * layer's weight and stateless (no KV), so a contiguous tail of FFNs offloads cleanly, freeing
+ * ~150 MB/layer of VRAM at an E-float boundary crossing. Byte-exact vs the GPU FFN under CRT.
+ * Returns 0 on success. */
+int gemma4_ffn_block_cpu(const qwen3_model *m, int L, float *x);
+
 /* EAGLE/MTP feature tap (step 2b): as gemma4_forward, but also writes the
  * post-output_norm hidden (feature the LM head consumes, = embedding_length_out)
  * for every token into feat_out (n_tokens * hidden_dim floats). The gemma4-assistant

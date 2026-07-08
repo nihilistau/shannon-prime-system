@@ -56,6 +56,44 @@ static void g4_rmsnorm_noweight(float *v, int d, float eps) {
     for (int i = 0; i < d; i++) v[i] *= inv;
 }
 
+/* ADR-011 CPU LAYER OFFLOAD — one layer's FFN residual block on the CPU for a SINGLE token,
+ * in place on x[E]. The FFN is ~90% of a layer's weight and is STATELESS (touches no KV), so a
+ * contiguous TAIL of FFNs can run on the CPU (weights resident in 40 GB/s host DRAM) while the
+ * attention (which shares KV with early GPU layers) stays on the GPU — freeing the FFN weight
+ * VRAM (~150 MB/layer) with only an E-float activation crossing at each boundary. Arithmetic is
+ * IDENTICAL to gemma4_forward_impl's FFN block (lines: ffn_norm → gate/up → gelu·up → down →
+ * post_ffw_norm → residual add), reusing sp_matmul (reads the OK_Q4B arena weights on CPU). Under
+ * SP_BYTEEXACT the CPU sp_matmul and the GPU dp4a agree bit-for-bit (the CRT gift); in float chat
+ * mode they agree to coherence (same argmax). Caller passes the residual x (E) IN/OUT. Returns 0.*/
+int gemma4_ffn_block_cpu(const qwen3_model *m, int L, float *x) {
+    const qwen3_config *c = &m->cfg;
+    const int E = (int)c->n_embd, FF = (int)c->n_ff;
+    const float eps = c->rms_eps;
+    if (L < 0 || L >= (int)c->n_layers) return 1;
+    const qwen3_layer *ly = &m->layers[L];
+    const int FF_L = (ly->ffn_gate && ly->ffn_gate->n_dims >= 2 && ly->ffn_gate->dims[1] > 0)
+                     ? (int)ly->ffn_gate->dims[1] : FF;
+    float *nx = (float *)malloc((size_t)E * sizeof(float));
+    float *g  = (float *)malloc((size_t)FF_L * sizeof(float));
+    float *up = (float *)malloc((size_t)FF_L * sizeof(float));
+    float *dn = (float *)malloc((size_t)E * sizeof(float));
+    int rc = 1;
+    if (!nx || !g || !up || !dn) goto done;
+    sp_rmsnorm(x, sp_as_f32(m, ly->ffn_norm), E, eps, nx);
+    if (sp_matmul(m, ly->ffn_gate, nx, 1, E, FF_L, g))  goto done;
+    if (sp_matmul(m, ly->ffn_up,   nx, 1, E, FF_L, up)) goto done;
+    for (int i = 0; i < FF_L; i++) g[i] = g4_gelu(g[i]) * up[i];
+    if (sp_matmul(m, ly->ffn_down, g, 1, FF_L, E, dn))  goto done;
+    /* post_ffw_norm on the FFN output, then residual add (gemma sandwich norm). */
+    if (ly->post_ffw_norm) { sp_rmsnorm(dn, sp_as_f32(m, ly->post_ffw_norm), E, eps, nx);
+        for (int i = 0; i < E; i++) x[i] += nx[i]; }
+    else for (int i = 0; i < E; i++) x[i] += dn[i];
+    rc = 0;
+done:
+    free(nx); free(g); free(up); free(dn);
+    return rc;
+}
+
 static int gemma4_forward_impl(const qwen3_model *m, const int32_t *tokens, int n_tok,
                                float *logits, float *feat_out, g4_kv_tap *kv) {
     const qwen3_config *c = &m->cfg;
