@@ -94,6 +94,109 @@ done:
     return rc;
 }
 
+/* ── ADR-012 — CONTIGUOUS full-layer CPU tail (the sync-killer) ───────────────────────────────
+ * Runs layers [L_start, NL) of the gemma4 forward for ONE token at absolute position `pos`
+ * ENTIRELY on the CPU. Where gemma4_ffn_block_cpu (ADR-011) offloads only the FFN and stays
+ * INTERLEAVED with GPU attention — forcing a GPU<->CPU round-trip (D2H + 2x sync + H2D) per
+ * offloaded layer, ~2K syncs/token, the measured sync-bound wall — this severs the WHOLE tail:
+ * the caller hands over the residual + the two shared-KV owner caches ONCE, the CPU runs every
+ * tail layer (attention over the host KV + FFN + AltUp) with NO GPU interaction, and hands the
+ * residual back ONCE. Per-token boundary crossings collapse from ~2K to ~2 => the slope
+ * approaches the memory-bound floor (~4 ms/layer) instead of ~33 ms/layer.
+ *
+ * gemma4-12b-b1 has NO KV sharing (kvfs == n_layers): EVERY layer OWNS its K/V and reads only its
+ * OWN cache. So each tail layer keeps its own KV cache ENTIRELY on host (hK[L]/hV[L], linear
+ * [Pmax*kvd]); it computes Wk/Wv, k/v-norm and RoPE, STORES the new position, and attends over its
+ * own [0..pos]. There is NO cross-boundary KV dependency (no GPU layer reads a tail layer's KV and
+ * vice-versa), so the ONLY thing crossing the boundary is the residual (+ this token's AltUp
+ * inputs `ipl`). Because the tail runs on CPU for EVERY token (prefill + decode via g4_kv_step),
+ * the host KV is built from position 0 — no seeding. V-less global layers set V = the raw K
+ * projection (pre-norm/RoPE), exactly like the reference. Weights come from the host OK_Q4B arena
+ * via sp_matmul (host-resident; the GPU upload is the copy the caller SKIPS to free the VRAM).
+ * `ipl` = the per-layer AltUp inputs for this token ([NL*PL], = the device dipl). CRT makes the
+ * CPU legs bit-identical to the GPU under SP_BYTEEXACT. x[E] in/out. Returns 0. Default never calls. */
+int gemma4_tail_cpu(const qwen3_model *m, int L_start, int pos, float *x, const float *ipl,
+                    float **hK, float **hV) {
+    const qwen3_config *c = &m->cfg;
+    const int   E  = (int)c->n_embd, NL = (int)c->n_layers;
+    const float eps = c->rms_eps;
+    const int   PL = (int)c->g4_n_embd_per_layer;
+    const int   period = (int)c->g4_swa_period ? (int)c->g4_swa_period : 6;
+    const int   g_nh=(int)c->n_head, g_nkv=(int)c->n_head_kv, g_hd=(int)c->head_dim;
+    const int   s_nh=(int)c->g4_nh_swa, s_nkv=(int)c->g4_nkv_swa, s_hd=(int)c->g4_hd_swa;
+    const float g_base=c->rope_freq_base, s_base=c->g4_rope_base_swa;
+    const int   SW=(int)c->sliding_window;
+    const int   QD_g=g_nh*g_hd, QD_s=s_nh*s_hd, QD_max=QD_g>QD_s?QD_g:QD_s;
+    int rc = 1;
+    float *nx = (float*)malloc((size_t)E*sizeof(float));
+    float *q  = (float*)malloc((size_t)QD_max*sizeof(float));
+    float *ao = (float*)malloc((size_t)QD_max*sizeof(float));
+    float *ap = (float*)malloc((size_t)E*sizeof(float));
+    float *sc = (float*)malloc((size_t)(pos+1)*sizeof(float));
+    float *pgate = PL ? (float*)malloc((size_t)PL*sizeof(float)) : NULL;
+    float *pproj = PL ? (float*)malloc((size_t)E*sizeof(float)) : NULL;
+    if (!nx || !q || !ao || !ap || !sc || (PL && (!pgate || !pproj))) goto done;
+    for (int L = L_start; L < NL; L++) {
+        const qwen3_layer *ly = &m->layers[L];
+        const int global = ((L % period) == period - 1);
+        const int nh  = global ? g_nh  : s_nh;
+        const int nkv = global ? g_nkv : s_nkv;
+        const int hd  = global ? g_hd  : s_hd;
+        const int grp = nh / nkv, qd = nh * hd, kvd = nkv * hd;
+        const float rbase = global ? g_base : s_base;
+        const float *ff   = global ? sp_as_f32(m, m->rope_freqs) : NULL;
+        const int   win   = global ? -1 : SW;
+        /* ── q ── */
+        sp_rmsnorm(x, sp_as_f32(m, ly->attn_norm), E, eps, nx);
+        if (sp_matmul(m, ly->attn_q, nx, 1, E, qd, q)) goto done;
+        const float *qn = sp_as_f32(m, ly->attn_q_norm);
+        for (int h = 0; h < nh; h++) {
+            float *qh = q + (size_t)h * hd;
+            sp_rmsnorm_head(qh, qn, hd, eps);
+            sp_rope_neox_freqs(qh, hd, pos, rbase, ff);
+        }
+        /* ── k/v (OWNER): compute + norm + RoPE, STORE into this layer's OWN host cache @ pos.
+         * gemma4-12b has NO KV sharing (kvfs==NL) so each layer keeps its own KV entirely on host;
+         * built from position 0 since the tail runs on CPU every token. V-less globals: V = raw K. */
+        float *kh = hK[L] + (size_t)pos * kvd;
+        float *vh = hV[L] + (size_t)pos * kvd;
+        if (sp_matmul(m, ly->attn_k, nx, 1, E, kvd, kh)) goto done;
+        if (ly->attn_v) { if (sp_matmul(m, ly->attn_v, nx, 1, E, kvd, vh)) goto done; }
+        else memcpy(vh, kh, (size_t)kvd * sizeof(float));
+        const float *kn = sp_as_f32(m, ly->attn_k_norm);
+        for (int h = 0; h < nkv; h++) {
+            sp_rmsnorm_head(kh + (size_t)h*hd, kn, hd, eps);
+            sp_rope_neox_freqs(kh + (size_t)h*hd, hd, pos, rbase, ff);
+            g4_rmsnorm_noweight(vh + (size_t)h*hd, hd, eps);
+        }
+        /* ── attention over this layer's own host KV [0..pos] (windowed for SWA) ── */
+        for (int h = 0; h < nh; h++)
+            sp_attn_head(q + (size_t)h * hd, hK[L], hV[L], pos, kvd,
+                         h / grp, hd, 1.0f, win, sc, ao + (size_t)h * hd);
+        if (sp_matmul(m, ly->attn_output, ao, 1, qd, E, ap)) goto done;
+        sp_rmsnorm(ap, sp_as_f32(m, ly->post_attn_norm), E, eps, nx);
+        for (int i = 0; i < E; i++) x[i] += nx[i];
+        /* ── FFN (GeGLU + post_ffw sandwich norm) — the ADR-011 block, reused ── */
+        if (gemma4_ffn_block_cpu(m, L, x)) goto done;
+        /* ── AltUp per-layer-input injection ── */
+        if (PL) {
+            if (sp_matmul(m, ly->per_layer_inp_gate, x, 1, E, PL, pgate)) goto done;
+            const float *iplL = ipl + (size_t)L * PL;
+            for (int i = 0; i < PL; i++) pgate[i] = g4_gelu(pgate[i]) * iplL[i];
+            if (sp_matmul(m, ly->per_layer_proj, pgate, 1, PL, E, pproj)) goto done;
+            sp_rmsnorm(pproj, sp_as_f32(m, ly->per_layer_post_norm), E, eps, nx);
+            for (int i = 0; i < E; i++) x[i] += nx[i];
+        }
+        /* ── per-layer output scale (scalar) ── */
+        if (ly->out_scale) { const float *os = sp_as_f32(m, ly->out_scale);
+            if (os) { float sv = os[0]; for (int i = 0; i < E; i++) x[i] *= sv; } }
+    }
+    rc = 0;
+done:
+    free(nx); free(q); free(ao); free(ap); free(sc); free(pgate); free(pproj);
+    return rc;
+}
+
 static int gemma4_forward_impl(const qwen3_model *m, const int32_t *tokens, int n_tok,
                                float *logits, float *feat_out, g4_kv_tap *kv) {
     const qwen3_config *c = &m->cfg;
