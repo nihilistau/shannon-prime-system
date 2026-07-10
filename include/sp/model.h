@@ -226,6 +226,18 @@ int gemma4_forward(const qwen3_model *m, const int32_t *tokens, int n_tokens,
  * Returns 0 on success. */
 int gemma4_ffn_block_cpu(const qwen3_model *m, int L, float *x);
 
+/* ADR-012 CONTIGUOUS full-layer CPU tail: run layers [L_start, n_layers) of the gemma4 forward for
+ * ONE token at position `pos` entirely on the CPU. gemma4-12b has NO KV sharing (kvfs==n_layers),
+ * so each tail layer OWNS its K/V and keeps its own cache on host: hK[L]/hV[L] are per-layer linear
+ * [Pmax*kvd] buffers the layer computes into (Wk/Wv, k/v-norm, RoPE) and attends over [0..pos].
+ * NO cross-boundary KV dependency, so the caller crosses the GPU<->CPU boundary ONCE (residual out,
+ * residual in) instead of per-FFN — killing the sync-bound slope. Built from position 0 (the tail
+ * runs on CPU every token, prefill+decode). `ipl` = per-layer AltUp inputs ([n_layers*
+ * g4_n_embd_per_layer], = device dipl). Weights from the host arena (sp_matmul); byte-exact vs the
+ * GPU legs under CRT. x[n_embd] in/out. Returns 0 on success. */
+int gemma4_tail_cpu(const qwen3_model *m, int L_start, int pos, float *x, const float *ipl,
+                    float **hK, float **hV);
+
 /* EAGLE/MTP feature tap (step 2b): as gemma4_forward, but also writes the
  * post-output_norm hidden (feature the LM head consumes, = embedding_length_out)
  * for every token into feat_out (n_tokens * hidden_dim floats). The gemma4-assistant
