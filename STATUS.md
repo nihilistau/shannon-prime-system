@@ -1,7 +1,9 @@
 # STATUS — shannon-prime-system
 
 **Date:** 2026-08-29  
-**Class:** `STANDING` — exact-integer math core + frozen L1 C ABI. **Not absorbed by Kairos.**
+**Class:** `STANDING` — exact-integer math core + frozen L1 C ABI. **Not absorbed elsewhere.**
+
+**Zoo map:** [JOURNEY.md](https://github.com/nihilistau/Position_Is_Arithmetic/blob/main/JOURNEY.md)
 
 Unique work that lives here:
 
@@ -12,5 +14,3 @@ Unique work that lives here:
 
 Consumed by [shannon-prime-system-engine](https://github.com/nihilistau/shannon-prime-system-engine) as `lib/shannon-prime-system`.
 Canon / status: [shannon-prime-lattice](https://github.com/nihilistau/shannon-prime-lattice).
-
-Kairos is a Python companion harness. It does not own this ABI or these kernels.
