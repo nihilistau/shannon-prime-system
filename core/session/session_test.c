@@ -16,9 +16,25 @@
 #include "gemma4_fixture.h"
 #include "qwen25_fixture.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+
+/* ── WHERE THE ENGINE'S CROSS-LOAD ARTIFACTS LIVE ────────────────────────────────────
+ * These three gates load .sp-model / .sp-tokenizer files built by the ENGINE repo, which is
+ * not this one and is not on a public clone's disk. The path used to be hardcoded to one
+ * machine — useless to anyone else, and a published record of a private layout.
+ *
+ * It comes from the environment now, defaulting to the sibling checkout the repos actually
+ * sit in. Every caller already skips gracefully when the artifact is absent, which is what a
+ * stranger gets either way; setting SP_ENGINE_ARTIFACTS is what makes them run again.
+ * Same idiom as core/forward/qwen36_gate.c's SP_QWEN36_GGUF. */
+static const char *sp_engine_artifacts(void) {
+    const char *e = getenv("SP_ENGINE_ARTIFACTS");
+    return (e && *e) ? e : "../shannon-prime-system-engine/build-cpu/tests";
+}
+
 
 static const int32_t TOKS[5] = { 1, 7, 3, 42, 13 };
 #define NTOK 5u
@@ -392,10 +408,10 @@ static void T_PARITY_CROSS_LOAD(void) {
      * now written as sp_arch_info) loads via math-core sp_model_load; arch fields
      * round-trip correctly through sp_model_arch; prefill produces finite logits.
      * Skips gracefully if the artifact is absent (standalone math-core suite run). */
-    const char *mpath = "../shannon-prime-system-engine/"
-                        "build-cpu/tests/qwen3_rt.sp-model";
-    const char *tpath = "../shannon-prime-system-engine/"
-                        "build-cpu/tests/qwen3_rt.sp-tokenizer";
+    char mbuf[512], tbuf[512];
+    snprintf(mbuf, sizeof mbuf, "%s/qwen3_rt.sp-model",     sp_engine_artifacts());
+    snprintf(tbuf, sizeof tbuf, "%s/qwen3_rt.sp-tokenizer", sp_engine_artifacts());
+    const char *mpath = mbuf, *tpath = tbuf;
     FILE *probe = fopen(mpath, "rb");
     if (!probe) {
         fprintf(stderr, "    [E_PARITY_3] cross-load: artifact absent — SKIP\n");
@@ -656,10 +672,10 @@ static void T_GEMMA3_DECODE_TRAJECTORY(void) {
 static void T_PARITY_CROSS_LOAD_GEMMA3(void) {
     /* Phase 3 Cell 1: engine-transcoded Gemma3-1B .sp-model cross-loads in math-core;
      * arch fields round-trip; prefill produces finite logits. Skips if artifact absent. */
-    const char *mpath = "../shannon-prime-system-engine/"
-                        "build-cpu/tests/gemma3_rt.sp-model";
-    const char *tpath = "../shannon-prime-system-engine/"
-                        "build-cpu/tests/gemma3_rt.sp-tokenizer";
+    char mbuf[512], tbuf[512];
+    snprintf(mbuf, sizeof mbuf, "%s/gemma3_rt.sp-model",     sp_engine_artifacts());
+    snprintf(tbuf, sizeof tbuf, "%s/gemma3_rt.sp-tokenizer", sp_engine_artifacts());
+    const char *mpath = mbuf, *tpath = tbuf;
     FILE *probe = fopen(mpath, "rb");
     if (!probe) {
         fprintf(stderr, "    [G3-cross] artifact absent — SKIP\n");
@@ -806,10 +822,10 @@ static void T_QWEN25_DECODE_TRAJECTORY(void) {
 static void T_PARITY_CROSS_LOAD_QWEN25(void) {
     /* Phase 3 Cell 2: engine-transcoded Qwen2.5-3B .sp-model cross-loads in math-core;
      * arch fields round-trip; prefill produces finite logits. Skips if artifact absent. */
-    const char *mpath = "../shannon-prime-system-engine/"
-                        "build-cpu/tests/qwen25_rt.sp-model";
-    const char *tpath = "../shannon-prime-system-engine/"
-                        "build-cpu/tests/qwen25_rt.sp-tokenizer";
+    char mbuf[512], tbuf[512];
+    snprintf(mbuf, sizeof mbuf, "%s/qwen25_rt.sp-model",     sp_engine_artifacts());
+    snprintf(tbuf, sizeof tbuf, "%s/qwen25_rt.sp-tokenizer", sp_engine_artifacts());
+    const char *mpath = mbuf, *tpath = tbuf;
     FILE *probe = fopen(mpath, "rb");
     if (!probe) {
         fprintf(stderr, "    [Q25-cross] artifact absent — SKIP\n");
@@ -1093,7 +1109,8 @@ static void T_GEMMA4_DECODE_TRAJECTORY(void) {
  * the persistent-KV decode is self-consistent with the O(n²) re-prefill on the
  * REAL weights (not just the fixture). Skips if the model is absent. */
 static void T_GEMMA4_GGUF_FORWARD(void) {
-    const char *mpath = "D:/Files/Models/New folder/gemma-4-E2B-it-uncensored-Q8_0.gguf";
+    const char *mpath = getenv("SP_G4_GGUF");
+    if (!mpath || !*mpath) mpath = "models/gemma-4-E2B-it-Q8_0.gguf";
     FILE *probe = fopen(mpath, "rb");
     if (!probe) { fprintf(stderr, "    [G4-gguf] model absent — SKIP\n"); return; }
     fclose(probe);

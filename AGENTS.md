@@ -9,7 +9,7 @@ landing in this repo, read this first, then follow the read-order below before t
 
 1. **[`README.md`](README.md)** — what this repo is, the frozen L1 ABI, the `core/` modules + their tiers, the substrate diagram.
 2. **[`CLAUDE.md`](CLAUDE.md)** — this repo's specifics + the non-negotiables (short form).
-3. **Lattice canon** (`..\shannon-prime-lattice\`):
+3. **Lattice canon** (`../shannon-prime-lattice/`):
    - `prompt.md` — the canonical session bootstrap (project, machine, doc map, operator).
    - `papers/VERIFIED-SCOREBOARD.md` — **the status source of truth (receipts-checked): what is built, what is open.** Trust this over any "current edge" prose.
    - `papers/PPT-LAT-KEYSTONE.md` — the canonical, current, complete system map (the five repos, architecture, memory model, gate index).
@@ -26,8 +26,8 @@ This project has rebuilt the same subsystems 20+ times. A new file for a capabil
 exists is a **defect**. Before building ANY subsystem:
 
 ```bash
-python ..\shannon-prime-lattice\tools\okf_mem.py lookup \
-    --root ..\shannon-prime-lattice\memory-okf <keyword>
+python ../shannon-prime-lattice/tools/okf_mem.py lookup \
+    --root ../shannon-prime-lattice/memory-okf <keyword>
 ```
 
 …then `grep` the tree. The content-addressed LUT→summary→full store + the rule live in lattice

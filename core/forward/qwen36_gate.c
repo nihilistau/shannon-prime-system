@@ -12,7 +12,7 @@
 #include <stdlib.h>
 
 #ifndef SP_QWEN36_GGUF
-#define SP_QWEN36_GGUF "D:/Files/Models/lmstudio-community/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf"
+#define SP_QWEN36_GGUF "models/Qwen3.6-35B-A3B-Q4_K_M.gguf"  /* override with SP_QWEN36_GGUF */
 #endif
 
 int main(void) {

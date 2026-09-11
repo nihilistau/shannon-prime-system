@@ -19,7 +19,7 @@ same so parallel agents never collide and the integrated build stays trivial.
 ## Anti-contamination (binding)
 
 Do **not** read, copy, or vendor code from
-`..\shannon-prime\` or `…\shannon-prime-engine\`. Math
+`../shannon-prime/` or `…\shannon-prime-engine\`. Math
 papers under `…\papers\PPT-ARM\` are conceptual reference only — read theorem
 statements, re-derive the implementation from scratch. See
 `../shannon-prime-lattice/papers/PPT-LAT-Roadmap.md` §3.1.
